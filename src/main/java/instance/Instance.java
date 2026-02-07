@@ -11,8 +11,6 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * JDK 11 compatible.
- *
  * Parse MVPRP instance txt (delivery-style) and map it to your pickup+production model parameters.
  *
  * =========================
