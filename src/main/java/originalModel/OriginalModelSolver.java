@@ -118,6 +118,17 @@ public final class OriginalModelSolver {
                     supplierBalance.addTerm(-1.0, inventory[i][t]);
                     cplex.addEq(supplierBalance, rhsSupplier, "SupplierBalance_" + i + "_" + t);
 
+                    // Align with reformulation/LBBD semantics: inventory right before the period-t pickup
+                    // (i.e., previous end inventory + current generation) must not exceed supplier capacity.
+                    IloLinearNumExpr prePickupCap = cplex.linearNumExpr();
+                    double rhsPrePickupCap = ins.Li[i] - ins.s[i][t];
+                    if (t == 1) {
+                        rhsPrePickupCap -= ins.Ii0[i];
+                    } else {
+                        prePickupCap.addTerm(1.0, inventory[i][t - 1]);
+                    }
+                    cplex.addLe(prePickupCap, rhsPrePickupCap, "SupplierPrePickupCap_" + i + "_" + t);
+
                     IloLinearNumExpr pickupAll = cplex.linearNumExpr();
                     double rhsPickupAll = ins.s[i][t] - ins.bigM;
                     pickupAll.addTerm(1.0, q[i][t]);

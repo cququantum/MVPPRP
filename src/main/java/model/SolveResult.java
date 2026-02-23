@@ -38,18 +38,23 @@ public final class SolveResult {
           .append(" | status=").append(status)
           .append(" | feasible=").append(feasible)
           .append(" | optimal=").append(optimal);
+        boolean hideBoundInfo = isInfeasibleStatus(status);
 
         if (!Double.isNaN(objective)) {
             sb.append(" | obj=").append(format(objective));
         }
-        if (!Double.isNaN(bestBound)) {
+        if (!hideBoundInfo && !Double.isNaN(bestBound)) {
             sb.append(" | bestBound=").append(format(bestBound));
         }
-        if (!Double.isNaN(mipGap)) {
+        if (!hideBoundInfo && !Double.isNaN(mipGap)) {
             sb.append(" | gap=").append(format(mipGap));
         }
         sb.append(" | timeSec=").append(format(solveTimeSec));
         return sb.toString();
+    }
+
+    private static boolean isInfeasibleStatus(String status) {
+        return status != null && status.contains("Infeasible");
     }
 
     private static String format(double v) {

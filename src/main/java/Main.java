@@ -8,7 +8,7 @@ import java.util.Locale;
 
 public class Main {
     public static void main(String[] args) {
-        String instancePath = (args.length > 0) ? args[0] : "data/MVPRP/MVPRP1_10_3_2.txt";
+        String instancePath = (args.length > 0) ? args[0] : "data/MVPRP/MVPRP1_10_6_2.txt";
 
         Instance.Options options = Instance.Options.defaults();
         options.distanceMode = Instance.Options.DistanceMode.EUCLIDEAN_FLOAT;
