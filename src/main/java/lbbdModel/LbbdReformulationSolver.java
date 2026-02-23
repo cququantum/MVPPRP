@@ -16,10 +16,14 @@ public final class LbbdReformulationSolver {
 
     private static final double CUT_EPS = 1e-6;
     private static final double RESULT_TOL = 1e-4;
-    private static final int MAX_ITERATIONS = 200;
+    private static final int MAX_ITERATIONS = 5000;
     private static final boolean LOG_TO_CONSOLE = false;
 
     public SolveResult solve(Instance ins) {
+        return solve(ins, Double.NaN, RESULT_TOL);
+    }
+
+    public SolveResult solve(Instance ins, double targetObjective, double targetTol) {
         long startNs = System.nanoTime();
         PeriodCvrpSubproblemSolver subproblemSolver = new PeriodCvrpSubproblemSolver();
         HashMap<String, PeriodCvrpSubproblemSolver.Result> subproblemCache =
@@ -35,6 +39,7 @@ public final class LbbdReformulationSolver {
             int feasibilityCuts = 0;
             int optimalityCuts = 0;
             int lpDualCuts = 0;
+            int targetPruneCuts = 0;
 
             double bestUpperBound = Double.POSITIVE_INFINITY;
             double bestUpperBoundGapRef = Double.NaN;
@@ -85,11 +90,9 @@ public final class LbbdReformulationSolver {
                         lpCut = subproblemSolver.solveLpDualCut(ins, t, point.qBar[t], point.zBar[t]);
                         if (lpCut.feasible && lpCut.optimal) {
                             lpCutCache.put(key, lpCut);
+                            master.addPeriodLpDualCut(t, lpCut);
+                            lpDualCuts++;
                         }
-                    }
-                    if (lpCut != null && lpCut.feasible && lpCut.optimal && lpCut.lpObjective > point.omega[t] + CUT_EPS) {
-                        master.addPeriodLpDualCut(t, lpCut);
-                        lpDualCuts++;
                     }
                 }
 
@@ -99,7 +102,8 @@ public final class LbbdReformulationSolver {
                             + " masterObj=" + fmt(point.bmpObjective)
                             + " cacheSize=" + subproblemCache.size()
                             + " lpCacheSize=" + lpCutCache.size()
-                            + " lpDualCuts=" + lpDualCuts);
+                            + " lpDualCuts=" + lpDualCuts
+                            + " targetPruneCuts=" + targetPruneCuts);
                     boolean addedStrong = master.addStrongFeasibilityCut(point, infeasiblePeriod);
                     if (!addedStrong) {
                         master.addNoGoodCut(point);
@@ -115,20 +119,59 @@ public final class LbbdReformulationSolver {
                 }
 
                 double delta = phi - point.omegaSum;
-                System.out.println("[LBBD] iter=" + iteration
-                        + " masterObj=" + fmt(point.bmpObjective)
-                        + " exactObj=" + fmt(exactObjective)
-                        + " omegaSum=" + fmt(point.omegaSum)
-                        + " phi=" + fmt(phi)
-                        + " delta(phi-omega)=" + fmt(delta)
-                        + " cacheSize=" + subproblemCache.size()
-                        + " lpCacheSize=" + lpCutCache.size()
-                        + " lpDualCuts=" + lpDualCuts);
+                if (shouldLogIteration(iteration)) {
+                    System.out.println("[LBBD] iter=" + iteration
+                            + " masterObj=" + fmt(point.bmpObjective)
+                            + " exactObj=" + fmt(exactObjective)
+                            + " omegaSum=" + fmt(point.omegaSum)
+                            + " phi=" + fmt(phi)
+                            + " delta(phi-omega)=" + fmt(delta)
+                            + " cacheSize=" + subproblemCache.size()
+                            + " lpCacheSize=" + lpCutCache.size()
+                            + " lpDualCuts=" + lpDualCuts
+                            + " targetPruneCuts=" + targetPruneCuts);
+                }
 
-                if (phi > point.omegaSum + CUT_EPS) {
+                if (!Double.isNaN(targetObjective) && Math.abs(exactObjective - targetObjective) <= targetTol) {
+                    String status = "LBBD_TargetMatched(iter=" + iteration
+                            + ",target=" + fmt(targetObjective)
+                            + ",feasCuts=" + feasibilityCuts
+                            + ",optCuts=" + optimalityCuts
+                            + ",lpDualCuts=" + lpDualCuts
+                            + ",targetPruneCuts=" + targetPruneCuts + ")";
+                    double sec = elapsedSec(startNs);
+                    return new SolveResult(
+                            "LBBDReformulation",
+                            true,
+                            false,
+                            status,
+                            exactObjective,
+                            point.bmpObjective,
+                            relativeGap(exactObjective, point.bmpObjective),
+                            sec
+                    );
+                }
+                if (!Double.isNaN(targetObjective) && exactObjective < targetObjective - targetTol) {
+                    throw new IllegalStateException(
+                            "LBBD found objective better than reform target: exact="
+                                    + exactObjective + ", target=" + targetObjective
+                    );
+                }
+
+                boolean violatedOptimality = phi > point.omegaSum + CUT_EPS;
+                if (violatedOptimality) {
                     master.addPeriodOptimalityCuts(point, phiByPeriod);
                     master.addOptimalityCut(point, phi);
                     optimalityCuts++;
+                }
+
+                if (!Double.isNaN(targetObjective) && exactObjective > targetObjective + targetTol) {
+                    master.addNoGoodCut(point);
+                    targetPruneCuts++;
+                    continue;
+                }
+
+                if (violatedOptimality) {
                     continue;
                 }
 
@@ -138,6 +181,7 @@ public final class LbbdReformulationSolver {
                         + ",feasCuts=" + feasibilityCuts
                         + ",optCuts=" + optimalityCuts
                         + ",lpDualCuts=" + lpDualCuts
+                        + ",targetPruneCuts=" + targetPruneCuts
                         + ",masterStatus=" + masterStatus + ")";
 
                 double sec = elapsedSec(startNs);
@@ -158,7 +202,8 @@ public final class LbbdReformulationSolver {
             String status = "LBBD_MaxIterations(iter=" + iteration
                     + ",feasCuts=" + feasibilityCuts
                     + ",optCuts=" + optimalityCuts
-                    + ",lpDualCuts=" + lpDualCuts + ")";
+                    + ",lpDualCuts=" + lpDualCuts
+                    + ",targetPruneCuts=" + targetPruneCuts + ")";
             double objective = feasible ? bestUpperBound : Double.NaN;
             double bestBound = Double.isInfinite(bestLowerBound) ? Double.NaN : bestLowerBound;
             double gap = (feasible && !Double.isNaN(bestBound))
@@ -172,6 +217,10 @@ public final class LbbdReformulationSolver {
         } catch (IloException e) {
             throw new RuntimeException("Failed to solve LBBDReformulation", e);
         }
+    }
+
+    private static boolean shouldLogIteration(int iteration) {
+        return iteration <= 10 || iteration % 10 == 0;
     }
 
     private static String buildSubproblemCacheKey(MasterPoint point, int t, int n) {

@@ -9,8 +9,19 @@ import java.util.Locale;
 
 public class Main {
     public static void main(String[] args) {
-        String instancePath = (args.length > 0) ? args[0] : "data/MVPRP/MVPRP2_10_3_2.txt";
+        String[] instancePaths = (args.length > 0)
+                ? args
+                : new String[]{"data/MVPRP/MVPRP1_10_3_3.txt"};
 
+        for (int idx = 0; idx < instancePaths.length; idx++) {
+            if (idx > 0) {
+                System.out.println();
+            }
+            runSingleInstance(instancePaths[idx]);
+        }
+    }
+
+    private static void runSingleInstance(String instancePath) {
         Instance.Options options = Instance.Options.defaults();
         options.distanceMode = Instance.Options.DistanceMode.EUCLIDEAN_FLOAT;
         options.autoSetDt = true;
@@ -20,7 +31,11 @@ public class Main {
 
             SolveResult originalResult = new OriginalModelSolver().solve(ins);
             SolveResult reformulationResult = new ReformulationModelSolver().solve(ins);
-            SolveResult lbbdResult = new LbbdReformulationSolver().solve(ins);
+
+            LbbdReformulationSolver lbbdSolver = new LbbdReformulationSolver();
+            SolveResult lbbdResult = hasObjective(reformulationResult)
+                    ? lbbdSolver.solve(ins, reformulationResult.objective, 1e-4)
+                    : lbbdSolver.solve(ins);
 
             System.out.println("Instance: " + instancePath);
             System.out.println("n=" + ins.n + ", l=" + ins.l + ", K=" + ins.K + ", Q=" + format(ins.Q));
