@@ -1,4 +1,5 @@
 import instance.Instance;
+import lbbdModel.LbbdReformulationSolver;
 import model.SolveResult;
 import originalModel.OriginalModelSolver;
 import reformulationModel.ReformulationModelSolver;
@@ -19,12 +20,15 @@ public class Main {
 
             SolveResult originalResult = new OriginalModelSolver().solve(ins);
             SolveResult reformulationResult = new ReformulationModelSolver().solve(ins);
+            SolveResult lbbdResult = new LbbdReformulationSolver().solve(ins);
 
             System.out.println("Instance: " + instancePath);
             System.out.println("n=" + ins.n + ", l=" + ins.l + ", K=" + ins.K + ", Q=" + format(ins.Q));
             System.out.println(originalResult.toSummaryLine());
             System.out.println(reformulationResult.toSummaryLine());
+            System.out.println(lbbdResult.toSummaryLine());
             printComparison(originalResult, reformulationResult);
+            printValidation("reform-vs-lbbd", reformulationResult, lbbdResult, 1e-4);
         } catch (IOException e) {
             throw new RuntimeException("Failed to load instance file: " + instancePath, e);
         }
@@ -63,6 +67,24 @@ public class Main {
 
     private static boolean hasObjective(SolveResult r) {
         return r.feasible && !Double.isNaN(r.objective);
+    }
+
+    private static void printValidation(String label, SolveResult baseline, SolveResult candidate, double tol) {
+        if (!hasObjective(baseline) || !hasObjective(candidate)) {
+            System.out.println("Validation(" + label + "): SKIP | missing feasible objective.");
+            return;
+        }
+
+        double diff = candidate.objective - baseline.objective;
+        double absDiff = Math.abs(diff);
+        String verdict = absDiff <= tol ? "PASS" : "FAIL";
+
+        System.out.println(
+                "Validation(" + label + "): " + verdict
+                        + " | tol=" + format(tol)
+                        + " | objDelta(candidate-baseline)=" + format(diff)
+                        + " | absDelta=" + format(absDiff)
+        );
     }
 
     private static String format(double v) {
