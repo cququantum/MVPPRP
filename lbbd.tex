@@ -1,0 +1,325 @@
+% This document is compiled using pdfLaTeX
+% You can switch XeLaTeX/pdfLaTeX/LaTeX/LuaLaTeX in Settings
+
+\documentclass{article}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{mathrsfs}
+\geometry{a4paper, margin=1in}
+\usepackage{ctex} % 支持中文
+\usepackage{hyperref} % 启用超链接功能
+\usepackage{float}
+\usepackage[linesnumbered,ruled,vlined]{algorithm2e}
+
+\newtheorem{assumption}{假设}
+\newtheorem{remark}{注释}
+\newtheorem{definition}{定义}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================
+%  LBBD additions (v3): Fix omega_t definition and its link to
+%  original routing-cost term sum c_ij x_ijt.
+%  Includes LB_R computation and implementable LBBD skeleton.
+%  Usage: \input{lbbd_vrp_cost_v3.tex}
+% ============================================================
+
+\section{车辆路径成本的逻辑Benders分解（LBBD）---模型增补（含$\omega_t$定义）}
+
+% ------------------------------------------------------------
+% A. BMP edits (replace routing cost by omega; remove routing vars)
+% ------------------------------------------------------------
+\subsection{Benders主问题（BMP）需要新增/替换的部分}
+
+\paragraph{A.1 新增变量（每期路径成本变量）}
+\begin{align}
+\omega_t \ge 0,\qquad \forall t\in T .
+\end{align}
+
+\paragraph{A.2 $\omega_t$与原始路由成本$\sum c_{ij}x_{ijt}$的关系（必须明确给实现用）}
+在\textbf{完整模型}中，时期$t$的车辆路径成本为
+\begin{equation}
+\text{RouteCost}_t(x)=\sum_{(i,j)\in A} c_{ij}\,x_{ijt}.
+\label{eq:routecost_arc}
+\end{equation}
+在LBBD中，将该成本视为一个\textbf{子问题最优值}并用变量$\omega_t$表示：
+\begin{equation}
+\omega_t\ :=\ \min\Bigl\{\ \sum_{(i,j)\in A} c_{ij}\,x_{ijt}\ :\ (x_{\cdot\cdot t},\text{其余路由变量})\ \text{满足时期}t\text{的CVRP约束，且服务集合/需求由}(z,\lambda)\text{决定}\ \Bigr\}.
+\label{eq:omega_def_arc}
+\end{equation}
+因此，BMP里不再显式出现$x_{ijt}$，而是通过Benders割逐步保证$\omega_t$不低估\eqref{eq:omega_def_arc}中的最优值。
+
+\paragraph{A.3 目标函数中的替换}
+将你现有（原始模型或改写后模型）目标函数中的车辆路径成本项
+\[
+\sum_{t\in T}\ \sum_{(i,j)\in A} c_{ij}\,x_{ijt}
+\]
+替换为
+\[
+\sum_{t\in T}\omega_t .
+\]
+（生产/库存/收集点库存持有等其它成本项保持不变。）
+
+\paragraph{A.4 从BMP中移除的车辆路径变量与约束（全部转入BSP）}
+在BMP中移除车辆路径相关变量与约束：
+\[
+x_{ijt},\ u_{it},\ m_t\ (\text{若你在模型中仍保留}),\ \text{及所有路由约束（流平衡/出入库/车辆数/容量/MTZ等）}.
+\]
+BMP仅保留生产/库存/访问序列（$z,\lambda$）等相关约束（即第2章原始/改写后模型中除路由部分以外的约束）。
+
+% ------------------------------------------------------------
+% B. BSP definition: CVRP(t) in set-partitioning form (equivalent cost)
+% ------------------------------------------------------------
+\subsection{Benders子问题（BSP）：给定$(z,\lambda)$计算精确路径成本$\phi(z,\lambda)$}
+
+给定BMP整数解$(\bar z,\bar\lambda)$，子问题BSP定义为
+\begin{equation}
+\phi(\bar z,\bar\lambda)=\sum_{t\in T}\omega_t^*,
+\end{equation}
+其中$\omega_t^*$为时期$t$的CVRP$(t)$最优值。若任一时期CVRP$(t)$不可行，则$\phi(\bar z,\bar\lambda)=+\infty$。
+
+\paragraph{B.1 用集合划分形式表示CVRP$(t)$（并与$\sum c_{ij}x_{ijt}$等价）}
+对时期$t$，由$(\bar z,\bar\lambda)$确定该期必须服务的客户集合与需求。
+令$\mathcal R^t$为所有容量可行路线集合（每条路线从工厂出发并返回工厂），
+$b_r$为路线$r$的行驶成本，定义为
+\begin{equation}
+b_r\ :=\ \sum_{(i,j)\in r} c_{ij},
+\label{eq:br_def}
+\end{equation}
+$a_{ir}=1$表示路线$r$访问客户$i$，否则0；$\xi_r$为是否选用路线$r$的二元变量。
+则CVRP$(t)$可写为：
+\begin{align}
+\text{CVRP}(t):\quad
+\omega_t^*=\min\ & \sum_{r\in\mathcal R^t} b_r\,\xi_r \notag\\
+\text{s.t.}\quad
+& \sum_{r\in\mathcal R^t} a_{ir}\,\xi_r = 1, && \forall i\in N_c^t(\bar z) \notag\\
+& \sum_{r\in\mathcal R^t} \xi_r \le K, \notag\\
+& \xi_r\in\{0,1\}, && \forall r\in\mathcal R^t .
+\label{eq:cvrp_sp_t}
+\end{align}
+在该定义下，\eqref{eq:cvrp_sp_t}的最优值与\eqref{eq:omega_def_arc}（弧变量形式）的最优值一致，
+即“$\omega_t$就是原始$\sum c_{ij}x_{ijt}$在该期最优路由下的取值”。
+
+% ------------------------------------------------------------
+% C. Core LBBD cuts used in Section 3.2.2 (f_lambda, g, LB_R)
+% ------------------------------------------------------------
+\subsection{用于LBBD回调的核心割（对应第3章3.2.2）}
+
+\paragraph{C.1 Hamming距离函数 $f_{\bar\lambda}(\lambda)$（式(3-10)）}
+对当前BMP整数解$\bar\lambda$，定义
+\begin{align}
+f_{\bar\lambda}(\lambda)
+=&\sum_{t\in T}\ \sum_{i\in V_S}\ \sum_{v=\pi(i,t)}^{t-1}\Bigl[
+\mathbf{1}(\bar\lambda_{ivt}=1)\,(1-\lambda_{ivt})
++
+\mathbf{1}(\bar\lambda_{ivt}=0)\,\lambda_{ivt}
+\Bigr]. \label{eq:flambda_def}
+\end{align}
+实现时建议构造两类索引集合并展开：
+\[
+f_{\bar\lambda}(\lambda)=
+\sum_{(i,v,t)\in\mathcal I^1(\bar\lambda)} (1-\lambda_{ivt})
++
+\sum_{(i,v,t)\in\mathcal I^0(\bar\lambda)} \lambda_{ivt},
+\]
+其中
+$\mathcal I^1(\bar\lambda)=\{(i,v,t):\bar\lambda_{ivt}=1\}$，
+$\mathcal I^0(\bar\lambda)=\{(i,v,t):\bar\lambda_{ivt}=0\}$（索引范围均为$t\in T,i\in V_S,v=\pi(i,t),\ldots,t-1$）。
+
+\paragraph{C.2 不可行性割（No-good cut，式(3-9)）}
+当BSP在$(\bar z,\bar\lambda)$下不可行时，向BMP添加：
+\begin{equation}
+f_{\bar\lambda}(\lambda)\ \ge\ 1.
+\label{eq:nogood_feas_39}
+\end{equation}
+
+\paragraph{C.3 最优性割（基于$LB_R$的组合割，式(3-11)--(3-12)）}
+当BSP可行，且$\phi(\bar z,\bar\lambda)>\sum_{t\in T}\bar\omega_t$时，
+向BMP添加：
+\begin{equation}
+\sum_{t\in T}\omega_t\ \ge\ g_{(\bar z,\bar\lambda)}(\lambda),
+\label{eq:opt_g_311}
+\end{equation}
+其中
+\begin{equation}
+g_{(\bar z,\bar\lambda)}(\lambda)
+=\phi(\bar z,\bar\lambda)
+-\bigl(\phi(\bar z,\bar\lambda)-LB_R\bigr)\,f_{\bar\lambda}(\lambda).
+\label{eq:g_def_312}
+\end{equation}
+
+\paragraph{C.4 直接可加到BMP的线性形式（推荐实现用）}
+\begin{equation}
+\sum_{t\in T}\omega_t
++
+\bigl(\phi(\bar z,\bar\lambda)-LB_R\bigr)\,f_{\bar\lambda}(\lambda)
+\ \ge\
+\phi(\bar z,\bar\lambda).
+\label{eq:opt_g_linear}
+\end{equation}
+
+% ------------------------------------------------------------
+% D. Stronger feasibility cuts (Section 3.3.2): (3-14)(3-15)(3-16)
+% ------------------------------------------------------------
+\subsection{加强可行性割（对应第3章3.3.2，推荐优先使用式(3-16)）}
+
+当存在时期$t$使得CVRP$(t)$不可行，令
+\[
+N_c^t(\bar z)=\{\,i\in V_S:\ \bar z_{it}=1\,\},
+\quad
+\bar v_i\ \text{满足}\ \bar\lambda_{i\bar v_i t}=1.
+\]
+
+\paragraph{D.1 基础可行性割（式(3-14)）}
+\begin{equation}
+\sum_{i\in N_c^t(\bar z)}\Bigl(1-\lambda_{i\bar v_i t}\Bigr)
++
+\sum_{i\in N_c^t(\bar z)}\ \sum_{\substack{v=\pi(i,t)\\ \bar\lambda_{ivt}=0}}^{t-1}\lambda_{ivt}
+\ \ge\ 1,
+\qquad \forall t\in T.
+\label{eq:feas_314}
+\end{equation}
+
+\paragraph{D.2 强可行性割（式(3-15)）}
+\begin{equation}
+\sum_{i\in N_c^t(\bar z)}\Bigl(1-\lambda_{i\bar v_i t}\Bigr)\ \ge\ 1,
+\qquad \forall t\in T.
+\label{eq:feas_315}
+\end{equation}
+
+\paragraph{D.3 进一步加强的强可行性割（式(3-16)，推荐）}
+\begin{equation}
+\sum_{i\in N_c^t(\bar z)}\ \sum_{v=\pi(i,t)}^{\bar v_i}\Bigl(1-\lambda_{ivt}\Bigr)\ \ge\ 1,
+\qquad \forall t\in T.
+\label{eq:feas_316}
+\end{equation}
+
+% ------------------------------------------------------------
+% E. Dual-based optimality cuts (Section 3.3.3): (3-18)(3-19)
+% ------------------------------------------------------------
+\subsection{对偶最优性割（对应第3章3.3.3：式(3-18)/(3-19)）}
+
+CVRP$(t)$的LP松弛对偶可写为：
+\begin{align}
+\text{DualCVRP}(t):\quad
+\max\ & \sum_{i\in N_c^t(\bar z)} u_i + K u_0 \notag\\
+\text{s.t.}\quad
+& \sum_{i\in N_c^t(\bar z)} a_{ir} u_i + u_0 \le b_r, && \forall r\in\mathcal R^t \notag\\
+& u_i\in\mathbb R, && \forall i\in N_c^t(\bar z), \notag\\
+& u_0\le 0 .
+\label{eq:dual_cvrp_t}
+\end{align}
+
+设\eqref{eq:dual_cvrp_t}的最优解为$(u_i^*,u_0^*)$，则可向BMP添加：
+
+\paragraph{E.1 最优性割（式(3-18)）}
+\begin{equation}
+\omega_t\ \ge\ \sum_{i\in N_c^t(\bar z)} u_i^*\cdot \lambda_{i\bar v_i t}\ +\ K u_0^*,
+\qquad \forall t\in T.
+\label{eq:opt_318}
+\end{equation}
+
+\paragraph{E.2 加强最优性割（式(3-19)，推荐）}
+\begin{equation}
+\omega_t\ \ge\ \sum_{i\in N_c^t(\bar z)}\ \sum_{v=\pi(i,t)}^{\bar v_i} u_i^*\,\lambda_{ivt}\ +\ K u_0^*,
+\qquad \forall t\in T.
+\label{eq:opt_319}
+\end{equation}
+
+% ------------------------------------------------------------
+% F. Compute LB_R (Section 3.4): (3-20)-(3-24)
+% ------------------------------------------------------------
+\subsection{计算路径成本下界 $LB_R$（对应第3章3.4，用于\eqref{eq:g_def_312}）}
+
+\paragraph{F.1 参数（式(3-20)--(3-23)，规划期长度$l=|T|$）}
+\begin{align}
+f_{il} &= \left\lceil \frac{I_{i0}+\sum_{t=1}^{l}s_{it}}{Q}\right\rceil, && \forall i\in V_S, \label{eq:param_320}\\
+m_L &= \left\lceil \frac{\sum_{i\in V_S}\left(I_{i0}+\sum_{t=1}^{l}s_{it}\right)}{Q}\right\rceil, \label{eq:param_321}\\
+m_U &= K\cdot l, \label{eq:param_322}\\
+q_i &= \min_{t\in T}\{\,s_{it}\,\}, && \forall i\in V_S. \label{eq:param_323}
+\end{align}
+
+\paragraph{F.2 松弛路由问题（RF）（式(3-24)）}
+令$\mathcal R$为所有容量可行路线集合，
+容量判定使用$q_i$（即路线$r$必须满足$\sum_{i\in V_S} q_i a_{ir}\le Q$）。
+令$\zeta_r$为路线$r$在整个规划期内被使用的次数（LP松弛下为连续非负）。
+则
+\begin{align}
+z(RF)=\min\ & \sum_{r\in\mathcal R} b_r\,\zeta_r \notag\\
+\text{s.t.}\quad
+& \sum_{r\in\mathcal R} a_{ir}\,\zeta_r \ge f_{il}, && \forall i\in V_S \notag\\
+& \sum_{r\in\mathcal R} \zeta_r \ge m_L, \notag\\
+& \sum_{r\in\mathcal R} \zeta_r \le m_U, \notag\\
+& \zeta_r \ge 0,\ \zeta_r\in\mathbb Z, && \forall r\in\mathcal R .
+\label{eq:rf_324}
+\end{align}
+
+\paragraph{F.3 $LB_R$定义（实现直接用）}
+\begin{equation}
+LB_R\ :=\ z_{LP}(RF),
+\label{eq:lbr_value}
+\end{equation}
+其中$z_{LP}(RF)$表示将\eqref{eq:rf_324}中的$\zeta_r\in\mathbb Z$放宽为连续变量$\zeta_r\ge 0$后的LP最优值。
+实现时建议用列生成求解该LP（Restricted Master + Pricing），得到常数$LB_R$后在LBBD主循环中复用。
+
+% ------------------------------------------------------------
+% G. Implementable LBBD algorithm skeleton
+% ------------------------------------------------------------
+\subsection{LBBD迭代算法（与第3章一致的可编码伪代码，含$LB_R$）}
+
+\begin{algorithm}[H]
+\caption{LBBD：仅分解车辆路径成本（与论文3.2.2三分支一致）}
+\DontPrintSemicolon
+\KwIn{参数与集合；车辆容量$Q$；车辆上限$K$；规划期$T=\{1,\dots,l\}$；容差$\varepsilon$}
+\KwOut{最优解与最优值}
+
+\textbf{Step 0 (可选一次性预处理):} 计算路径成本下界$LB_R$\; % 对应论文3.4
+
+\textbf{Step 1 (初始化BMP):} 引入$\omega_t\ge0$并移除路由变量/约束；割集$\mathcal C\leftarrow\emptyset$\;
+$UB\leftarrow+\infty$\;
+
+\While{true}{
+  \textbf{(1) 解BMP到整数最优}\;
+  得到$(\bar z,\bar\lambda,\bar\omega)$，并令$LB \leftarrow$ 当前BMP目标值\;
+
+  \textbf{(2) 解BSP（逐期CVRP）}\;
+  $\textit{infeasible}\leftarrow false$，$\phi\leftarrow 0$\;
+  \ForEach{$t\in T$}{
+    由$(\bar z,\bar\lambda)$构造时期$t$的客户集合$N_c^t=\{i:\bar z_{it}=1\}$与需求$q_{it}$\;
+    求解$\text{CVRP}(t)$（或先用BPP做可行性判定）得到$\omega_t^*$；\;
+    \If{$\text{CVRP}(t)$不可行}{
+      $\textit{infeasible}\leftarrow true$，记录该时期$t$\;
+      \textbf{break}\;
+    }
+    $\phi \leftarrow \phi + \omega_t^*$\;
+  }
+
+  \textbf{(3) 若BSP不可行：加可行性割并继续迭代}\;
+  \If{$\textit{infeasible}$}{
+    加可行性割：优先用强可行性割(3-16)；或用(3-14)/(3-15)/(3-9)\;
+    $\mathcal C\leftarrow \mathcal C\cup\{\text{新割}\}$\;
+    \textbf{continue}\;
+  }
+
+  \textbf{(4) BSP可行：更新上界}\;
+  $UB\leftarrow \min\{UB,\ C_{\text{nonVRP}}(\bar z,\bar\lambda)+\phi\}$\;
+
+  \textbf{(5) 若需要：加最优性割}\;
+  \If{$\phi > \sum_{t\in T}\bar\omega_t + \varepsilon$}{
+     加组合最优性割(3-11)(3-12)（用$LB_R$）；或加对偶割(3-19)\;
+     $\mathcal C\leftarrow \mathcal C\cup\{\text{新割}\}$\;
+     \textbf{continue}\;
+  }
+
+  \textbf{(6) 收敛判定}\;
+  \If{$UB-LB\le \varepsilon$}{\textbf{break}}
+}
+\end{algorithm}
+
+
+
+
+\end{document}
