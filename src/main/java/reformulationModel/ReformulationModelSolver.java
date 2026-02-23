@@ -9,9 +9,26 @@ import model.CplexConfig;
 import model.SolveResult;
 
 public final class ReformulationModelSolver {
+    private int[][] lastPrevVisitHint;
+
+    public int[][] getLastPrevVisitHint() {
+        if (lastPrevVisitHint == null) {
+            return null;
+        }
+        int[][] copy = new int[lastPrevVisitHint.length][];
+        for (int i = 0; i < lastPrevVisitHint.length; i++) {
+            if (lastPrevVisitHint[i] == null) {
+                continue;
+            }
+            copy[i] = new int[lastPrevVisitHint[i].length];
+            System.arraycopy(lastPrevVisitHint[i], 0, copy[i], 0, lastPrevVisitHint[i].length);
+        }
+        return copy;
+    }
 
     public SolveResult solve(Instance ins) {
         long startNs = System.nanoTime();
+        lastPrevVisitHint = null;
         try (IloCplex cplex = new IloCplex()) {
             configure(cplex);
 
@@ -261,10 +278,36 @@ public final class ReformulationModelSolver {
             }
 
             boolean solved = cplex.solve();
+            if (solved) {
+                lastPrevVisitHint = extractPrevVisitHint(ins, cplex, lambda);
+            }
             return buildResult("ReformulationModel", solved, cplex, startNs);
         } catch (IloException e) {
             throw new RuntimeException("Failed to solve ReformulationModel", e);
         }
+    }
+
+    private static int[][] extractPrevVisitHint(Instance ins, IloCplex cplex, IloNumVar[][][] lambda) throws IloException {
+        int[][] prevVisit = new int[ins.n + 1][ins.l + 1];
+        for (int i = 1; i <= ins.n; i++) {
+            for (int t = 1; t <= ins.l; t++) {
+                prevVisit[i][t] = -1;
+                int chosenV = -1;
+                double bestVal = 0.5;
+                for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                    if (lambda[i][v][t] == null) {
+                        continue;
+                    }
+                    double val = cplex.getValue(lambda[i][v][t]);
+                    if (val > bestVal) {
+                        bestVal = val;
+                        chosenV = v;
+                    }
+                }
+                prevVisit[i][t] = chosenV;
+            }
+        }
+        return prevVisit;
     }
 
     private static boolean isPickupNode(int node, int n) {

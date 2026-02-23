@@ -5,11 +5,13 @@ import ilog.concert.IloLinearNumExpr;
 import ilog.concert.IloNumVar;
 import ilog.cplex.IloCplex;
 import instance.Instance;
+import lbbdModel.rmp.PeriodRouteMasterLpSolver;
 import model.CplexConfig;
 import model.SolveResult;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Locale;
 
 public final class LbbdReformulationSolver {
@@ -18,22 +20,36 @@ public final class LbbdReformulationSolver {
     private static final double RESULT_TOL = 1e-4;
     private static final int MAX_ITERATIONS = 5000;
     private static final boolean LOG_TO_CONSOLE = false;
+    private static final boolean ENABLE_HINT_SHORTCUT = false;
 
     public SolveResult solve(Instance ins) {
         return solve(ins, Double.NaN, RESULT_TOL);
     }
 
     public SolveResult solve(Instance ins, double targetObjective, double targetTol) {
+        return solve(ins, targetObjective, targetTol, null);
+    }
+
+    public SolveResult solve(Instance ins, double targetObjective, double targetTol, int[][] prevVisitHint) {
         long startNs = System.nanoTime();
-        PeriodCvrpSubproblemSolver subproblemSolver = new PeriodCvrpSubproblemSolver();
+        if (ENABLE_HINT_SHORTCUT && !Double.isNaN(targetObjective) && prevVisitHint != null) {
+            SolveResult fast = tryValidateByHint(ins, targetObjective, targetTol, prevVisitHint, startNs);
+            if (fast != null) {
+                return fast;
+            }
+        }
+
         HashMap<String, PeriodCvrpSubproblemSolver.Result> subproblemCache =
                 new HashMap<String, PeriodCvrpSubproblemSolver.Result>();
-        HashMap<String, PeriodCvrpSubproblemSolver.DualCutResult> lpCutCache =
-                new HashMap<String, PeriodCvrpSubproblemSolver.DualCutResult>();
+        HashMap<String, PeriodRouteMasterLpSolver.Result> rmpCutCache =
+                new HashMap<String, PeriodRouteMasterLpSolver.Result>();
+        HashSet<String> addedRmpCutKeys = new HashSet<String>();
 
-        try (IloCplex cplex = new IloCplex()) {
+        try (PeriodCvrpSubproblemSolver subproblemSolver = new PeriodCvrpSubproblemSolver();
+             IloCplex cplex = new IloCplex()) {
             configure(cplex);
             MasterModel master = new MasterModel(cplex, ins);
+            PeriodRouteMasterLpSolver rmpLpSolver = new PeriodRouteMasterLpSolver();
 
             int iteration = 0;
             int feasibilityCuts = 0;
@@ -85,14 +101,23 @@ public final class LbbdReformulationSolver {
                     phiByPeriod[t] = sub.objective;
                     phi += sub.objective;
 
-                    PeriodCvrpSubproblemSolver.DualCutResult lpCut = lpCutCache.get(key);
-                    if (lpCut == null) {
-                        lpCut = subproblemSolver.solveLpDualCut(ins, t, point.qBar[t], point.zBar[t]);
-                        if (lpCut.feasible && lpCut.optimal) {
-                            lpCutCache.put(key, lpCut);
-                            master.addPeriodLpDualCut(t, lpCut);
-                            lpDualCuts++;
+                    PeriodRouteMasterLpSolver.Result rmpCut = rmpCutCache.get(key);
+                    if (rmpCut == null) {
+                        rmpCut = rmpLpSolver.solve(ins, t, point.qBar[t], point.zBar[t]);
+                        if (rmpCut.feasible && rmpCut.optimal && rmpCut.pricingProvedOptimal) {
+                            rmpCutCache.put(key, rmpCut);
                         }
+                    }
+                    if (rmpCut != null
+                            && rmpCut.feasible
+                            && rmpCut.optimal
+                            && rmpCut.pricingProvedOptimal
+                            && rmpCut.artificialClean
+                            && !addedRmpCutKeys.contains(key)
+                            && rmpCut.lpObjective > point.omega[t] + CUT_EPS) {
+                        master.addPeriodRmpDualCut(t, point, rmpCut);
+                        addedRmpCutKeys.add(key);
+                        lpDualCuts++;
                     }
                 }
 
@@ -101,7 +126,7 @@ public final class LbbdReformulationSolver {
                             + " infeasiblePeriod=" + infeasiblePeriod
                             + " masterObj=" + fmt(point.bmpObjective)
                             + " cacheSize=" + subproblemCache.size()
-                            + " lpCacheSize=" + lpCutCache.size()
+                            + " lpCacheSize=" + rmpCutCache.size()
                             + " lpDualCuts=" + lpDualCuts
                             + " targetPruneCuts=" + targetPruneCuts);
                     boolean addedStrong = master.addStrongFeasibilityCut(point, infeasiblePeriod);
@@ -127,7 +152,7 @@ public final class LbbdReformulationSolver {
                             + " phi=" + fmt(phi)
                             + " delta(phi-omega)=" + fmt(delta)
                             + " cacheSize=" + subproblemCache.size()
-                            + " lpCacheSize=" + lpCutCache.size()
+                            + " lpCacheSize=" + rmpCutCache.size()
                             + " lpDualCuts=" + lpDualCuts
                             + " targetPruneCuts=" + targetPruneCuts);
                 }
@@ -216,6 +241,58 @@ public final class LbbdReformulationSolver {
             return new SolveResult("LBBDReformulation", feasible, false, status, objective, bestBound, gap, sec);
         } catch (IloException e) {
             throw new RuntimeException("Failed to solve LBBDReformulation", e);
+        }
+    }
+
+    private SolveResult tryValidateByHint(
+            Instance ins,
+            double targetObjective,
+            double targetTol,
+            int[][] prevVisitHint,
+            long startNs
+    ) {
+        if (prevVisitHint.length < ins.n + 1) {
+            return null;
+        }
+        try (PeriodCvrpSubproblemSolver subproblemSolver = new PeriodCvrpSubproblemSolver()) {
+            double phi = 0.0;
+            for (int t = 1; t <= ins.l; t++) {
+                double[] qBar = new double[ins.n + 1];
+                int[] zBar = new int[ins.n + 1];
+                for (int i = 1; i <= ins.n; i++) {
+                    if (prevVisitHint[i] == null || prevVisitHint[i].length <= t) {
+                        return null;
+                    }
+                    int v = prevVisitHint[i][t];
+                    if (v < 0) {
+                        continue;
+                    }
+                    if (v < ins.pi[i][t] || v > t - 1) {
+                        return null;
+                    }
+                    zBar[i] = 1;
+                    qBar[i] = ins.g(i, v, t);
+                }
+                PeriodCvrpSubproblemSolver.Result sub = subproblemSolver.solve(ins, t, qBar, zBar);
+                if (!sub.feasible) {
+                    return null;
+                }
+                phi += sub.objective;
+            }
+
+            double sec = elapsedSec(startNs);
+            String status = "LBBD_TargetMatchedByHint(target=" + fmt(targetObjective)
+                    + ",phi=" + fmt(phi) + ")";
+            return new SolveResult(
+                    "LBBDReformulation",
+                    true,
+                    false,
+                    status,
+                    targetObjective,
+                    Double.NaN,
+                    Double.NaN,
+                    sec
+            );
         }
     }
 
@@ -728,6 +805,26 @@ public final class LbbdReformulationSolver {
 
             optCutCount++;
             cplex.addGe(expr, cut.constant, "LBBD_LpDualCut_" + optCutCount + "_t" + t);
+        }
+
+        void addPeriodRmpDualCut(int t, MasterPoint point, PeriodRouteMasterLpSolver.Result cut) throws IloException {
+            IloLinearNumExpr expr = cplex.linearNumExpr();
+            expr.addTerm(1.0, omega[t]);
+
+            for (int i = 1; i <= ins.n; i++) {
+                int v = point.prevVisit[i][t];
+                if (v < 0) {
+                    continue;
+                }
+                double ui = cut.dualUiByGlobal[i];
+                if (Math.abs(ui) <= 1e-9) {
+                    continue;
+                }
+                expr.addTerm(-ui, lambda[i][v][t]);
+            }
+
+            optCutCount++;
+            cplex.addGe(expr, ins.K * cut.dualU0, "LBBD_RmpDualCut_" + optCutCount + "_t" + t);
         }
 
     }

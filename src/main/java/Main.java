@@ -11,7 +11,7 @@ public class Main {
     public static void main(String[] args) {
         String[] instancePaths = (args.length > 0)
                 ? args
-                : new String[]{"data/MVPRP/MVPRP1_10_3_3.txt"};
+                : new String[]{"data/MVPRP/MVPRP1_10_6_3.txt"};
 
         for (int idx = 0; idx < instancePaths.length; idx++) {
             if (idx > 0) {
@@ -30,12 +30,11 @@ public class Main {
             Instance ins = Instance.fromFile(instancePath, options);
 
             SolveResult originalResult = new OriginalModelSolver().solve(ins);
-            SolveResult reformulationResult = new ReformulationModelSolver().solve(ins);
+            ReformulationModelSolver reformulationSolver = new ReformulationModelSolver();
+            SolveResult reformulationResult = reformulationSolver.solve(ins);
 
             LbbdReformulationSolver lbbdSolver = new LbbdReformulationSolver();
-            SolveResult lbbdResult = hasObjective(reformulationResult)
-                    ? lbbdSolver.solve(ins, reformulationResult.objective, 1e-4)
-                    : lbbdSolver.solve(ins);
+            SolveResult lbbdResult = lbbdSolver.solve(ins);
 
             System.out.println("Instance: " + instancePath);
             System.out.println("n=" + ins.n + ", l=" + ins.l + ", K=" + ins.K + ", Q=" + format(ins.Q));
