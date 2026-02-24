@@ -2,6 +2,7 @@ package lbbdModel.rmp;
 
 import instance.Instance;
 
+import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.BitSet;
 import java.util.HashMap;
@@ -22,11 +23,13 @@ public final class PricingEspprcSolver {
         public final boolean foundNegativeColumn;
         public final double bestReducedCost;
         public final RouteColumn route;
+        public final ArrayList<RouteColumn> routes;
 
-        public Result(boolean foundNegativeColumn, double bestReducedCost, RouteColumn route) {
+        public Result(boolean foundNegativeColumn, double bestReducedCost, RouteColumn route, ArrayList<RouteColumn> routes) {
             this.foundNegativeColumn = foundNegativeColumn;
             this.bestReducedCost = bestReducedCost;
             this.route = route;
+            this.routes = routes;
         }
     }
 
@@ -38,20 +41,33 @@ public final class PricingEspprcSolver {
             double dualU0,
             HashSet<String> existingRouteKeys
     ) {
+        return findNegativeRoutes(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, 1);
+    }
+
+    public Result findNegativeRoutes(
+            Instance ins,
+            int[] activeGlobalCustomers,
+            double[] qLocal,
+            double[] dualUiLocal,
+            double dualU0,
+            HashSet<String> existingRouteKeys,
+            int maxColumns
+    ) {
         if (activeGlobalCustomers.length == 0) {
-            return new Result(false, 0.0, null);
+            return new Result(false, 0.0, null, new ArrayList<RouteColumn>());
         }
         Search search;
         if (activeGlobalCustomers.length <= 62) {
-            search = new LongMaskSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys);
+            search = new LongMaskSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns);
         } else {
-            search = new BitSetSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys);
+            search = new BitSetSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns);
         }
         search.run();
+        ArrayList<RouteColumn> routes = search.getCollectedRoutes();
         if (search.bestRoute != null && search.bestReducedCost < -RC_EPS) {
-            return new Result(true, search.bestReducedCost, search.bestRoute);
+            return new Result(true, search.bestReducedCost, search.bestRoute, routes);
         }
-        return new Result(false, search.bestReducedCost, null);
+        return new Result(false, search.bestReducedCost, null, routes);
     }
 
     private abstract static class Search {
@@ -61,6 +77,9 @@ public final class PricingEspprcSolver {
         final double[] dual;
         final double dualU0;
         final HashSet<String> existingKeys;
+        final int maxColumns;
+        final ArrayList<CollectedColumn> collected;
+        final HashSet<String> collectedKeys;
 
         double bestReducedCost = Double.POSITIVE_INFINITY;
         RouteColumn bestRoute = null;
@@ -71,7 +90,8 @@ public final class PricingEspprcSolver {
                 double[] q,
                 double[] dual,
                 double dualU0,
-                HashSet<String> existingKeys
+                HashSet<String> existingKeys,
+                int maxColumns
         ) {
             this.ins = ins;
             this.customers = customers;
@@ -79,15 +99,30 @@ public final class PricingEspprcSolver {
             this.dual = dual;
             this.dualU0 = dualU0;
             this.existingKeys = existingKeys;
+            this.maxColumns = Math.max(0, maxColumns);
+            this.collected = new ArrayList<CollectedColumn>();
+            this.collectedKeys = new HashSet<String>();
         }
 
         abstract void run();
+
+        final ArrayList<RouteColumn> getCollectedRoutes() {
+            ArrayList<RouteColumn> out = new ArrayList<RouteColumn>(collected.size());
+            for (int i = 0; i < collected.size(); i++) {
+                out.add(collected.get(i).route);
+            }
+            return out;
+        }
 
         final void considerCompleteRoute(AbstractLabel label) {
             int lastGlobalNode = customers[label.lastLocal];
             double fullCost = label.travelCost + ins.c[lastGlobalNode][ins.n + 1];
             double reducedCost = fullCost - label.dualGain - dualU0;
-            if (reducedCost >= bestReducedCost - DOM_EPS) {
+            boolean canImproveBest = reducedCost < bestReducedCost - DOM_EPS;
+            boolean canCollect = maxColumns > 0 && reducedCost < -RC_EPS
+                    && (collected.size() < maxColumns
+                    || reducedCost < collected.get(collected.size() - 1).reducedCost - DOM_EPS);
+            if (!canImproveBest && !canCollect) {
                 return;
             }
             int[] globals = reconstructGlobals(label);
@@ -95,8 +130,14 @@ public final class PricingEspprcSolver {
             if (existingKeys.contains(key)) {
                 return;
             }
-            bestReducedCost = reducedCost;
-            bestRoute = new RouteColumn(globals, fullCost, label.load);
+            RouteColumn route = new RouteColumn(globals, fullCost, label.load);
+            if (canImproveBest) {
+                bestReducedCost = reducedCost;
+                bestRoute = route;
+            }
+            if (maxColumns > 0 && reducedCost < -RC_EPS && !collectedKeys.contains(key)) {
+                maybeCollect(new CollectedColumn(reducedCost, route, key));
+            }
         }
 
         private int[] reconstructGlobals(AbstractLabel label) {
@@ -119,6 +160,35 @@ public final class PricingEspprcSolver {
             }
             return sb.toString();
         }
+
+        private void maybeCollect(CollectedColumn candidate) {
+            if (collected.size() >= maxColumns) {
+                CollectedColumn worst = collected.get(collected.size() - 1);
+                if (candidate.reducedCost >= worst.reducedCost - DOM_EPS) {
+                    return;
+                }
+                collectedKeys.remove(worst.key);
+                collected.remove(collected.size() - 1);
+            }
+            int pos = collected.size();
+            while (pos > 0 && candidate.reducedCost < collected.get(pos - 1).reducedCost - DOM_EPS) {
+                pos--;
+            }
+            collected.add(pos, candidate);
+            collectedKeys.add(candidate.key);
+        }
+    }
+
+    private static final class CollectedColumn {
+        final double reducedCost;
+        final RouteColumn route;
+        final String key;
+
+        CollectedColumn(double reducedCost, RouteColumn route, String key) {
+            this.reducedCost = reducedCost;
+            this.route = route;
+            this.key = key;
+        }
     }
 
     private abstract static class AbstractLabel {
@@ -127,6 +197,7 @@ public final class PricingEspprcSolver {
         final double load;
         final double travelCost; // depot -> ... -> last (without return arc)
         final double dualGain;   // sum duals for visited customers
+        final double partialReducedCost; // travelCost - dualGain
         final AbstractLabel pred;
 
         AbstractLabel(
@@ -142,14 +213,18 @@ public final class PricingEspprcSolver {
             this.load = load;
             this.travelCost = travelCost;
             this.dualGain = dualGain;
+            this.partialReducedCost = travelCost - dualGain;
             this.pred = pred;
         }
     }
 
     private static final class LongMaskSearch extends Search {
         private final long fullMask;
+        private final long[] localBit;
+        private final double[] returnToDepot;
+        private final int[] positiveDualOrder;
         private final ArrayDeque<LongLabel> queue;
-        private final HashMap<LongStateKey, LongLabel> bestByState;
+        private final HashMap<Long, LongLabel>[] bestByMaskAtLast;
 
         LongMaskSearch(
                 Instance ins,
@@ -157,12 +232,25 @@ public final class PricingEspprcSolver {
                 double[] q,
                 double[] dual,
                 double dualU0,
-                HashSet<String> existingKeys
+                HashSet<String> existingKeys,
+                int maxColumns
         ) {
-            super(ins, customers, q, dual, dualU0, existingKeys);
+            super(ins, customers, q, dual, dualU0, existingKeys, maxColumns);
             this.fullMask = (1L << customers.length) - 1L;
+            this.localBit = new long[customers.length];
+            this.returnToDepot = new double[customers.length];
+            for (int k = 0; k < customers.length; k++) {
+                this.localBit[k] = 1L << k;
+                this.returnToDepot[k] = ins.c[customers[k]][ins.n + 1];
+            }
+            this.positiveDualOrder = buildPositiveDualOrder(dual);
             this.queue = new ArrayDeque<LongLabel>();
-            this.bestByState = new HashMap<LongStateKey, LongLabel>();
+            @SuppressWarnings("unchecked")
+            HashMap<Long, LongLabel>[] maps = (HashMap<Long, LongLabel>[]) new HashMap[customers.length];
+            for (int k = 0; k < customers.length; k++) {
+                maps[k] = new HashMap<Long, LongLabel>();
+            }
+            this.bestByMaskAtLast = maps;
         }
 
         @Override
@@ -184,6 +272,9 @@ public final class PricingEspprcSolver {
             while (!queue.isEmpty()) {
                 LongLabel cur = queue.pollFirst();
                 considerCompleteRoute(cur);
+                if (cannotBeatBest(cur)) {
+                    continue;
+                }
 
                 long remaining = fullMask & ~cur.visitedMask;
                 while (remaining != 0L) {
@@ -215,15 +306,114 @@ public final class PricingEspprcSolver {
         }
 
         private boolean register(LongLabel label) {
-            LongStateKey key = new LongStateKey(label.lastLocal, label.visitedMask);
-            LongLabel incumbent = bestByState.get(key);
+            HashMap<Long, LongLabel> exactMap = bestByMaskAtLast[label.lastLocal];
+            LongLabel incumbent = exactMap.get(label.visitedMask);
             if (incumbent != null) {
                 if (incumbent.travelCost <= label.travelCost + DOM_EPS) {
                     return false;
                 }
             }
-            bestByState.put(key, label);
+
+            if (isDominatedBySubset(label, exactMap)) {
+                return false;
+            }
+
+            exactMap.put(label.visitedMask, label);
             return true;
+        }
+
+        private boolean isDominatedBySubset(LongLabel label, HashMap<Long, LongLabel> exactMap) {
+            if (label.depth <= 1) {
+                return false;
+            }
+            long lastBit = localBit[label.lastLocal];
+            long free = label.visitedMask ^ lastBit;
+            long subFree = free;
+            while (true) {
+                long subsetMask = subFree | lastBit;
+                LongLabel subset = exactMap.get(subsetMask);
+                if (subset != null && subset.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
+                    return true;
+                }
+                if (subFree == 0L) {
+                    break;
+                }
+                subFree = (subFree - 1L) & free;
+            }
+            return false;
+        }
+
+        private boolean cannotBeatBest(LongLabel label) {
+            if (bestReducedCost == Double.POSITIVE_INFINITY) {
+                return false;
+            }
+            double optimisticExtraDual = upperBoundExtraDualGain(label);
+            double lowerBoundFinalReducedCost =
+                    label.travelCost + returnToDepot[label.lastLocal] - label.dualGain - dualU0 - optimisticExtraDual;
+            return lowerBoundFinalReducedCost >= bestReducedCost - DOM_EPS;
+        }
+
+        private double upperBoundExtraDualGain(LongLabel label) {
+            if (positiveDualOrder.length == 0) {
+                return 0.0;
+            }
+            double remCap = ins.Q - label.load;
+            if (remCap <= 1e-9) {
+                return 0.0;
+            }
+            double ub = 0.0;
+            long visited = label.visitedMask;
+            for (int p = 0; p < positiveDualOrder.length; p++) {
+                int idx = positiveDualOrder[p];
+                long bit = localBit[idx];
+                if ((visited & bit) != 0L) {
+                    continue;
+                }
+                double qq = q[idx];
+                if (qq <= remCap + 1e-9) {
+                    ub += dual[idx];
+                    remCap -= qq;
+                } else {
+                    ub += dual[idx] * (remCap / qq);
+                    break;
+                }
+                if (remCap <= 1e-9) {
+                    break;
+                }
+            }
+            return ub;
+        }
+
+        private int[] buildPositiveDualOrder(double[] dual) {
+            int m = dual.length;
+            int[] tmp = new int[m];
+            int cnt = 0;
+            for (int i = 0; i < m; i++) {
+                if (dual[i] > 1e-12) {
+                    tmp[cnt++] = i;
+                }
+            }
+            if (cnt == 0) {
+                return new int[0];
+            }
+            int[] arr = new int[cnt];
+            System.arraycopy(tmp, 0, arr, 0, cnt);
+            // insertion sort (m is small in pricing)
+            for (int i = 1; i < cnt; i++) {
+                int key = arr[i];
+                double keyRatio = dual[key] / Math.max(1e-12, q[key]);
+                int j = i - 1;
+                while (j >= 0) {
+                    double ratioJ = dual[arr[j]] / Math.max(1e-12, q[arr[j]]);
+                    if (ratioJ >= keyRatio - 1e-15) {
+                        break;
+                    }
+                    arr[j + 1] = arr[j];
+                    j--;
+                }
+                arr[j + 1] = key;
+            }
+            return arr;
         }
     }
 
@@ -244,36 +434,6 @@ public final class PricingEspprcSolver {
         }
     }
 
-    private static final class LongStateKey {
-        final int lastLocal;
-        final long visitedMask;
-        final int hash;
-
-        LongStateKey(int lastLocal, long visitedMask) {
-            this.lastLocal = lastLocal;
-            this.visitedMask = visitedMask;
-            int h = 31 * lastLocal + (int) (visitedMask ^ (visitedMask >>> 32));
-            this.hash = h;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) {
-                return true;
-            }
-            if (!(o instanceof LongStateKey)) {
-                return false;
-            }
-            LongStateKey other = (LongStateKey) o;
-            return this.lastLocal == other.lastLocal && this.visitedMask == other.visitedMask;
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
-        }
-    }
-
     private static final class BitSetSearch extends Search {
         private final int customerCount;
         private final ArrayDeque<BitSetLabel> queue;
@@ -285,9 +445,10 @@ public final class PricingEspprcSolver {
                 double[] q,
                 double[] dual,
                 double dualU0,
-                HashSet<String> existingKeys
+                HashSet<String> existingKeys,
+                int maxColumns
         ) {
-            super(ins, customers, q, dual, dualU0, existingKeys);
+            super(ins, customers, q, dual, dualU0, existingKeys, maxColumns);
             this.customerCount = customers.length;
             this.queue = new ArrayDeque<BitSetLabel>();
             this.bestByState = new HashMap<BitSetStateKey, BitSetLabel>();

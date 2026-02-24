@@ -77,6 +77,7 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
                 model = new ExactPeriodModel(ins, t);
                 exactModels.put(t, model);
             }
+            model.setSolveThreads(recommendedExactThreads(visitCount));
             return model.solve(qBar, zBar, totalPickup);
         } catch (IloException e) {
             throw new RuntimeException("Failed to solve CVRP subproblem at t=" + t, e);
@@ -159,6 +160,16 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
 
     private static boolean isPickupNode(int node, int n) {
         return node >= 1 && node <= n;
+    }
+
+    private static int recommendedExactThreads(int visitCount) {
+        if (visitCount <= 8) {
+            return 1;
+        }
+        if (visitCount <= 12) {
+            return 2;
+        }
+        return 4;
     }
 
     private static void configure(IloCplex cplex) throws IloException {
@@ -294,6 +305,10 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
                 return new Result(false, false, status, Double.NaN);
             }
             return new Result(true, optimal, status, cplex.getObjValue());
+        }
+
+        void setSolveThreads(int threads) throws IloException {
+            cplex.setParam(IloCplex.Param.Threads, Math.max(1, threads));
         }
 
         private void updateMtzRhs(double[] qBar) throws IloException {

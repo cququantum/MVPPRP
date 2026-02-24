@@ -8,20 +8,33 @@ import java.io.IOException;
 import java.util.Locale;
 
 public class Main {
+    private enum SolverMode { ALL, ORIGINAL, REFORM, LBBD }
+
     public static void main(String[] args) {
-        String[] instancePaths = (args.length > 0)
-                ? args
-                : new String[]{"data/MVPRP/MVPRP1_15_3_2.txt"};
+        SolverMode solverMode = SolverMode.ALL;
+        int startArg = 0;
+        if (args.length > 0 && args[0].startsWith("--solver=")) {
+            solverMode = parseSolverMode(args[0].substring("--solver=".length()));
+            startArg = 1;
+        }
+
+        String[] instancePaths;
+        if (args.length > startArg) {
+            instancePaths = new String[args.length - startArg];
+            System.arraycopy(args, startArg, instancePaths, 0, instancePaths.length);
+        } else {
+            instancePaths = new String[]{"data/MVPRP/MVPRP3_10_3_2.txt"};
+        }
 
         for (int idx = 0; idx < instancePaths.length; idx++) {
             if (idx > 0) {
                 System.out.println();
             }
-            runSingleInstance(instancePaths[idx]);
+            runSingleInstance(instancePaths[idx], solverMode);
         }
     }
 
-    private static void runSingleInstance(String instancePath) {
+    private static void runSingleInstance(String instancePath, SolverMode solverMode) {
         Instance.Options options = Instance.Options.defaults();
         options.distanceMode = Instance.Options.DistanceMode.EUCLIDEAN_FLOAT;
         options.autoSetDt = true;
@@ -29,23 +42,62 @@ public class Main {
         try {
             Instance ins = Instance.fromFile(instancePath, options);
 
-            SolveResult originalResult = new OriginalModelSolver().solve(ins);
-            ReformulationModelSolver reformulationSolver = new ReformulationModelSolver();
-            SolveResult reformulationResult = reformulationSolver.solve(ins);
+            SolveResult originalResult = null;
+            SolveResult reformulationResult = null;
+            SolveResult lbbdResult = null;
 
-            LbbdReformulationSolver lbbdSolver = new LbbdReformulationSolver();
-            SolveResult lbbdResult = lbbdSolver.solve(ins);
+            if (solverMode == SolverMode.ALL || solverMode == SolverMode.ORIGINAL) {
+                originalResult = new OriginalModelSolver().solve(ins);
+            }
+            if (solverMode == SolverMode.ALL || solverMode == SolverMode.REFORM) {
+                ReformulationModelSolver reformulationSolver = new ReformulationModelSolver();
+                reformulationResult = reformulationSolver.solve(ins);
+            }
+            if (solverMode == SolverMode.ALL || solverMode == SolverMode.LBBD) {
+                LbbdReformulationSolver lbbdSolver = new LbbdReformulationSolver();
+                lbbdResult = lbbdSolver.solve(ins);
+            }
 
             System.out.println("Instance: " + instancePath);
             System.out.println("n=" + ins.n + ", l=" + ins.l + ", K=" + ins.K + ", Q=" + format(ins.Q));
-            System.out.println(originalResult.toSummaryLine());
-            System.out.println(reformulationResult.toSummaryLine());
-            System.out.println(lbbdResult.toSummaryLine());
-            printComparison(originalResult, reformulationResult);
-            printValidation("reform-vs-lbbd", reformulationResult, lbbdResult, 1e-4);
+            if (originalResult != null) {
+                System.out.println(originalResult.toSummaryLine());
+            }
+            if (reformulationResult != null) {
+                System.out.println(reformulationResult.toSummaryLine());
+            }
+            if (lbbdResult != null) {
+                System.out.println(lbbdResult.toSummaryLine());
+            }
+            if (originalResult != null && reformulationResult != null) {
+                printComparison(originalResult, reformulationResult);
+            }
+            if (reformulationResult != null && lbbdResult != null) {
+                printValidation("reform-vs-lbbd", reformulationResult, lbbdResult, 1e-4);
+            }
         } catch (IOException e) {
             throw new RuntimeException("Failed to load instance file: " + instancePath, e);
         }
+    }
+
+    private static SolverMode parseSolverMode(String s) {
+        if (s == null) {
+            return SolverMode.ALL;
+        }
+        String x = s.trim().toLowerCase(Locale.ROOT);
+        if ("all".equals(x)) {
+            return SolverMode.ALL;
+        }
+        if ("original".equals(x)) {
+            return SolverMode.ORIGINAL;
+        }
+        if ("reform".equals(x) || "reformulation".equals(x)) {
+            return SolverMode.REFORM;
+        }
+        if ("lbbd".equals(x)) {
+            return SolverMode.LBBD;
+        }
+        throw new IllegalArgumentException("Unsupported --solver mode: " + s);
     }
 
     private static void printComparison(SolveResult original, SolveResult reformulation) {

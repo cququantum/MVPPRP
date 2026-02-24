@@ -10,6 +10,7 @@ import instance.Instance;
 import model.CplexConfig;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 
 /**
@@ -20,6 +21,7 @@ public final class PeriodRouteMasterLpSolver {
     private static final boolean LOG_TO_CONSOLE = false;
     private static final double RC_EPS = 1e-8;
     private static final double ART_EPS = 1e-7;
+    private static final int MAX_COLUMNS_PER_PRICING = 8;
 
     public static final class Result {
         public final boolean feasible;
@@ -69,8 +71,11 @@ public final class PeriodRouteMasterLpSolver {
         }
 
         double[] qLocal = new double[m];
+        int[] localIndexByGlobal = new int[ins.nodeCount];
+        Arrays.fill(localIndexByGlobal, -1);
         for (int k = 0; k < m; k++) {
             qLocal[k] = qBar[activeCustomers[k]];
+            localIndexByGlobal[activeCustomers[k]] = k;
             if (qLocal[k] > ins.Q + 1e-9) {
                 return new Result(false, false, false, false, "InfeasibleBySingleCustomerCapacity", Double.NaN,
                         null, Double.NaN, 0, m);
@@ -102,7 +107,7 @@ public final class PeriodRouteMasterLpSolver {
                 int g = activeCustomers[k];
                 double cost = ins.c[0][g] + ins.c[g][ins.n + 1];
                 RouteColumn singleton = new RouteColumn(new int[]{g}, cost, qLocal[k]);
-                addRouteColumn(cplex, obj, coverEq, vehLimit, activeCustomers, singleton, routeVars, existingRouteKeys,
+                addRouteColumn(cplex, obj, coverEq, vehLimit, localIndexByGlobal, singleton, routeVars, existingRouteKeys,
                         "init_" + t + "_" + k);
             }
 
@@ -126,24 +131,37 @@ public final class PeriodRouteMasterLpSolver {
                 }
                 lastDualU0 = cplex.getDual(vehLimit);
 
-                PricingEspprcSolver.Result pricing = pricingSolver.findBestNegativeRoute(
+                PricingEspprcSolver.Result pricing = pricingSolver.findNegativeRoutes(
                         ins,
                         activeCustomers,
                         qLocal,
                         lastDualUiLocal,
                         lastDualU0,
-                        existingRouteKeys
+                        existingRouteKeys,
+                        MAX_COLUMNS_PER_PRICING
                 );
 
                 if (!pricing.foundNegativeColumn) {
                     break;
                 }
 
-                addRouteColumn(
-                        cplex, obj, coverEq, vehLimit, activeCustomers, pricing.route, routeVars, existingRouteKeys,
-                        "cg_" + t + "_" + generatedColumns
-                );
-                generatedColumns++;
+                ArrayList<RouteColumn> newRoutes = pricing.routes;
+                if (newRoutes == null || newRoutes.isEmpty()) {
+                    // Safety fallback: preserve old behavior if pricing only returns the best route.
+                    addRouteColumn(
+                            cplex, obj, coverEq, vehLimit, localIndexByGlobal, pricing.route, routeVars, existingRouteKeys,
+                            "cg_" + t + "_" + generatedColumns
+                    );
+                    generatedColumns++;
+                } else {
+                    for (int r = 0; r < newRoutes.size(); r++) {
+                        addRouteColumn(
+                                cplex, obj, coverEq, vehLimit, localIndexByGlobal, newRoutes.get(r), routeVars, existingRouteKeys,
+                                "cg_" + t + "_" + generatedColumns
+                        );
+                        generatedColumns++;
+                    }
+                }
             }
 
             boolean artificialClean = true;
@@ -209,7 +227,7 @@ public final class PeriodRouteMasterLpSolver {
             IloObjective obj,
             IloRange[] coverEq,
             IloRange vehLimit,
-            int[] activeCustomers,
+            int[] localIndexByGlobal,
             RouteColumn route,
             ArrayList<IloNumVar> routeVars,
             HashSet<String> existingRouteKeys,
@@ -222,10 +240,10 @@ public final class PeriodRouteMasterLpSolver {
         existingRouteKeys.add(key);
 
         IloColumn col = cplex.column(obj, route.cost).and(cplex.column(vehLimit, 1.0));
-        boolean[] coveredLocal = new boolean[activeCustomers.length];
+        boolean[] coveredLocal = new boolean[coverEq.length];
         for (int pos = 0; pos < route.globalCustomersInOrder.length; pos++) {
             int g = route.globalCustomersInOrder[pos];
-            int local = indexOf(activeCustomers, g);
+            int local = (g >= 0 && g < localIndexByGlobal.length) ? localIndexByGlobal[g] : -1;
             if (local >= 0 && !coveredLocal[local]) {
                 col = col.and(cplex.column(coverEq[local], 1.0));
                 coveredLocal[local] = true;
@@ -233,15 +251,6 @@ public final class PeriodRouteMasterLpSolver {
         }
         IloNumVar var = cplex.numVar(col, 0.0, Double.MAX_VALUE, "xi_" + varName);
         routeVars.add(var);
-    }
-
-    private static int indexOf(int[] arr, int x) {
-        for (int i = 0; i < arr.length; i++) {
-            if (arr[i] == x) {
-                return i;
-            }
-        }
-        return -1;
     }
 
     private static void configureLp(IloCplex cplex) throws IloException {
