@@ -11,7 +11,7 @@ public class Main {
     public static void main(String[] args) {
         String[] instancePaths = (args.length > 0)
                 ? args
-                : new String[]{"data/MVPRP/MVPRP1_10_6_3.txt"};
+                : new String[]{"data/MVPRP/MVPRP1_15_3_2.txt"};
 
         for (int idx = 0; idx < instancePaths.length; idx++) {
             if (idx > 0) {
