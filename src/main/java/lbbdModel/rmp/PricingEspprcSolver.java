@@ -18,6 +18,7 @@ import java.util.HashSet;
 public final class PricingEspprcSolver {
     private static final double RC_EPS = 1e-8;
     private static final double DOM_EPS = 1e-12;
+    private static final int SUPERSET_CLEANUP_MAX_EXTRA_BITS = 7;
 
     public static final class Result {
         public final boolean foundNegativeColumn;
@@ -271,6 +272,9 @@ public final class PricingEspprcSolver {
 
             while (!queue.isEmpty()) {
                 LongLabel cur = queue.pollFirst();
+                if (!isCurrentBest(cur)) {
+                    continue;
+                }
                 considerCompleteRoute(cur);
                 if (cannotBeatBest(cur)) {
                     continue;
@@ -314,33 +318,56 @@ public final class PricingEspprcSolver {
                 }
             }
 
-            if (isDominatedBySubset(label, exactMap)) {
+            if (isDominatedByProperSubset(label, exactMap)) {
                 return false;
             }
 
             exactMap.put(label.visitedMask, label);
+            removeDominatedSupersetsNearTail(label, exactMap);
             return true;
         }
 
-        private boolean isDominatedBySubset(LongLabel label, HashMap<Long, LongLabel> exactMap) {
+        private boolean isCurrentBest(LongLabel label) {
+            return bestByMaskAtLast[label.lastLocal].get(label.visitedMask) == label;
+        }
+
+        private boolean isDominatedByProperSubset(LongLabel label, HashMap<Long, LongLabel> exactMap) {
             if (label.depth <= 1) {
                 return false;
             }
             long lastBit = localBit[label.lastLocal];
             long free = label.visitedMask ^ lastBit;
             long subFree = free;
-            while (true) {
+            while (subFree != 0L) {
                 long subsetMask = subFree | lastBit;
                 LongLabel subset = exactMap.get(subsetMask);
                 if (subset != null && subset.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
                     return true;
                 }
-                if (subFree == 0L) {
-                    break;
-                }
                 subFree = (subFree - 1L) & free;
             }
             return false;
+        }
+
+        private void removeDominatedSupersetsNearTail(LongLabel label, HashMap<Long, LongLabel> exactMap) {
+            if (label.depth <= 1) {
+                return;
+            }
+            long mask = label.visitedMask;
+            long extraPool = fullMask & ~mask;
+            int extraCount = Long.bitCount(extraPool);
+            if (extraCount == 0 || extraCount > SUPERSET_CLEANUP_MAX_EXTRA_BITS) {
+                return;
+            }
+            double rc = label.partialReducedCost;
+            long add = extraPool;
+            while (add != 0L) {
+                LongLabel other = exactMap.get(mask | add);
+                if (other != null && rc <= other.partialReducedCost + DOM_EPS) {
+                    exactMap.remove(mask | add);
+                }
+                add = (add - 1L) & extraPool;
+            }
         }
 
         private boolean cannotBeatBest(LongLabel label) {
@@ -473,6 +500,9 @@ public final class PricingEspprcSolver {
 
             while (!queue.isEmpty()) {
                 BitSetLabel cur = queue.pollFirst();
+                if (!isCurrentBest(cur)) {
+                    continue;
+                }
                 considerCompleteRoute(cur);
 
                 int nxt = cur.visited.nextClearBit(0);
@@ -511,6 +541,11 @@ public final class PricingEspprcSolver {
             }
             bestByState.put(key, label);
             return true;
+        }
+
+        private boolean isCurrentBest(BitSetLabel label) {
+            BitSetStateKey key = new BitSetStateKey(label.lastLocal, label.visited);
+            return bestByState.get(key) == label;
         }
     }
 
