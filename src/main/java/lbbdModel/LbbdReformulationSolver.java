@@ -169,7 +169,7 @@ public final class LbbdReformulationSolver {
                 int iterRmpCalls = 0;
                 int iterRmpCacheMisses = 0;
 
-                if (Double.isFinite(bestUpperBound)) {
+                if (isFinite(bestUpperBound)) {
                     setMasterUpperCutoff(cplex, bestUpperBound - INCUMBENT_PRUNE_TOL);
                 }
                 double masterMipGapThisIter = recommendedMasterMipGap(iteration, forceStrictMasterGap);
@@ -181,6 +181,18 @@ public final class LbbdReformulationSolver {
                 totalMasterSolveNs += iterMasterSolveNs;
                 String masterStatus = safeStatus(cplex);
                 if (!solved) {
+                    if (isFinite(bestUpperBound) && isInfeasibleLikeStatus(masterStatus)) {
+                        return buildCutoffExhaustedResult(
+                                startNs,
+                                iteration,
+                                feasibilityCuts,
+                                optimalityCuts,
+                                lpDualCuts,
+                                allSubproblemsOptimal,
+                                bestUpperBound,
+                                bestLowerBound
+                        );
+                    }
                     return buildFailedResult(startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts, masterStatus);
                 }
                 if (!masterStatus.startsWith("Optimal")) {
@@ -454,7 +466,7 @@ public final class LbbdReformulationSolver {
                     }
                     optimalityCuts++;
 
-                    if (Double.isFinite(bestUpperBound)
+                    if (isFinite(bestUpperBound)
                             && exactObjective >= bestUpperBound - INCUMBENT_PRUNE_TOL) {
                     if (ENABLE_INCUMBENT_PRUNE_NOGOOD
                             && iteration >= INCUMBENT_PRUNE_START_ITER
@@ -650,6 +662,38 @@ public final class LbbdReformulationSolver {
         return new SolveResult("LBBDReformulation", false, false, status, Double.NaN, Double.NaN, Double.NaN, sec);
     }
 
+    private static SolveResult buildCutoffExhaustedResult(
+            long startNs,
+            int iteration,
+            int feasibilityCuts,
+            int optimalityCuts,
+            int lpDualCuts,
+            boolean allSubproblemsOptimal,
+            double bestUpperBound,
+            double bestLowerBound
+    ) {
+        double sec = elapsedSec(startNs);
+        double impliedLowerBound = bestUpperBound - INCUMBENT_PRUNE_TOL;
+        double finalBestBound = isFinite(bestLowerBound) ? Math.max(bestLowerBound, impliedLowerBound) : impliedLowerBound;
+        double finalGap = relativeGap(bestUpperBound, finalBestBound);
+        boolean optimal = allSubproblemsOptimal && finalGap <= RESULT_TOL;
+        String status = "LBBD_CutoffExhausted(iter=" + iteration
+                + ",feasCuts=" + feasibilityCuts
+                + ",optCuts=" + optimalityCuts
+                + ",lpDualCuts=" + lpDualCuts
+                + ",cutoff=" + fmt(impliedLowerBound) + ")";
+        return new SolveResult(
+                "LBBDReformulation",
+                true,
+                optimal,
+                status,
+                bestUpperBound,
+                finalBestBound,
+                finalGap,
+                sec
+        );
+    }
+
     private static double elapsedSec(long startNs) {
         return (System.nanoTime() - startNs) / 1_000_000_000.0;
     }
@@ -710,8 +754,16 @@ public final class LbbdReformulationSolver {
         return Math.abs(upper - lower) / denom;
     }
 
+    private static boolean isInfeasibleLikeStatus(String status) {
+        return status != null && status.startsWith("Infeasible");
+    }
+
+    private static boolean isFinite(double value) {
+        return !Double.isNaN(value) && !Double.isInfinite(value);
+    }
+
     private static void setMasterUpperCutoff(IloCplex cplex, double cutoff) throws IloException {
-        if (!Double.isFinite(cutoff)) {
+        if (!isFinite(cutoff)) {
             return;
         }
         cplex.setParam(IloCplex.DoubleParam.CutUp, cutoff);
