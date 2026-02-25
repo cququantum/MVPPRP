@@ -315,10 +315,10 @@ public final class Instance {
         double h = this.hi[i];
 
         if (v == 0) {
-            // e_{i0t} = h_i * sum_{j=0..t-1} (I_{i0} + sum_{r=1..j} s_ir)
-            //         = h_i * [ t*I_{i0} + sum_{j=0..t-1} prefixS[i][j] ]
+            // e_{i0t} = h_i * sum_{j=1..t-1} (I_{i0} + sum_{r=1..j} s_ir)
+            //         = h_i * [ (t-1)*I_{i0} + sum_{j=1..t-1} prefixS[i][j] ]
             double sumPrefix0To = cumPrefix[i][t - 1];
-            return h * (t * Ii0[i] + sumPrefix0To);
+            return h * ((t - 1) * Ii0[i] + sumPrefix0To);
         } else {
             // e_{ivt} = h_i * sum_{j=v+1..t-1} (sum_{r=v+1..j} s_ir)
             //         = h_i * [ sum_{j=v+1..t-1} prefixS[i][j] - (t-v-1)*prefixS[i][v] ]

@@ -14,7 +14,7 @@ import java.util.HashMap;
 public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
     private static final boolean LOG_TO_CONSOLE = false;
     private static final double EPS = 1e-9;
-    private static final int EXACT_DP_MAX_N = 15;
+    private static final int EXACT_DP_MAX_N = 18;
 
     private final HashMap<Integer, ExactPeriodModel> exactModels = new HashMap<Integer, ExactPeriodModel>();
     private final HashMap<Integer, LpPeriodModel> lpModels = new HashMap<Integer, LpPeriodModel>();
@@ -183,11 +183,14 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
     }
 
     private static int recommendedExactThreads(int visitCount) {
-        if (visitCount <= 8) {
+        if (visitCount <= 6) {
             return 1;
         }
-        if (visitCount <= 12) {
+        if (visitCount <= 10) {
             return 2;
+        }
+        if (visitCount <= 13) {
+            return 3;
         }
         return 4;
     }

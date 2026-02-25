@@ -22,9 +22,9 @@ public final class PeriodRouteMasterLpSolver {
     private static final double RC_EPS = 1e-8;
     private static final double ART_EPS = 1e-7;
     private static final int EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS = 0;
-    private static final int MAX_COLUMNS_PER_PRICING_SMALL = 8;
-    private static final int MAX_COLUMNS_PER_PRICING_MEDIUM = 12;
-    private static final int MAX_COLUMNS_PER_PRICING_LARGE = 16;
+    private static final int MAX_COLUMNS_PER_PRICING_SMALL = 12;
+    private static final int MAX_COLUMNS_PER_PRICING_MEDIUM = 18;
+    private static final int MAX_COLUMNS_PER_PRICING_LARGE = 24;
 
     private ExactSubsetRouteCostOracle subsetRouteOracle;
     private Instance subsetRouteOracleInstance;
