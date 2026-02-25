@@ -9,6 +9,7 @@ import java.util.Locale;
 
 public class Main {
     private enum SolverMode { ALL, ORIGINAL, REFORM, LBBD }
+    private static final double RESULT_TOL = 1e-4;
 
     public static void main(String[] args) {
         SolverMode solverMode = SolverMode.ALL;
@@ -55,8 +56,8 @@ public class Main {
                 reformulationResult = reformulationSolver.solve(ins);
             }
             if (solverMode == SolverMode.ALL || solverMode == SolverMode.LBBD) {
-                LbbdReformulationSolver lbbdSolver = new LbbdReformulationSolver();
-                lbbdResult = lbbdSolver.solve(ins);
+                LbbdReformulationSolver lbbdSolver = new LbbdReformulationSolver(ins);
+                lbbdResult = lbbdSolver.solve(Double.NaN, RESULT_TOL);
             }
 
             System.out.println("Instance: " + instancePath);

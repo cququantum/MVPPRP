@@ -23,36 +23,154 @@ public final class LbbdReformulationSolver {
     private static final double INCUMBENT_PRUNE_TOL = 1e-4;
     private static final int MAX_ITERATIONS = 5000;
     private static final int MAX_RMP_PERIODS_PER_ITER = 3;
-    private static final int ACTIVE_RMP_DUAL_CUTS_CAP_BASE = 800;
-    private static final int ACTIVE_RMP_DUAL_CUTS_CAP_LATE = 1200;
-    private static final int ACTIVE_PERIOD_OPT_CUTS_CAP_BASE = 150;
-    private static final int ACTIVE_PERIOD_OPT_CUTS_CAP_LATE = 100;
-    private static final int ACTIVE_GLOBAL_OPT_CUTS_CAP_BASE = 120;
-    private static final int ACTIVE_GLOBAL_OPT_CUTS_CAP_LATE = 80;
-    private static final int ACTIVE_INC_PRUNE_CUTS_CAP_BASE = 150;
-    private static final int ACTIVE_INC_PRUNE_CUTS_CAP_LATE = 110;
-    private static final int ACTIVE_CUT_CAP_LATE_START_ITER = 300;
-    private static final int MAX_PERIOD_OPT_CUTS_PER_ITER = 2;
-    private static final int LATE_PERIOD_OPT_CUTS_PER_ITER = 3;
-    private static final int LATE_PERIOD_OPT_START_ITER = 150;
-    private static final double LATE_PERIOD_OPT_MIN_DELTA = 1500.0;
     private static final boolean ENABLE_INCUMBENT_PRUNE_NOGOOD = true;
-    private static final int INCUMBENT_PRUNE_START_ITER = 120;
-    private static final double INCUMBENT_PRUNE_MIN_EXCESS = 150.0;
     private static final boolean ENABLE_GLOBAL_COMBINATION_OPT_CUT = true;
-    private static final int GLOBAL_OPT_CUT_START_ITER = 100;
-    private static final double GLOBAL_OPT_CUT_MIN_DELTA = 1200.0;
     private static final boolean ENABLE_ITER_TIMING_LOG = true;
-    private static final double MASTER_MIP_GAP_EARLY = 1.5e-3;
-    private static final double MASTER_MIP_GAP_MID = 5e-4;
-    private static final double MASTER_MIP_GAP_LATE = 2e-4;
-    private static final double MASTER_MIP_GAP_VERY_LATE = 1.0e-4;
-    private static final int MASTER_MIP_GAP_EARLY_ITER_CUTOFF = 80;
-    private static final int MASTER_MIP_GAP_MID_ITER_CUTOFF = 200;
-    private static final int MASTER_MIP_GAP_VERY_LATE_ITER_CUTOFF = 300;
     private static final boolean LOG_TO_CONSOLE = false;
     private static final boolean ENABLE_HINT_SHORTCUT = false;
     private static final int MASTER_THREADS = 0;
+
+    // Adaptive parameters based on instance size
+    private double masterMipGapEarly;
+    private double masterMipGapMid;
+    private double masterMipGapLate;
+    private double masterMipGapVeryLate;
+    private int masterMipGapEarlyIterCutoff;
+    private int masterMipGapMidIterCutoff;
+    private int masterMipGapVeryLateIterCutoff;
+
+    private int activeRmpDualCutsCapBase;
+    private int activeRmpDualCutsCapLate;
+    private int activePeriodOptCutsCapBase;
+    private int activePeriodOptCutsCapLate;
+    private int activeGlobalOptCutsCapBase;
+    private int activeGlobalOptCutsCapLate;
+    private int activeIncPruneCutsCapBase;
+    private int activeIncPruneCutsCapLate;
+    private int activeCutCapLateStartIter;
+
+    private int maxPeriodOptCutsPerIter;
+    private int latePeriodOptCutsPerIter;
+    private int latePeriodOptStartIter;
+    private double latePeriodOptMinDelta;
+    private int globalOptCutStartIter;
+    private double globalOptCutMinDelta;
+    private int incumbentPruneStartIter;
+    private double incumbentPruneMinExcess;
+
+    private final Instance ins;
+
+    public LbbdReformulationSolver(Instance ins) {
+        this.ins = ins;
+
+        // Adaptive parameter configuration based on instance size
+        if (ins.n <= 12) {
+            // Small scale: preserve original parameters to avoid performance degradation
+            initSmallScaleParams();
+        } else if (ins.n <= 20) {
+            // Medium scale: moderate optimization
+            initMediumScaleParams();
+        } else {
+            // Large scale: aggressive optimization
+            initLargeScaleParams();
+        }
+    }
+
+    private void initSmallScaleParams() {
+        // MIP gap: keep relaxed to avoid over-solving
+        this.masterMipGapEarly = 3e-3;
+        this.masterMipGapMid = 7e-4;
+        this.masterMipGapLate = 2.5e-4;
+        this.masterMipGapVeryLate = 1.0e-4;
+        this.masterMipGapEarlyIterCutoff = 100;
+        this.masterMipGapMidIterCutoff = 280;
+        this.masterMipGapVeryLateIterCutoff = 360;
+
+        // Cut capacity: preserve original values to avoid oversized master problem
+        this.activeRmpDualCutsCapBase = 600;
+        this.activeRmpDualCutsCapLate = 1000;
+        this.activePeriodOptCutsCapBase = 120;
+        this.activePeriodOptCutsCapLate = 80;
+        this.activeGlobalOptCutsCapBase = 90;
+        this.activeGlobalOptCutsCapLate = 60;
+        this.activeIncPruneCutsCapBase = 120;
+        this.activeIncPruneCutsCapLate = 90;
+        this.activeCutCapLateStartIter = 420;
+
+        // Cut generation: conservative strategy
+        this.maxPeriodOptCutsPerIter = 1;
+        this.latePeriodOptCutsPerIter = 2;
+        this.latePeriodOptStartIter = 220;
+        this.latePeriodOptMinDelta = 2500.0;
+        this.globalOptCutStartIter = 140;
+        this.globalOptCutMinDelta = 2000.0;
+        this.incumbentPruneStartIter = 180;
+        this.incumbentPruneMinExcess = 200.0;
+    }
+
+    private void initMediumScaleParams() {
+        // MIP gap: moderately tightened
+        this.masterMipGapEarly = 2e-3;
+        this.masterMipGapMid = 6e-4;
+        this.masterMipGapLate = 2.2e-4;
+        this.masterMipGapVeryLate = 1.0e-4;
+        this.masterMipGapEarlyIterCutoff = 90;
+        this.masterMipGapMidIterCutoff = 240;
+        this.masterMipGapVeryLateIterCutoff = 330;
+
+        // Cut capacity: moderately increased
+        this.activeRmpDualCutsCapBase = 700;
+        this.activeRmpDualCutsCapLate = 1100;
+        this.activePeriodOptCutsCapBase = 135;
+        this.activePeriodOptCutsCapLate = 90;
+        this.activeGlobalOptCutsCapBase = 105;
+        this.activeGlobalOptCutsCapLate = 70;
+        this.activeIncPruneCutsCapBase = 135;
+        this.activeIncPruneCutsCapLate = 100;
+        this.activeCutCapLateStartIter = 360;
+
+        // Cut generation: moderately aggressive
+        this.maxPeriodOptCutsPerIter = 1;
+        this.latePeriodOptCutsPerIter = 2;
+        this.latePeriodOptStartIter = 185;
+        this.latePeriodOptMinDelta = 2000.0;
+        this.globalOptCutStartIter = 120;
+        this.globalOptCutMinDelta = 1600.0;
+        this.incumbentPruneStartIter = 150;
+        this.incumbentPruneMinExcess = 175.0;
+    }
+
+    private void initLargeScaleParams() {
+        // MIP gap: aggressively tightened
+        this.masterMipGapEarly = 1.5e-3;
+        this.masterMipGapMid = 5e-4;
+        this.masterMipGapLate = 2e-4;
+        this.masterMipGapVeryLate = 1.0e-4;
+        this.masterMipGapEarlyIterCutoff = 80;
+        this.masterMipGapMidIterCutoff = 200;
+        this.masterMipGapVeryLateIterCutoff = 300;
+
+        // Cut capacity: significantly increased
+        this.activeRmpDualCutsCapBase = 800;
+        this.activeRmpDualCutsCapLate = 1200;
+        this.activePeriodOptCutsCapBase = 150;
+        this.activePeriodOptCutsCapLate = 100;
+        this.activeGlobalOptCutsCapBase = 120;
+        this.activeGlobalOptCutsCapLate = 80;
+        this.activeIncPruneCutsCapBase = 150;
+        this.activeIncPruneCutsCapLate = 110;
+        this.activeCutCapLateStartIter = 300;
+
+        // Cut generation: aggressive strategy
+        this.maxPeriodOptCutsPerIter = 2;
+        this.latePeriodOptCutsPerIter = 3;
+        this.latePeriodOptStartIter = 150;
+        this.latePeriodOptMinDelta = 1500.0;
+        this.globalOptCutStartIter = 100;
+        this.globalOptCutMinDelta = 1200.0;
+        this.incumbentPruneStartIter = 120;
+        this.incumbentPruneMinExcess = 150.0;
+    }
 
     private static final class ActiveRmpDualCut {
         final String key;
@@ -94,15 +212,11 @@ public final class LbbdReformulationSolver {
         }
     }
 
-    public SolveResult solve(Instance ins) {
-        return solve(ins, Double.NaN, RESULT_TOL);
+    public SolveResult solve(double targetObjective, double targetTol) {
+        return solve(targetObjective, targetTol, null);
     }
 
-    public SolveResult solve(Instance ins, double targetObjective, double targetTol) {
-        return solve(ins, targetObjective, targetTol, null);
-    }
-
-    public SolveResult solve(Instance ins, double targetObjective, double targetTol, int[][] prevVisitHint) {
+    public SolveResult solve(double targetObjective, double targetTol, int[][] prevVisitHint) {
         long startNs = System.nanoTime();
         if (ENABLE_HINT_SHORTCUT && !Double.isNaN(targetObjective) && prevVisitHint != null) {
             SolveResult fast = tryValidateByHint(ins, targetObjective, targetTol, prevVisitHint, startNs);
@@ -128,7 +242,7 @@ public final class LbbdReformulationSolver {
              IloCplex cplex = new IloCplex()) {
             configure(cplex);
             MasterModel master = new MasterModel(cplex, ins);
-            PeriodRouteMasterLpSolver rmpLpSolver = new PeriodRouteMasterLpSolver();
+            PeriodRouteMasterLpSolver rmpLpSolver = new PeriodRouteMasterLpSolver(ins);
 
             int iteration = 0;
             int feasibilityCuts = 0;
@@ -411,12 +525,12 @@ public final class LbbdReformulationSolver {
                 }
 
                 if (violatedOptimality) {
-                    if (MAX_PERIOD_OPT_CUTS_PER_ITER > 0) {
+                    if (maxPeriodOptCutsPerIter > 0) {
                         int periodOptBudget = (freshRmpCutsAddedThisIter == 0)
-                                ? Math.max(MAX_PERIOD_OPT_CUTS_PER_ITER, ins.l)
-                                : MAX_PERIOD_OPT_CUTS_PER_ITER;
-                        if (iteration >= LATE_PERIOD_OPT_START_ITER && delta >= LATE_PERIOD_OPT_MIN_DELTA) {
-                            periodOptBudget = Math.min(ins.l, Math.max(periodOptBudget, LATE_PERIOD_OPT_CUTS_PER_ITER));
+                                ? Math.max(maxPeriodOptCutsPerIter, ins.l)
+                                : maxPeriodOptCutsPerIter;
+                        if (iteration >= latePeriodOptStartIter && delta >= latePeriodOptMinDelta) {
+                            periodOptBudget = Math.min(ins.l, Math.max(periodOptBudget, latePeriodOptCutsPerIter));
                         }
                         int addedPeriodOptThisIter = 0;
                         while (addedPeriodOptThisIter < periodOptBudget) {
@@ -451,7 +565,7 @@ public final class LbbdReformulationSolver {
                         }
                     }
                     if (ENABLE_GLOBAL_COMBINATION_OPT_CUT) {
-                        if (iteration >= GLOBAL_OPT_CUT_START_ITER && delta >= GLOBAL_OPT_CUT_MIN_DELTA) {
+                        if (iteration >= globalOptCutStartIter && delta >= globalOptCutMinDelta) {
                             String globalOptKey = buildGlobalOptCutKey(point, ins.n, ins.l);
                             if (!addedGlobalOptCutKeys.contains(globalOptKey)) {
                                 IloRange range = master.addOptimalityCutRange(point, phi);
@@ -469,8 +583,8 @@ public final class LbbdReformulationSolver {
                     if (isFinite(bestUpperBound)
                             && exactObjective >= bestUpperBound - INCUMBENT_PRUNE_TOL) {
                     if (ENABLE_INCUMBENT_PRUNE_NOGOOD
-                            && iteration >= INCUMBENT_PRUNE_START_ITER
-                            && exactObjective >= bestUpperBound + INCUMBENT_PRUNE_MIN_EXCESS) {
+                            && iteration >= incumbentPruneStartIter
+                            && exactObjective >= bestUpperBound + incumbentPruneMinExcess) {
                             String incPruneKey = buildGlobalRoutingPatternKey(point, ins.n, ins.l);
                             if (!activeIncumbentPruneCutKeys.contains(incPruneKey)) {
                                 IloRange ng = master.addNoGoodCutRange(point);
@@ -777,44 +891,44 @@ public final class LbbdReformulationSolver {
         }
     }
 
-    private static double recommendedMasterMipGap(int iteration, boolean forceStrict) {
+    private double recommendedMasterMipGap(int iteration, boolean forceStrict) {
         if (forceStrict) {
             return CplexConfig.MIP_GAP;
         }
-        if (iteration <= MASTER_MIP_GAP_EARLY_ITER_CUTOFF) {
-            return MASTER_MIP_GAP_EARLY;
+        if (iteration <= masterMipGapEarlyIterCutoff) {
+            return masterMipGapEarly;
         }
-        if (iteration <= MASTER_MIP_GAP_MID_ITER_CUTOFF) {
-            return MASTER_MIP_GAP_MID;
+        if (iteration <= masterMipGapMidIterCutoff) {
+            return masterMipGapMid;
         }
-        if (iteration <= MASTER_MIP_GAP_VERY_LATE_ITER_CUTOFF) {
-            return MASTER_MIP_GAP_LATE;
+        if (iteration <= masterMipGapVeryLateIterCutoff) {
+            return masterMipGapLate;
         }
-        return MASTER_MIP_GAP_VERY_LATE;
+        return masterMipGapVeryLate;
     }
 
-    private static int activeRmpDualCutCap(int iteration) {
-        return iteration >= ACTIVE_CUT_CAP_LATE_START_ITER
-                ? ACTIVE_RMP_DUAL_CUTS_CAP_LATE
-                : ACTIVE_RMP_DUAL_CUTS_CAP_BASE;
+    private int activeRmpDualCutCap(int iteration) {
+        return iteration >= activeCutCapLateStartIter
+                ? activeRmpDualCutsCapLate
+                : activeRmpDualCutsCapBase;
     }
 
-    private static int activePeriodOptCutCap(int iteration) {
-        return iteration >= ACTIVE_CUT_CAP_LATE_START_ITER
-                ? ACTIVE_PERIOD_OPT_CUTS_CAP_LATE
-                : ACTIVE_PERIOD_OPT_CUTS_CAP_BASE;
+    private int activePeriodOptCutCap(int iteration) {
+        return iteration >= activeCutCapLateStartIter
+                ? activePeriodOptCutsCapLate
+                : activePeriodOptCutsCapBase;
     }
 
-    private static int activeGlobalOptCutCap(int iteration) {
-        return iteration >= ACTIVE_CUT_CAP_LATE_START_ITER
-                ? ACTIVE_GLOBAL_OPT_CUTS_CAP_LATE
-                : ACTIVE_GLOBAL_OPT_CUTS_CAP_BASE;
+    private int activeGlobalOptCutCap(int iteration) {
+        return iteration >= activeCutCapLateStartIter
+                ? activeGlobalOptCutsCapLate
+                : activeGlobalOptCutsCapBase;
     }
 
-    private static int activeIncPruneCutCap(int iteration) {
-        return iteration >= ACTIVE_CUT_CAP_LATE_START_ITER
-                ? ACTIVE_INC_PRUNE_CUTS_CAP_LATE
-                : ACTIVE_INC_PRUNE_CUTS_CAP_BASE;
+    private int activeIncPruneCutCap(int iteration) {
+        return iteration >= activeCutCapLateStartIter
+                ? activeIncPruneCutsCapLate
+                : activeIncPruneCutsCapBase;
     }
 
     private static void trimActiveRmpDualCuts(

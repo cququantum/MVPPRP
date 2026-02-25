@@ -22,9 +22,11 @@ public final class PeriodRouteMasterLpSolver {
     private static final double RC_EPS = 1e-8;
     private static final double ART_EPS = 1e-7;
     private static final int EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS = 0;
-    private static final int MAX_COLUMNS_PER_PRICING_SMALL = 12;
-    private static final int MAX_COLUMNS_PER_PRICING_MEDIUM = 18;
-    private static final int MAX_COLUMNS_PER_PRICING_LARGE = 24;
+
+    // Adaptive column generation parameters based on instance size
+    private final int maxColumnsPerPricingSmall;
+    private final int maxColumnsPerPricingMedium;
+    private final int maxColumnsPerPricingLarge;
 
     private ExactSubsetRouteCostOracle subsetRouteOracle;
     private Instance subsetRouteOracleInstance;
@@ -63,6 +65,26 @@ public final class PeriodRouteMasterLpSolver {
             this.dualU0 = dualU0;
             this.generatedColumns = generatedColumns;
             this.customerCount = customerCount;
+        }
+    }
+
+    public PeriodRouteMasterLpSolver(Instance ins) {
+        // Adaptive column generation parameters based on instance size
+        if (ins.n <= 12) {
+            // Small scale: preserve original parameters
+            this.maxColumnsPerPricingSmall = 8;
+            this.maxColumnsPerPricingMedium = 12;
+            this.maxColumnsPerPricingLarge = 16;
+        } else if (ins.n <= 20) {
+            // Medium scale: moderate increase
+            this.maxColumnsPerPricingSmall = 10;
+            this.maxColumnsPerPricingMedium = 15;
+            this.maxColumnsPerPricingLarge = 20;
+        } else {
+            // Large scale: aggressive increase
+            this.maxColumnsPerPricingSmall = 12;
+            this.maxColumnsPerPricingMedium = 18;
+            this.maxColumnsPerPricingLarge = 24;
         }
     }
 
@@ -434,14 +456,14 @@ public final class PeriodRouteMasterLpSolver {
         return 1_000_000.0 + maxArc * (customerCount + 2);
     }
 
-    private static int maxColumnsPerPricing(int customerCount) {
+    private int maxColumnsPerPricing(int customerCount) {
         if (customerCount >= 13) {
-            return MAX_COLUMNS_PER_PRICING_LARGE;
+            return maxColumnsPerPricingLarge;
         }
         if (customerCount >= 9) {
-            return MAX_COLUMNS_PER_PRICING_MEDIUM;
+            return maxColumnsPerPricingMedium;
         }
-        return MAX_COLUMNS_PER_PRICING_SMALL;
+        return maxColumnsPerPricingSmall;
     }
 
     private static void addRouteColumn(
