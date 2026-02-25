@@ -15,6 +15,10 @@ import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public final class LbbdReformulationSolver {
 
@@ -238,8 +242,14 @@ public final class LbbdReformulationSolver {
         HashSet<String> activeIncumbentPruneCutKeys = new HashSet<String>();
         ArrayDeque<ActiveIncumbentPruneCut> activeIncumbentPruneCuts = new ArrayDeque<ActiveIncumbentPruneCut>();
 
-        try (PeriodCvrpSubproblemSolver subproblemSolver = new PeriodCvrpSubproblemSolver();
-             IloCplex cplex = new IloCplex()) {
+        int subThreads = Math.min(ins.l, Runtime.getRuntime().availableProcessors());
+        final PeriodCvrpSubproblemSolver[] subSolvers = new PeriodCvrpSubproblemSolver[ins.l + 1];
+        for (int tt = 1; tt <= ins.l; tt++) {
+            subSolvers[tt] = new PeriodCvrpSubproblemSolver();
+        }
+        ExecutorService subExecutor = subThreads > 1 ? Executors.newFixedThreadPool(subThreads) : null;
+
+        try (IloCplex cplex = new IloCplex()) {
             configure(cplex);
             MasterModel master = new MasterModel(cplex, ins);
             PeriodRouteMasterLpSolver rmpLpSolver = new PeriodRouteMasterLpSolver(ins);
@@ -267,6 +277,7 @@ public final class LbbdReformulationSolver {
             boolean allMasterOptimal = true;
             boolean allSubproblemsOptimal = true;
             boolean forceStrictMasterGap = false;
+            MasterPoint prevPoint = null;
 
             while (iteration < MAX_ITERATIONS) {
                 iteration++;
@@ -288,6 +299,10 @@ public final class LbbdReformulationSolver {
                 }
                 double masterMipGapThisIter = recommendedMasterMipGap(iteration, forceStrictMasterGap);
                 cplex.setParam(IloCplex.Param.MIP.Tolerances.MIPGap, masterMipGapThisIter);
+
+                if (prevPoint != null) {
+                    master.setMIPStart(prevPoint);
+                }
 
                 long masterStartNs = System.nanoTime();
                 boolean solved = cplex.solve();
@@ -314,30 +329,85 @@ public final class LbbdReformulationSolver {
                 }
 
                 MasterPoint point = master.extractPoint(ins);
-                bestLowerBound = point.bmpObjective;
+                prevPoint = point;
+                bestLowerBound = Math.max(bestLowerBound, point.bmpBestBound);
 
                 double phi = 0.0;
                 double[] phiByPeriod = new double[ins.l + 1];
                 String[] subKeysByPeriod = new String[ins.l + 1];
                 int infeasiblePeriod = -1;
+
+                // Phase 1: check cache and submit parallel tasks for misses
+                PeriodCvrpSubproblemSolver.Result[] subResults = new PeriodCvrpSubproblemSolver.Result[ins.l + 1];
+                @SuppressWarnings("unchecked")
+                Future<PeriodCvrpSubproblemSolver.Result>[] subFutures = (subExecutor != null)
+                        ? new Future[ins.l + 1] : null;
+                int cacheMissCount = 0;
+
                 for (int t = 1; t <= ins.l; t++) {
                     iterSubCalls++;
                     totalSubCalls++;
                     String key = buildSubproblemCacheKey(point, t, ins.n);
                     subKeysByPeriod[t] = key;
-                    PeriodCvrpSubproblemSolver.Result sub = subproblemCache.get(key);
-                    if (sub == null) {
+                    PeriodCvrpSubproblemSolver.Result cached = subproblemCache.get(key);
+                    if (cached != null) {
+                        subResults[t] = cached;
+                    } else {
+                        cacheMissCount++;
                         iterSubCacheMisses++;
                         totalSubCacheMisses++;
-                        long subStartNs = System.nanoTime();
-                        sub = subproblemSolver.solve(ins, t, point.qBar[t], point.zBar[t]);
-                        long subElapsed = System.nanoTime() - subStartNs;
-                        iterSubSolveNs += subElapsed;
-                        totalSubSolveNs += subElapsed;
-                        if (sub.optimal || !sub.feasible) {
-                            subproblemCache.put(key, sub);
+                        if (subExecutor != null) {
+                            final int period = t;
+                            final double[] qBarT = point.qBar[t];
+                            final int[] zBarT = point.zBar[t];
+                            subFutures[t] = subExecutor.submit(new Callable<PeriodCvrpSubproblemSolver.Result>() {
+                                @Override
+                                public PeriodCvrpSubproblemSolver.Result call() {
+                                    return subSolvers[period].solve(ins, period, qBarT, zBarT);
+                                }
+                            });
                         }
                     }
+                }
+
+                // Phase 2: collect results (parallel or sequential fallback)
+                if (cacheMissCount > 0) {
+                    long subStartNs = System.nanoTime();
+                    if (subExecutor != null) {
+                        for (int t = 1; t <= ins.l; t++) {
+                            if (subFutures[t] != null) {
+                                try {
+                                    subResults[t] = subFutures[t].get();
+                                } catch (Exception e) {
+                                    throw new RuntimeException("Subproblem solve failed for t=" + t, e);
+                                }
+                            }
+                        }
+                    } else {
+                        for (int t = 1; t <= ins.l; t++) {
+                            if (subResults[t] == null) {
+                                subResults[t] = subSolvers[t].solve(ins, t, point.qBar[t], point.zBar[t]);
+                            }
+                        }
+                    }
+                    long subElapsed = System.nanoTime() - subStartNs;
+                    iterSubSolveNs += subElapsed;
+                    totalSubSolveNs += subElapsed;
+
+                    for (int t = 1; t <= ins.l; t++) {
+                        if (subKeysByPeriod[t] != null && subResults[t] != null
+                                && !subproblemCache.containsKey(subKeysByPeriod[t])) {
+                            PeriodCvrpSubproblemSolver.Result sub = subResults[t];
+                            if (sub.optimal || !sub.feasible) {
+                                subproblemCache.put(subKeysByPeriod[t], sub);
+                            }
+                        }
+                    }
+                }
+
+                // Phase 3: process results
+                for (int t = 1; t <= ins.l; t++) {
+                    PeriodCvrpSubproblemSolver.Result sub = subResults[t];
                     if (!sub.feasible) {
                         infeasiblePeriod = t;
                         break;
@@ -660,6 +730,15 @@ public final class LbbdReformulationSolver {
             return new SolveResult("LBBDReformulation", feasible, false, status, objective, bestBound, gap, sec);
         } catch (IloException e) {
             throw new RuntimeException("Failed to solve LBBDReformulation", e);
+        } finally {
+            if (subExecutor != null) {
+                subExecutor.shutdownNow();
+            }
+            for (int tt = 1; tt < subSolvers.length; tt++) {
+                if (subSolvers[tt] != null) {
+                    subSolvers[tt].close();
+                }
+            }
         }
     }
 
@@ -720,7 +799,7 @@ public final class LbbdReformulationSolver {
     }
 
     private static String buildSubproblemCacheKey(MasterPoint point, int t, int n) {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(n * 3 + 4);
         sb.append(t).append(':');
         for (int i = 1; i <= n; i++) {
             if (i > 1) {
@@ -739,7 +818,7 @@ public final class LbbdReformulationSolver {
     }
 
     private static String buildGlobalRoutingPatternKey(MasterPoint point, int n, int l) {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(l * (n * 3 + 4));
         for (int t = 1; t <= l; t++) {
             if (t > 1) {
                 sb.append('|');
@@ -988,11 +1067,7 @@ public final class LbbdReformulationSolver {
     }
 
     private static double holdingCostOnArc(Instance ins, int i, int v, int t) {
-        double e = ins.e(i, v, t);
-        if (v == 0) {
-            return e - ins.hi[i] * ins.Ii0[i];
-        }
-        return e;
+        return ins.e(i, v, t);
     }
 
     private static void configure(IloCplex cplex) throws IloException {
@@ -1023,6 +1098,7 @@ public final class LbbdReformulationSolver {
 
     private static final class MasterPoint {
         final double bmpObjective;
+        final double bmpBestBound;
         final double nonRouteCost;
         final double omegaSum;
         final double[] omega;
@@ -1034,6 +1110,7 @@ public final class LbbdReformulationSolver {
 
         MasterPoint(
                 double bmpObjective,
+                double bmpBestBound,
                 double nonRouteCost,
                 double omegaSum,
                 double[] omega,
@@ -1044,6 +1121,7 @@ public final class LbbdReformulationSolver {
                 int routeLambdaOneCount
         ) {
             this.bmpObjective = bmpObjective;
+            this.bmpBestBound = bmpBestBound;
             this.nonRouteCost = nonRouteCost;
             this.omegaSum = omegaSum;
             this.omega = omega;
@@ -1304,10 +1382,17 @@ public final class LbbdReformulationSolver {
             }
 
             double bmpObjective = cplex.getObjValue();
+            double bmpBestBound;
+            try {
+                bmpBestBound = cplex.getBestObjValue();
+            } catch (IloException ignored) {
+                bmpBestBound = bmpObjective;
+            }
             double nonRouteCost = bmpObjective - omegaSum;
 
             return new MasterPoint(
                     bmpObjective,
+                    bmpBestBound,
                     nonRouteCost,
                     omegaSum,
                     omegaVal,
@@ -1447,6 +1532,26 @@ public final class LbbdReformulationSolver {
             if (cutRange != null) {
                 cplex.delete(cutRange);
             }
+        }
+
+        void setMIPStart(MasterPoint point) throws IloException {
+            ArrayList<IloNumVar> vars = new ArrayList<IloNumVar>();
+            ArrayList<Double> vals = new ArrayList<Double>();
+            for (int idx = 0; idx < routingLambdaRefs.size(); idx++) {
+                LambdaRef ref = routingLambdaRefs.get(idx);
+                vars.add(ref.var);
+                vals.add(point.lambdaOne[ref.i][ref.v][ref.t] ? 1.0 : 0.0);
+            }
+            for (int t = 1; t <= ins.l; t++) {
+                vars.add(omega[t]);
+                vals.add(point.omega[t]);
+            }
+            IloNumVar[] varArr = vars.toArray(new IloNumVar[0]);
+            double[] valArr = new double[vals.size()];
+            for (int idx = 0; idx < vals.size(); idx++) {
+                valArr[idx] = vals.get(idx);
+            }
+            cplex.addMIPStart(varArr, valArr);
         }
 
     }

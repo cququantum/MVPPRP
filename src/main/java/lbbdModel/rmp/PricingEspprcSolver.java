@@ -302,6 +302,13 @@ public final class PricingEspprcSolver {
                             cur,
                             cur.visitedMask | bit
                     );
+                    // Early completion bound pruning: skip register if child can never beat best
+                    if (bestReducedCost < Double.POSITIVE_INFINITY) {
+                        double lb = child.travelCost + returnToDepot[nxt] - child.dualGain - dualU0;
+                        if (lb >= bestReducedCost - DOM_EPS) {
+                            continue;
+                        }
+                    }
                     if (register(child)) {
                         queue.addLast(child);
                     }
@@ -463,6 +470,7 @@ public final class PricingEspprcSolver {
 
     private static final class BitSetSearch extends Search {
         private final int customerCount;
+        private final double[] returnToDepot;
         private final ArrayDeque<BitSetLabel> queue;
         private final HashMap<BitSetStateKey, BitSetLabel> bestByState;
 
@@ -477,6 +485,10 @@ public final class PricingEspprcSolver {
         ) {
             super(ins, customers, q, dual, dualU0, existingKeys, maxColumns);
             this.customerCount = customers.length;
+            this.returnToDepot = new double[customerCount];
+            for (int k = 0; k < customerCount; k++) {
+                this.returnToDepot[k] = ins.c[customers[k]][ins.n + 1];
+            }
             this.queue = new ArrayDeque<BitSetLabel>();
             this.bestByState = new HashMap<BitSetStateKey, BitSetLabel>();
         }
@@ -522,6 +534,13 @@ public final class PricingEspprcSolver {
                                 cur,
                                 nextVisited
                         );
+                        if (bestReducedCost < Double.POSITIVE_INFINITY) {
+                            double lb = child.travelCost + returnToDepot[nxt] - child.dualGain - dualU0;
+                            if (lb >= bestReducedCost - DOM_EPS) {
+                                nxt = cur.visited.nextClearBit(nxt + 1);
+                                continue;
+                            }
+                        }
                         if (register(child)) {
                             queue.addLast(child);
                         }

@@ -70,7 +70,7 @@ public final class ReformulationModelSolver {
             for (int t = 1; t <= l; t++) {
                 for (int i = 0; i < nodeCount; i++) {
                     for (int j = 0; j < nodeCount; j++) {
-                        if (i == j) {
+                        if (i == j || !isValidArc(i, j, n)) {
                             continue;
                         }
                         x[i][j][t] = cplex.boolVar("x_" + i + "_" + j + "_" + t);
@@ -90,7 +90,7 @@ public final class ReformulationModelSolver {
             for (int t = 1; t <= l; t++) {
                 for (int i = 0; i < nodeCount; i++) {
                     for (int j = 0; j < nodeCount; j++) {
-                        if (i == j) {
+                        if (x[i][j][t] == null) {
                             continue;
                         }
                         obj.addTerm(ins.c[i][j], x[i][j][t]);
@@ -212,11 +212,12 @@ public final class ReformulationModelSolver {
                     IloLinearNumExpr out = cplex.linearNumExpr();
                     IloLinearNumExpr in = cplex.linearNumExpr();
                     for (int j = 0; j < nodeCount; j++) {
-                        if (i == j) {
-                            continue;
+                        if (x[i][j][t] != null) {
+                            out.addTerm(1.0, x[i][j][t]);
                         }
-                        out.addTerm(1.0, x[i][j][t]);
-                        in.addTerm(1.0, x[j][i][t]);
+                        if (x[j][i][t] != null) {
+                            in.addTerm(1.0, x[j][i][t]);
+                        }
                     }
                     cplex.addEq(out, in, "FlowBalance_" + i + "_" + t);
                 }
@@ -240,10 +241,9 @@ public final class ReformulationModelSolver {
                 for (int j = 1; j <= n; j++) {
                     IloLinearNumExpr incoming = cplex.linearNumExpr();
                     for (int i = 0; i < nodeCount; i++) {
-                        if (i == j) {
-                            continue;
+                        if (x[i][j][t] != null) {
+                            incoming.addTerm(1.0, x[i][j][t]);
                         }
-                        incoming.addTerm(1.0, x[i][j][t]);
                     }
                     cplex.addEq(incoming, z[j][t], "VisitLink_" + j + "_" + t);
                 }
@@ -253,7 +253,7 @@ public final class ReformulationModelSolver {
             for (int t = 1; t <= l; t++) {
                 for (int i = 0; i < nodeCount; i++) {
                     for (int j = 0; j < nodeCount; j++) {
-                        if (i == j) {
+                        if (x[i][j][t] == null) {
                             continue;
                         }
                         IloLinearNumExpr mtz = cplex.linearNumExpr();
@@ -314,15 +314,18 @@ public final class ReformulationModelSolver {
         return node >= 1 && node <= n;
     }
 
+    private static boolean isValidArc(int i, int j, int n) {
+        int returnDepot = n + 1;
+        if (i == j) return false;
+        if (i == returnDepot) return false;
+        if (i == 0 && (j < 1 || j > n)) return false;
+        if (j == 0) return false;
+        if (j == returnDepot && (i < 1 || i > n)) return false;
+        return true;
+    }
+
     private static double holdingCostOnArc(Instance ins, int i, int v, int t) {
-        double e = ins.e(i, v, t);
-        if (v == 0) {
-            // Align with corrected model.tex:
-            // e_{i0t} should sum j=1..t-1, while Instance.e uses j=0..t-1.
-            // Therefore subtract one h_i * I_{i0}.
-            return e - ins.hi[i] * ins.Ii0[i];
-        }
-        return e;
+        return ins.e(i, v, t);
     }
 
     private static void configure(IloCplex cplex) throws IloException {

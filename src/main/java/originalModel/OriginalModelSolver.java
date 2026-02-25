@@ -57,7 +57,7 @@ public final class OriginalModelSolver {
             for (int t = 1; t <= l; t++) {
                 for (int i = 0; i < nodeCount; i++) {
                     for (int j = 0; j < nodeCount; j++) {
-                        if (i == j) {
+                        if (i == j || !isValidArc(i, j, n)) {
                             continue;
                         }
                         x[i][j][t] = cplex.boolVar("x_" + i + "_" + j + "_" + t);
@@ -69,7 +69,7 @@ public final class OriginalModelSolver {
             for (int t = 1; t <= l; t++) {
                 for (int i = 0; i < nodeCount; i++) {
                     for (int j = 0; j < nodeCount; j++) {
-                        if (i == j) {
+                        if (x[i][j][t] == null) {
                             continue;
                         }
                         obj.addTerm(ins.c[i][j], x[i][j][t]);
@@ -196,11 +196,12 @@ public final class OriginalModelSolver {
                     IloLinearNumExpr out = cplex.linearNumExpr();
                     IloLinearNumExpr in = cplex.linearNumExpr();
                     for (int j = 0; j < nodeCount; j++) {
-                        if (i == j) {
-                            continue;
+                        if (x[i][j][t] != null) {
+                            out.addTerm(1.0, x[i][j][t]);
                         }
-                        out.addTerm(1.0, x[i][j][t]);
-                        in.addTerm(1.0, x[j][i][t]);
+                        if (x[j][i][t] != null) {
+                            in.addTerm(1.0, x[j][i][t]);
+                        }
                     }
                     cplex.addEq(out, in, "FlowBalance_" + i + "_" + t);
                 }
@@ -224,10 +225,9 @@ public final class OriginalModelSolver {
                 for (int j = 1; j <= n; j++) {
                     IloLinearNumExpr incoming = cplex.linearNumExpr();
                     for (int i = 0; i < nodeCount; i++) {
-                        if (i == j) {
-                            continue;
+                        if (x[i][j][t] != null) {
+                            incoming.addTerm(1.0, x[i][j][t]);
                         }
-                        incoming.addTerm(1.0, x[i][j][t]);
                     }
                     cplex.addEq(incoming, z[j][t], "VisitLink_" + j + "_" + t);
                 }
@@ -236,7 +236,7 @@ public final class OriginalModelSolver {
             for (int t = 1; t <= l; t++) {
                 for (int i = 0; i < nodeCount; i++) {
                     for (int j = 0; j < nodeCount; j++) {
-                        if (i == j) {
+                        if (x[i][j][t] == null) {
                             continue;
                         }
                         IloLinearNumExpr mtz = cplex.linearNumExpr();
@@ -268,6 +268,21 @@ public final class OriginalModelSolver {
 
     private static boolean isPickupNode(int node, int n) {
         return node >= 1 && node <= n;
+    }
+
+    /** Valid arcs: depot(0)->supplier(1..n), supplier->supplier, supplier->return(n+1). */
+    private static boolean isValidArc(int i, int j, int n) {
+        int returnDepot = n + 1;
+        if (i == j) return false;
+        // return depot never departs
+        if (i == returnDepot) return false;
+        // depot(0) only goes to suppliers
+        if (i == 0 && (j < 1 || j > n)) return false;
+        // no one goes to depot(0) — they return to n+1
+        if (j == 0) return false;
+        // return depot only receives from suppliers
+        if (j == returnDepot && (i < 1 || i > n)) return false;
+        return true;
     }
 
     private static void configure(IloCplex cplex) throws IloException {

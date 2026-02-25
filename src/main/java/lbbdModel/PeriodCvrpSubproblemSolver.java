@@ -14,7 +14,7 @@ import java.util.HashMap;
 public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
     private static final boolean LOG_TO_CONSOLE = false;
     private static final double EPS = 1e-9;
-    private static final int EXACT_DP_MAX_N = 18;
+    private static final int EXACT_DP_MAX_N = 15;
 
     private final HashMap<Integer, ExactPeriodModel> exactModels = new HashMap<Integer, ExactPeriodModel>();
     private final HashMap<Integer, LpPeriodModel> lpModels = new HashMap<Integer, LpPeriodModel>();
