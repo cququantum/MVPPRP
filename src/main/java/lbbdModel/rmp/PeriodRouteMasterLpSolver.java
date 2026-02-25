@@ -21,7 +21,13 @@ public final class PeriodRouteMasterLpSolver {
     private static final boolean LOG_TO_CONSOLE = false;
     private static final double RC_EPS = 1e-8;
     private static final double ART_EPS = 1e-7;
-    private static final int MAX_COLUMNS_PER_PRICING = 8;
+    private static final int EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS = 0;
+    private static final int MAX_COLUMNS_PER_PRICING_SMALL = 8;
+    private static final int MAX_COLUMNS_PER_PRICING_MEDIUM = 12;
+    private static final int MAX_COLUMNS_PER_PRICING_LARGE = 16;
+
+    private ExactSubsetRouteCostOracle subsetRouteOracle;
+    private Instance subsetRouteOracleInstance;
 
     public static final class Result {
         public final boolean feasible;
@@ -82,6 +88,10 @@ public final class PeriodRouteMasterLpSolver {
             }
         }
 
+        if (m <= EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS) {
+            return solveBySubsetColumnsLp(ins, t, activeCustomers, qLocal, m);
+        }
+
         final double artificialPenalty = computeArtificialPenalty(ins, m);
         PricingEspprcSolver pricingSolver = new PricingEspprcSolver();
         try (IloCplex cplex = new IloCplex()) {
@@ -138,7 +148,7 @@ public final class PeriodRouteMasterLpSolver {
                         lastDualUiLocal,
                         lastDualU0,
                         existingRouteKeys,
-                        MAX_COLUMNS_PER_PRICING
+                        maxColumnsPerPricing(m)
                 );
 
                 if (!pricing.foundNegativeColumn) {
@@ -196,10 +206,212 @@ public final class PeriodRouteMasterLpSolver {
         }
     }
 
+    private Result solveBySubsetColumnsLp(
+            Instance ins,
+            int t,
+            int[] activeCustomers,
+            double[] qLocal,
+            int m
+    ) {
+        if (subsetRouteOracle == null || subsetRouteOracleInstance != ins) {
+            subsetRouteOracle = new ExactSubsetRouteCostOracle(ins);
+            subsetRouteOracleInstance = ins;
+        }
+
+        double totalLoad = 0.0;
+        for (int k = 0; k < m; k++) {
+            totalLoad += qLocal[k];
+        }
+        if (totalLoad > ins.K * ins.Q + 1e-9) {
+            return new Result(false, false, false, false, "InfeasibleByTotalCapacity", Double.NaN,
+                    null, Double.NaN, 0, m);
+        }
+
+        try (IloCplex cplex = new IloCplex()) {
+            configureLp(cplex);
+
+            IloObjective obj = cplex.addMinimize();
+            IloRange[] coverEq = new IloRange[m];
+            for (int k = 0; k < m; k++) {
+                coverEq[k] = cplex.addEq(cplex.linearNumExpr(), 1.0, "RMP_Subset_Cover_" + t + "_" + k);
+            }
+            IloRange vehLimit = cplex.addLe(cplex.linearNumExpr(), ins.K, "RMP_Subset_Vehicle_" + t);
+
+            int localMaskCount = 1 << m;
+            double[] subsetLoadLocal = new double[localMaskCount];
+            int[] subsetGlobalMask = new int[localMaskCount];
+
+            for (int mask = 1; mask < localMaskCount; mask++) {
+                int bit = mask & -mask;
+                int local = Integer.numberOfTrailingZeros(bit);
+                subsetLoadLocal[mask] = subsetLoadLocal[mask ^ bit] + qLocal[local];
+                subsetGlobalMask[mask] = subsetGlobalMask[mask ^ bit] | (1 << (activeCustomers[local] - 1));
+            }
+
+            int generatedColumns = 0;
+            for (int mask = 1; mask < localMaskCount; mask++) {
+                if (subsetLoadLocal[mask] > ins.Q + 1e-9) {
+                    continue;
+                }
+                double routeCost = subsetRouteOracle.routeCostByGlobalMask[subsetGlobalMask[mask]];
+                if (!(routeCost < Double.POSITIVE_INFINITY / 2.0)) {
+                    continue;
+                }
+
+                IloColumn col = cplex.column(obj, routeCost).and(cplex.column(vehLimit, 1.0));
+                int bits = mask;
+                while (bits != 0) {
+                    int bit = bits & -bits;
+                    int local = Integer.numberOfTrailingZeros(bit);
+                    col = col.and(cplex.column(coverEq[local], 1.0));
+                    bits ^= bit;
+                }
+                cplex.numVar(col, 0.0, Double.MAX_VALUE, "xi_subset_" + t + "_" + mask);
+                generatedColumns++;
+            }
+
+            boolean solved = cplex.solve();
+            String status = cplex.getStatus().toString();
+            boolean optimal = solved && status.startsWith("Optimal");
+            if (!solved) {
+                return new Result(false, false, false, false, status, Double.NaN, null, Double.NaN, generatedColumns, m);
+            }
+
+            double[] dualUiByGlobal = new double[ins.n + 1];
+            double[] rawDualUiLocal = new double[m];
+            for (int k = 0; k < m; k++) {
+                rawDualUiLocal[k] = cplex.getDual(coverEq[k]);
+            }
+            double rawDualU0 = cplex.getDual(vehLimit);
+
+            DualNormalization dualNorm = normalizeSubsetLpDual(
+                    rawDualUiLocal,
+                    rawDualU0,
+                    subsetLoadLocal,
+                    subsetGlobalMask,
+                    subsetRouteOracle.routeCostByGlobalMask,
+                    cplex.getObjValue(),
+                    ins.K,
+                    ins,
+                    m
+            );
+            if (!dualNorm.valid) {
+                return new Result(false, false, false, false,
+                        status + "_InvalidDualNormalization", Double.NaN, null, Double.NaN, generatedColumns, m);
+            }
+            for (int k = 0; k < m; k++) {
+                dualUiByGlobal[activeCustomers[k]] = dualNorm.dualUiLocal[k];
+            }
+            double dualU0 = dualNorm.dualU0;
+
+            return new Result(
+                    true,
+                    optimal,
+                    true,
+                    true,
+                    status + "_SubsetColumnsLP",
+                    cplex.getObjValue(),
+                    dualUiByGlobal,
+                    dualU0,
+                    generatedColumns,
+                    m
+            );
+        } catch (IloException e) {
+            throw new RuntimeException("Failed to solve subset-columns route-master LP at t=" + t, e);
+        }
+    }
+
+    private static DualNormalization normalizeSubsetLpDual(
+            double[] rawDualUiLocal,
+            double rawDualU0,
+            double[] subsetLoadLocal,
+            int[] subsetGlobalMask,
+            double[] routeCostByGlobalMask,
+            double lpObjective,
+            int vehicleLimitK,
+            Instance ins,
+            int m
+    ) {
+        double[] candUi = new double[m];
+        if (isDualFeasibleCandidate(
+                rawDualUiLocal, rawDualU0, subsetLoadLocal, subsetGlobalMask, routeCostByGlobalMask,
+                lpObjective, vehicleLimitK, ins, m
+        )) {
+            System.arraycopy(rawDualUiLocal, 0, candUi, 0, m);
+            return new DualNormalization(true, candUi, rawDualU0);
+        }
+        for (int k = 0; k < m; k++) {
+            candUi[k] = -rawDualUiLocal[k];
+        }
+        double flippedU0 = -rawDualU0;
+        if (isDualFeasibleCandidate(
+                candUi, flippedU0, subsetLoadLocal, subsetGlobalMask, routeCostByGlobalMask,
+                lpObjective, vehicleLimitK, ins, m
+        )) {
+            return new DualNormalization(true, candUi, flippedU0);
+        }
+        return new DualNormalization(false, null, Double.NaN);
+    }
+
+    private static boolean isDualFeasibleCandidate(
+            double[] dualUiLocal,
+            double dualU0,
+            double[] subsetLoadLocal,
+            int[] subsetGlobalMask,
+            double[] routeCostByGlobalMask,
+            double lpObjective,
+            int vehicleLimitK,
+            Instance ins,
+            int m
+    ) {
+        if (dualU0 > 1e-7) {
+            return false;
+        }
+        int localMaskCount = 1 << m;
+        for (int mask = 1; mask < localMaskCount; mask++) {
+            if (subsetLoadLocal[mask] > ins.Q + 1e-9) {
+                continue;
+            }
+            double lhs = dualU0;
+            int bits = mask;
+            while (bits != 0) {
+                int bit = bits & -bits;
+                int local = Integer.numberOfTrailingZeros(bit);
+                lhs += dualUiLocal[local];
+                bits ^= bit;
+            }
+            double cost = routeCostByGlobalMask[subsetGlobalMask[mask]];
+            if (lhs > cost + 1e-6) {
+                return false;
+            }
+        }
+        double dualObj = vehicleLimitK * dualU0;
+        for (int k = 0; k < m; k++) {
+            dualObj += dualUiLocal[k];
+        }
+        double tol = 1e-5 * Math.max(1.0, Math.abs(lpObjective));
+        if (Math.abs(dualObj - lpObjective) > tol) {
+            return false;
+        }
+        return true;
+    }
+
+    private static final class DualNormalization {
+        final boolean valid;
+        final double[] dualUiLocal;
+        final double dualU0;
+
+        DualNormalization(boolean valid, double[] dualUiLocal, double dualU0) {
+            this.valid = valid;
+            this.dualUiLocal = dualUiLocal;
+            this.dualU0 = dualU0;
+        }
+    }
+
     private static int[] collectActiveCustomers(Instance ins, double[] qBar, int[] zBar) {
         ArrayList<Integer> list = new ArrayList<Integer>();
         for (int i = 1; i <= ins.n; i++) {
-            if (zBar[i] != 0 && qBar[i] > 1e-9) {
+            if (zBar[i] != 0) {
                 list.add(i);
             }
         }
@@ -220,6 +432,16 @@ public final class PeriodRouteMasterLpSolver {
             }
         }
         return 1_000_000.0 + maxArc * (customerCount + 2);
+    }
+
+    private static int maxColumnsPerPricing(int customerCount) {
+        if (customerCount >= 13) {
+            return MAX_COLUMNS_PER_PRICING_LARGE;
+        }
+        if (customerCount >= 9) {
+            return MAX_COLUMNS_PER_PRICING_MEDIUM;
+        }
+        return MAX_COLUMNS_PER_PRICING_SMALL;
     }
 
     private static void addRouteColumn(
@@ -260,6 +482,80 @@ public final class PeriodRouteMasterLpSolver {
         if (!LOG_TO_CONSOLE) {
             cplex.setOut(null);
             cplex.setWarning(null);
+        }
+    }
+
+    private static final class ExactSubsetRouteCostOracle {
+        private static final double INF = 1e100;
+
+        final double[] routeCostByGlobalMask;
+
+        ExactSubsetRouteCostOracle(Instance ins) {
+            if (ins.n <= 0 || ins.n > 30) {
+                throw new IllegalArgumentException("ExactSubsetRouteCostOracle requires 1 <= n <= 30");
+            }
+            int n = ins.n;
+            int maskCount = 1 << n;
+            this.routeCostByGlobalMask = new double[maskCount];
+            double[][] pathToLast = new double[maskCount][n];
+            for (int mask = 0; mask < maskCount; mask++) {
+                Arrays.fill(pathToLast[mask], INF);
+            }
+            routeCostByGlobalMask[0] = 0.0;
+
+            for (int j = 0; j < n; j++) {
+                int mask = 1 << j;
+                int gj = j + 1;
+                pathToLast[mask][j] = ins.c[0][gj];
+                routeCostByGlobalMask[mask] = ins.c[0][gj] + ins.c[gj][ins.n + 1];
+            }
+
+            for (int mask = 1; mask < maskCount; mask++) {
+                if ((mask & (mask - 1)) == 0) {
+                    continue;
+                }
+
+                int bits = mask;
+                while (bits != 0) {
+                    int bitJ = bits & -bits;
+                    int j = Integer.numberOfTrailingZeros(bitJ);
+                    int prevMask = mask ^ bitJ;
+                    int gj = j + 1;
+
+                    double best = INF;
+                    int prevBits = prevMask;
+                    while (prevBits != 0) {
+                        int bitI = prevBits & -prevBits;
+                        int i = Integer.numberOfTrailingZeros(bitI);
+                        double prev = pathToLast[prevMask][i];
+                        if (prev < INF / 2) {
+                            double cand = prev + ins.c[i + 1][gj];
+                            if (cand < best) {
+                                best = cand;
+                            }
+                        }
+                        prevBits ^= bitI;
+                    }
+                    pathToLast[mask][j] = best;
+                    bits ^= bitJ;
+                }
+
+                double bestRoute = INF;
+                int endBits = mask;
+                while (endBits != 0) {
+                    int bitEnd = endBits & -endBits;
+                    int last = Integer.numberOfTrailingZeros(bitEnd);
+                    double path = pathToLast[mask][last];
+                    if (path < INF / 2) {
+                        double cand = path + ins.c[last + 1][ins.n + 1];
+                        if (cand < bestRoute) {
+                            bestRoute = cand;
+                        }
+                    }
+                    endBits ^= bitEnd;
+                }
+                routeCostByGlobalMask[mask] = bestRoute;
+            }
         }
     }
 }

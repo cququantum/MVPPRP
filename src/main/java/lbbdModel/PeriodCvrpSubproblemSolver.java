@@ -8,14 +8,18 @@ import ilog.cplex.IloCplex;
 import instance.Instance;
 import model.CplexConfig;
 
+import java.util.Arrays;
 import java.util.HashMap;
 
 public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
     private static final boolean LOG_TO_CONSOLE = false;
     private static final double EPS = 1e-9;
+    private static final int EXACT_DP_MAX_N = 15;
 
     private final HashMap<Integer, ExactPeriodModel> exactModels = new HashMap<Integer, ExactPeriodModel>();
     private final HashMap<Integer, LpPeriodModel> lpModels = new HashMap<Integer, LpPeriodModel>();
+    private Instance subsetDpInstance = null;
+    private ExactSubsetDpOracle subsetDpOracle = null;
 
     public static final class Result {
         public final boolean feasible;
@@ -69,6 +73,11 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
         }
         if (totalPickup > ins.Q * ins.K + EPS) {
             return new Result(false, false, "InfeasibleByTotalCapacity", Double.NaN);
+        }
+
+        Result dpResult = trySolveBySubsetDp(ins, qBar, zBar);
+        if (dpResult != null) {
+            return dpResult;
         }
 
         try {
@@ -162,6 +171,17 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
         return node >= 1 && node <= n;
     }
 
+    private Result trySolveBySubsetDp(Instance ins, double[] qBar, int[] zBar) {
+        if (ins.n > EXACT_DP_MAX_N) {
+            return null;
+        }
+        if (subsetDpOracle == null || subsetDpInstance != ins) {
+            subsetDpOracle = new ExactSubsetDpOracle(ins);
+            subsetDpInstance = ins;
+        }
+        return subsetDpOracle.solve(qBar, zBar);
+    }
+
     private static int recommendedExactThreads(int visitCount) {
         if (visitCount <= 8) {
             return 1;
@@ -179,6 +199,188 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
         if (!LOG_TO_CONSOLE) {
             cplex.setOut(null);
             cplex.setWarning(null);
+        }
+    }
+
+    /**
+     * Exact CVRP cost for fixed-period demand via:
+     * 1) global Held-Karp route-cost precomputation over all customer subsets (distance only)
+     * 2) per-call partition DP with capacity and at-most-K routes.
+     *
+     * This is exact and much faster than solving a MIP repeatedly for n <= 15.
+     */
+    private static final class ExactSubsetDpOracle {
+        private static final double INF = 1e100;
+
+        private final Instance ins;
+        private final int n;
+        private final int maskCount;
+        private final int fullMask;
+        private final double[] routeCostByMask;
+        private final double[] subsetLoad;
+        private final double[][] memoByK;
+        private final boolean[][] seenByK;
+
+        ExactSubsetDpOracle(Instance ins) {
+            this.ins = ins;
+            this.n = ins.n;
+            this.maskCount = 1 << n;
+            this.fullMask = maskCount - 1;
+            this.routeCostByMask = precomputeRouteCosts(ins, n, maskCount);
+            this.subsetLoad = new double[maskCount];
+            this.memoByK = new double[ins.K + 1][maskCount];
+            this.seenByK = new boolean[ins.K + 1][maskCount];
+        }
+
+        Result solve(double[] qBar, int[] zBar) {
+            int activeMask = 0;
+            for (int i = 1; i <= n; i++) {
+                if (zBar[i] != 0) {
+                    activeMask |= (1 << (i - 1));
+                } else if (qBar[i] > EPS) {
+                    return new Result(false, false, "InfeasibleByPositivePickupWithoutVisit", Double.NaN);
+                }
+            }
+            if (activeMask == 0) {
+                return new Result(true, true, "TrivialZeroDP", 0.0);
+            }
+
+            buildSubsetLoads(qBar);
+
+            // If any visited customer alone exceeds capacity, infeasible.
+            int bits = activeMask;
+            while (bits != 0) {
+                int bit = bits & -bits;
+                int idx = Integer.numberOfTrailingZeros(bit);
+                if (qBar[idx + 1] > ins.Q + EPS) {
+                    return new Result(false, false, "InfeasibleBySingleCustomerCapacity", Double.NaN);
+                }
+                bits ^= bit;
+            }
+
+            clearMemo();
+            double best = solvePartition(activeMask, ins.K);
+            if (best >= INF / 2) {
+                return new Result(false, false, "InfeasibleByRoutePartitionDP", Double.NaN);
+            }
+            return new Result(true, true, "OptimalDP", best);
+        }
+
+        private void buildSubsetLoads(double[] qBar) {
+            subsetLoad[0] = 0.0;
+            for (int mask = 1; mask <= fullMask; mask++) {
+                int bit = mask & -mask;
+                int idx = Integer.numberOfTrailingZeros(bit); // 0-based customer local index
+                subsetLoad[mask] = subsetLoad[mask ^ bit] + qBar[idx + 1];
+            }
+        }
+
+        private void clearMemo() {
+            for (int k = 0; k <= ins.K; k++) {
+                Arrays.fill(seenByK[k], false);
+            }
+        }
+
+        private double solvePartition(int mask, int kLeft) {
+            if (mask == 0) {
+                return 0.0;
+            }
+            if (kLeft <= 0) {
+                return INF;
+            }
+            if (subsetLoad[mask] > kLeft * ins.Q + EPS) {
+                return INF;
+            }
+            if (kLeft == 1) {
+                return (subsetLoad[mask] <= ins.Q + EPS) ? routeCostByMask[mask] : INF;
+            }
+            if (seenByK[kLeft][mask]) {
+                return memoByK[kLeft][mask];
+            }
+            seenByK[kLeft][mask] = true;
+
+            double best = INF;
+            int anchor = mask & -mask; // symmetry breaking: first route must contain anchor
+            int sub = mask;
+            while (sub != 0) {
+                if ((sub & anchor) != 0 && subsetLoad[sub] <= ins.Q + EPS) {
+                    double rest = solvePartition(mask ^ sub, kLeft - 1);
+                    if (rest < INF / 2) {
+                        double val = routeCostByMask[sub] + rest;
+                        if (val < best) {
+                            best = val;
+                        }
+                    }
+                }
+                sub = (sub - 1) & mask;
+            }
+
+            memoByK[kLeft][mask] = best;
+            return best;
+        }
+
+        private static double[] precomputeRouteCosts(Instance ins, int n, int maskCount) {
+            double[] routeCost = new double[maskCount];
+            double[][] pathToLast = new double[maskCount][n];
+            for (int mask = 0; mask < maskCount; mask++) {
+                Arrays.fill(pathToLast[mask], INF);
+            }
+            routeCost[0] = 0.0;
+
+            for (int j = 0; j < n; j++) {
+                int mask = 1 << j;
+                int gj = j + 1;
+                pathToLast[mask][j] = ins.c[0][gj];
+                routeCost[mask] = ins.c[0][gj] + ins.c[gj][ins.n + 1];
+            }
+
+            for (int mask = 1; mask < maskCount; mask++) {
+                if ((mask & (mask - 1)) == 0) {
+                    continue; // singleton already handled
+                }
+
+                int bits = mask;
+                while (bits != 0) {
+                    int bitJ = bits & -bits;
+                    int j = Integer.numberOfTrailingZeros(bitJ);
+                    int prevMask = mask ^ bitJ;
+                    int gj = j + 1;
+
+                    double best = INF;
+                    int prevBits = prevMask;
+                    while (prevBits != 0) {
+                        int bitI = prevBits & -prevBits;
+                        int i = Integer.numberOfTrailingZeros(bitI);
+                        double prev = pathToLast[prevMask][i];
+                        if (prev < INF / 2) {
+                            double cand = prev + ins.c[i + 1][gj];
+                            if (cand < best) {
+                                best = cand;
+                            }
+                        }
+                        prevBits ^= bitI;
+                    }
+                    pathToLast[mask][j] = best;
+                    bits ^= bitJ;
+                }
+
+                double bestRoute = INF;
+                int endBits = mask;
+                while (endBits != 0) {
+                    int bitEnd = endBits & -endBits;
+                    int last = Integer.numberOfTrailingZeros(bitEnd);
+                    double path = pathToLast[mask][last];
+                    if (path < INF / 2) {
+                        double cand = path + ins.c[last + 1][ins.n + 1];
+                        if (cand < bestRoute) {
+                            bestRoute = cand;
+                        }
+                    }
+                    endBits ^= bitEnd;
+                }
+                routeCost[mask] = bestRoute;
+            }
+            return routeCost;
         }
     }
 
