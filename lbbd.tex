@@ -309,6 +309,18 @@ z_{LP}(RF)=\min\ & \sum_{r\in\mathcal R} b_r\,\zeta_r \notag\\
 \end{align}
 实现时建议用列生成求解该LP（Restricted Master + Pricing），得到常数$LB_R$后在LBBD主循环中复用。
 
+\begin{remark}[RF列生成的Phase-I实现细节（避免初始RMP不可行）]
+在实现\eqref{eq:rf_lp}时，受限主问题（RMP）可能因初始列不足而暂时不可行（例如仅含单客户路线时，无法同时满足全部覆盖下界）。
+推荐采用Phase-I机制区分“初始RMP不可行”和“RF模型本身不可行”：
+\begin{itemize}
+  \item 仅在覆盖下界约束 $\sum_{r\in\mathcal R} a_{ir}\zeta_r \ge f_{il}$ 上添加人工变量 $a_i\ge 0$，并在目标中加入大罚项 $M\sum_i a_i$；
+  \item 路线数上下界约束 $\sum_r\zeta_r\ge m_L,\ \sum_r\zeta_r\le m_U$ 不添加人工变量；
+  \item 当列生成收敛后，若仍存在 $a_i>0$，则判定RF确实不可行；若全部 $a_i=0$，则当前目标值即为有效的 $LB_R$；
+  \item $M$ 需显著大于正常路线成本量级（即远大于典型 $b_r$），以避免人工变量在最优解中残留。
+\end{itemize}
+若RF最终被判定不可行，实现上可回退到保守下界（如$LB_R=0$），不影响割的有效性，但会削弱组合最优性割强度。
+\end{remark}
+
 \begin{remark}[$LB_R$ 在供给量跨期差异大时的松弛程度]
 RF 的松弛关键在于使用 $q_i=\min_{t\in T}\{s_{it}\}$ 代替各期实际取货量。当各期供给量 $s_{it}$ 差异较大时，$q_i$ 远低于实际平均取货量，导致 $f_{il}$ 低估了收集点 $i$ 的实际最少服务次数，进而使 $LB_R$ 显著偏小。在此情形下，基于 $LB_R$ 的组合最优性割 \eqref{eq:g_def_312} 的斜率 $\phi-LB_R$ 会偏大，割相对较弱。
 

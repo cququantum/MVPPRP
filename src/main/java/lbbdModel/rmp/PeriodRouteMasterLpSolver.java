@@ -21,7 +21,7 @@ public final class PeriodRouteMasterLpSolver {
     private static final boolean LOG_TO_CONSOLE = false;
     private static final double RC_EPS = 1e-8;
     private static final double ART_EPS = 1e-7;
-    private static final int EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS = 0;
+    private static final int EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS = 15;
 
     // Adaptive column generation parameters based on instance size
     private final int maxColumnsPerPricingSmall;
@@ -39,6 +39,7 @@ public final class PeriodRouteMasterLpSolver {
         public final String status;
         public final double lpObjective;
         public final double[] dualUiByGlobal; // size n+1
+        public final double[][] dualUiByPrev; // size [n+1][l+2], only period-t entries used
         public final double dualU0;
         public final int generatedColumns;
         public final int customerCount;
@@ -51,6 +52,7 @@ public final class PeriodRouteMasterLpSolver {
                 String status,
                 double lpObjective,
                 double[] dualUiByGlobal,
+                double[][] dualUiByPrev,
                 double dualU0,
                 int generatedColumns,
                 int customerCount
@@ -62,6 +64,7 @@ public final class PeriodRouteMasterLpSolver {
             this.status = status;
             this.lpObjective = lpObjective;
             this.dualUiByGlobal = dualUiByGlobal;
+            this.dualUiByPrev = dualUiByPrev;
             this.dualU0 = dualU0;
             this.generatedColumns = generatedColumns;
             this.customerCount = customerCount;
@@ -88,14 +91,26 @@ public final class PeriodRouteMasterLpSolver {
         }
     }
 
-    public Result solve(Instance ins, int t, double[] qBar, int[] zBar) {
+    public Result solve(Instance ins, int t, double[] qBar, int[] zBar, int[] prevVisitBySupplier) {
         if (t < 1 || t > ins.l) {
             throw new IllegalArgumentException("t must be in 1..l");
         }
         int[] activeCustomers = collectActiveCustomers(ins, qBar, zBar);
         int m = activeCustomers.length;
         if (m == 0) {
-            return new Result(true, true, true, true, "TrivialZeroRmp", 0.0, new double[ins.n + 1], 0.0, 0, 0);
+            return new Result(
+                    true,
+                    true,
+                    true,
+                    true,
+                    "TrivialZeroRmp",
+                    0.0,
+                    new double[ins.n + 1],
+                    new double[ins.n + 1][ins.l + 2],
+                    0.0,
+                    0,
+                    0
+            );
         }
 
         double[] qLocal = new double[m];
@@ -106,12 +121,12 @@ public final class PeriodRouteMasterLpSolver {
             localIndexByGlobal[activeCustomers[k]] = k;
             if (qLocal[k] > ins.Q + 1e-9) {
                 return new Result(false, false, false, false, "InfeasibleBySingleCustomerCapacity", Double.NaN,
-                        null, Double.NaN, 0, m);
+                        null, null, Double.NaN, 0, m);
             }
         }
 
         if (m <= EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS) {
-            return solveBySubsetColumnsLp(ins, t, activeCustomers, qLocal, m);
+            return solveBySubsetColumnsLp(ins, t, activeCustomers, qLocal, m, prevVisitBySupplier);
         }
 
         final double artificialPenalty = computeArtificialPenalty(ins, m);
@@ -154,7 +169,8 @@ public final class PeriodRouteMasterLpSolver {
                 status = cplex.getStatus().toString();
                 optimal = solved && status.startsWith("Optimal");
                 if (!solved) {
-                    return new Result(false, false, false, false, status, Double.NaN, null, Double.NaN, generatedColumns, m);
+                    return new Result(false, false, false, false, status, Double.NaN,
+                            null, null, Double.NaN, generatedColumns, m);
                 }
 
                 lastDualUiLocal = new double[m];
@@ -210,6 +226,7 @@ public final class PeriodRouteMasterLpSolver {
                     dualUiByGlobal[activeCustomers[k]] = lastDualUiLocal[k];
                 }
             }
+            double[][] dualUiByPrev = buildDualByPrev(ins, t, dualUiByGlobal, prevVisitBySupplier);
 
             return new Result(
                     true,
@@ -219,6 +236,7 @@ public final class PeriodRouteMasterLpSolver {
                     artificialClean ? status : (status + "_ArtificialPositive"),
                     cplex.getObjValue(),
                     dualUiByGlobal,
+                    dualUiByPrev,
                     lastDualU0,
                     generatedColumns,
                     m
@@ -233,7 +251,8 @@ public final class PeriodRouteMasterLpSolver {
             int t,
             int[] activeCustomers,
             double[] qLocal,
-            int m
+            int m,
+            int[] prevVisitBySupplier
     ) {
         if (subsetRouteOracle == null || subsetRouteOracleInstance != ins) {
             subsetRouteOracle = new ExactSubsetRouteCostOracle(ins);
@@ -246,7 +265,7 @@ public final class PeriodRouteMasterLpSolver {
         }
         if (totalLoad > ins.K * ins.Q + 1e-9) {
             return new Result(false, false, false, false, "InfeasibleByTotalCapacity", Double.NaN,
-                    null, Double.NaN, 0, m);
+                    null, null, Double.NaN, 0, m);
         }
 
         try (IloCplex cplex = new IloCplex()) {
@@ -296,7 +315,8 @@ public final class PeriodRouteMasterLpSolver {
             String status = cplex.getStatus().toString();
             boolean optimal = solved && status.startsWith("Optimal");
             if (!solved) {
-                return new Result(false, false, false, false, status, Double.NaN, null, Double.NaN, generatedColumns, m);
+                return new Result(false, false, false, false, status, Double.NaN,
+                        null, null, Double.NaN, generatedColumns, m);
             }
 
             double[] dualUiByGlobal = new double[ins.n + 1];
@@ -319,12 +339,14 @@ public final class PeriodRouteMasterLpSolver {
             );
             if (!dualNorm.valid) {
                 return new Result(false, false, false, false,
-                        status + "_InvalidDualNormalization", Double.NaN, null, Double.NaN, generatedColumns, m);
+                        status + "_InvalidDualNormalization", Double.NaN,
+                        null, null, Double.NaN, generatedColumns, m);
             }
             for (int k = 0; k < m; k++) {
                 dualUiByGlobal[activeCustomers[k]] = dualNorm.dualUiLocal[k];
             }
             double dualU0 = dualNorm.dualU0;
+            double[][] dualUiByPrev = buildDualByPrev(ins, t, dualUiByGlobal, prevVisitBySupplier);
 
             return new Result(
                     true,
@@ -334,6 +356,7 @@ public final class PeriodRouteMasterLpSolver {
                     status + "_SubsetColumnsLP",
                     cplex.getObjValue(),
                     dualUiByGlobal,
+                    dualUiByPrev,
                     dualU0,
                     generatedColumns,
                     m
@@ -341,6 +364,28 @@ public final class PeriodRouteMasterLpSolver {
         } catch (IloException e) {
             throw new RuntimeException("Failed to solve subset-columns route-master LP at t=" + t, e);
         }
+    }
+
+    private static double[][] buildDualByPrev(
+            Instance ins,
+            int t,
+            double[] dualUiByGlobal,
+            int[] prevVisitBySupplier
+    ) {
+        double[][] byPrev = new double[ins.n + 1][ins.l + 2];
+        if (prevVisitBySupplier == null) {
+            return byPrev;
+        }
+        for (int i = 1; i <= ins.n; i++) {
+            if (dualUiByGlobal == null || i >= dualUiByGlobal.length) {
+                continue;
+            }
+            int v = (i < prevVisitBySupplier.length) ? prevVisitBySupplier[i] : -1;
+            if (v >= 0 && v <= t - 1 && v < byPrev[i].length) {
+                byPrev[i][v] = dualUiByGlobal[i];
+            }
+        }
+        return byPrev;
     }
 
     private static DualNormalization normalizeSubsetLpDual(

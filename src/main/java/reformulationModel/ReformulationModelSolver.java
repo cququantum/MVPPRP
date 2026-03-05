@@ -81,6 +81,9 @@ public final class ReformulationModelSolver {
             for (int i = 1; i <= n; i++) {
                 for (int t = 1; t <= l + 1; t++) {
                     for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                        if (ins.g(i, v, t) > ins.Q + 1e-9) {
+                            continue;
+                        }
                         lambda[i][v][t] = cplex.boolVar("lambda_" + i + "_" + v + "_" + t);
                     }
                 }
@@ -104,7 +107,9 @@ public final class ReformulationModelSolver {
             for (int i = 1; i <= n; i++) {
                 for (int t = 1; t <= l + 1; t++) {
                     for (int v = ins.pi[i][t]; v <= t - 1; v++) {
-                        obj.addTerm(holdingCostOnArc(ins, i, v, t), lambda[i][v][t]);
+                        if (lambda[i][v][t] != null) {
+                            obj.addTerm(holdingCostOnArc(ins, i, v, t), lambda[i][v][t]);
+                        }
                     }
                 }
             }
@@ -140,7 +145,9 @@ public final class ReformulationModelSolver {
                 }
                 for (int i = 1; i <= n; i++) {
                     for (int v = ins.pi[i][t]; v <= t - 1; v++) {
-                        factoryBalance.addTerm(ins.g(i, v, t), lambda[i][v][t]);
+                        if (lambda[i][v][t] != null) {
+                            factoryBalance.addTerm(ins.g(i, v, t), lambda[i][v][t]);
+                        }
                     }
                 }
                 factoryBalance.addTerm(-ins.k, p[t]);
@@ -150,16 +157,18 @@ public final class ReformulationModelSolver {
                 cplex.addLe(i0[t], ins.L0, "FactoryCap_" + t);
             }
 
-            for (int i = 1; i <= n; i++) {
-                for (int t = 1; t <= l; t++) {
-                    IloLinearNumExpr link = cplex.linearNumExpr();
-                    for (int v = ins.pi[i][t]; v <= t - 1; v++) {
-                        link.addTerm(1.0, lambda[i][v][t]);
+                for (int i = 1; i <= n; i++) {
+                    for (int t = 1; t <= l; t++) {
+                        IloLinearNumExpr link = cplex.linearNumExpr();
+                        for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                            if (lambda[i][v][t] != null) {
+                                link.addTerm(1.0, lambda[i][v][t]);
+                            }
+                        }
+                        link.addTerm(-1.0, z[i][t]);
+                        cplex.addEq(link, 0.0, "LinkZLambda_" + i + "_" + t);
                     }
-                    link.addTerm(-1.0, z[i][t]);
-                    cplex.addEq(link, 0.0, "LinkZLambda_" + i + "_" + t);
                 }
-            }
 
             for (int i = 1; i <= n; i++) {
                 IloLinearNumExpr startFlow = cplex.linearNumExpr();
@@ -171,16 +180,18 @@ public final class ReformulationModelSolver {
                 cplex.addEq(startFlow, 1.0, "StartFlow_" + i);
             }
 
-            for (int i = 1; i <= n; i++) {
-                for (int t = 1; t <= l; t++) {
-                    IloLinearNumExpr balance = cplex.linearNumExpr();
-                    for (int v = ins.pi[i][t]; v <= t - 1; v++) {
-                        balance.addTerm(1.0, lambda[i][v][t]);
-                    }
-                    for (int tau = t + 1; tau <= ins.mu[i][t]; tau++) {
-                        if (lambda[i][t][tau] != null) {
-                            balance.addTerm(-1.0, lambda[i][t][tau]);
+                for (int i = 1; i <= n; i++) {
+                    for (int t = 1; t <= l; t++) {
+                        IloLinearNumExpr balance = cplex.linearNumExpr();
+                        for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                            if (lambda[i][v][t] != null) {
+                                balance.addTerm(1.0, lambda[i][v][t]);
+                            }
                         }
+                        for (int tau = t + 1; tau <= ins.mu[i][t]; tau++) {
+                            if (lambda[i][t][tau] != null) {
+                                balance.addTerm(-1.0, lambda[i][t][tau]);
+                            }
                     }
                     cplex.addEq(balance, 0.0, "LambdaFlow_" + i + "_" + t);
                 }
@@ -200,7 +211,9 @@ public final class ReformulationModelSolver {
                 IloLinearNumExpr vehCap = cplex.linearNumExpr();
                 for (int i = 1; i <= n; i++) {
                     for (int v = ins.pi[i][t]; v <= t - 1; v++) {
-                        vehCap.addTerm(ins.g(i, v, t), lambda[i][v][t]);
+                        if (lambda[i][v][t] != null) {
+                            vehCap.addTerm(ins.g(i, v, t), lambda[i][v][t]);
+                        }
                     }
                 }
                 vehCap.addTerm(-ins.Q, m[t]);
@@ -262,7 +275,9 @@ public final class ReformulationModelSolver {
                         mtz.addTerm(-ins.bigM, x[i][j][t]);
                         if (isPickupNode(i, n)) {
                             for (int v = ins.pi[i][t]; v <= t - 1; v++) {
-                                mtz.addTerm(-ins.g(i, v, t), lambda[i][v][t]);
+                                if (lambda[i][v][t] != null) {
+                                    mtz.addTerm(-ins.g(i, v, t), lambda[i][v][t]);
+                                }
                             }
                         }
                         cplex.addGe(mtz, -ins.bigM, "MTZ_" + i + "_" + j + "_" + t);
