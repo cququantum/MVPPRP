@@ -21,7 +21,7 @@ public final class PeriodRouteMasterLpSolver {
     private static final boolean LOG_TO_CONSOLE = false;
     private static final double RC_EPS = 1e-8;
     private static final double ART_EPS = 1e-7;
-    private static final int EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS = 15;
+    private static final int EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS = 0;
 
     // Adaptive column generation parameters based on instance size
     private final int maxColumnsPerPricingSmall;
@@ -95,9 +95,31 @@ public final class PeriodRouteMasterLpSolver {
         if (t < 1 || t > ins.l) {
             throw new IllegalArgumentException("t must be in 1..l");
         }
-        int[] activeCustomers = collectActiveCustomers(ins, qBar, zBar);
-        int m = activeCustomers.length;
-        if (m == 0) {
+        if (prevVisitBySupplier == null || prevVisitBySupplier.length < ins.n + 1) {
+            throw new IllegalArgumentException("prevVisitBySupplier must have length n+1");
+        }
+
+        ArrayList<Integer> supplierList = new ArrayList<Integer>();
+        ArrayList<Integer> prevList = new ArrayList<Integer>();
+        ArrayList<Double> demandList = new ArrayList<Double>();
+        ArrayList<Double> rhsList = new ArrayList<Double>();
+
+        for (int i = 1; i <= ins.n; i++) {
+            int vBar = prevVisitBySupplier[i];
+            for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                double demand = ins.g(i, v, t);
+                if (demand > ins.Q + 1e-9) {
+                    continue;
+                }
+                supplierList.add(i);
+                prevList.add(v);
+                demandList.add(demand);
+                rhsList.add((vBar == v) ? 1.0 : 0.0);
+            }
+        }
+
+        int scenarioCount = supplierList.size();
+        if (scenarioCount == 0) {
             return new Result(
                     true,
                     true,
@@ -113,53 +135,53 @@ public final class PeriodRouteMasterLpSolver {
             );
         }
 
-        double[] qLocal = new double[m];
-        int[] localIndexByGlobal = new int[ins.nodeCount];
-        Arrays.fill(localIndexByGlobal, -1);
-        for (int k = 0; k < m; k++) {
-            qLocal[k] = qBar[activeCustomers[k]];
-            localIndexByGlobal[activeCustomers[k]] = k;
-            if (qLocal[k] > ins.Q + 1e-9) {
-                return new Result(false, false, false, false, "InfeasibleBySingleCustomerCapacity", Double.NaN,
-                        null, null, Double.NaN, 0, m);
-            }
+        int[] scenarioSupplier = new int[scenarioCount];
+        int[] scenarioPrev = new int[scenarioCount];
+        double[] scenarioDemand = new double[scenarioCount];
+        double[] scenarioRhs = new double[scenarioCount];
+        for (int s = 0; s < scenarioCount; s++) {
+            scenarioSupplier[s] = supplierList.get(s);
+            scenarioPrev[s] = prevList.get(s);
+            scenarioDemand[s] = demandList.get(s);
+            scenarioRhs[s] = rhsList.get(s);
         }
-
-        if (m <= EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS) {
-            return solveBySubsetColumnsLp(ins, t, activeCustomers, qLocal, m, prevVisitBySupplier);
-        }
-
-        final double artificialPenalty = computeArtificialPenalty(ins, m);
+        final double artificialPenalty = computeArtificialPenalty(ins, scenarioCount);
         PricingEspprcSolver pricingSolver = new PricingEspprcSolver();
         try (IloCplex cplex = new IloCplex()) {
             configureLp(cplex);
 
             IloObjective obj = cplex.addMinimize();
-            IloRange[] coverEq = new IloRange[m];
-            for (int k = 0; k < m; k++) {
-                coverEq[k] = cplex.addEq(cplex.linearNumExpr(), 1.0, "RMP_Cover_" + t + "_" + k);
+            IloRange[] coverEq = new IloRange[scenarioCount];
+            for (int s = 0; s < scenarioCount; s++) {
+                coverEq[s] = cplex.addEq(cplex.linearNumExpr(), scenarioRhs[s], "RMP_Cover_" + t + "_s" + s);
             }
             IloRange vehLimit = cplex.addLe(cplex.linearNumExpr(), ins.K, "RMP_Vehicle_" + t);
 
-            IloNumVar[] artificial = new IloNumVar[m];
-            for (int k = 0; k < m; k++) {
-                IloColumn col = cplex.column(obj, artificialPenalty).and(cplex.column(coverEq[k], 1.0));
-                artificial[k] = cplex.numVar(col, 0.0, Double.MAX_VALUE, "a_" + t + "_" + k);
+            IloNumVar[] artificial = new IloNumVar[scenarioCount];
+            for (int s = 0; s < scenarioCount; s++) {
+                IloColumn col = cplex.column(obj, artificialPenalty).and(cplex.column(coverEq[s], 1.0));
+                artificial[s] = cplex.numVar(col, 0.0, Double.MAX_VALUE, "a_" + t + "_s" + s);
             }
 
             HashSet<String> existingRouteKeys = new HashSet<String>();
-            ArrayList<IloNumVar> routeVars = new ArrayList<IloNumVar>();
 
-            for (int k = 0; k < m; k++) {
-                int g = activeCustomers[k];
-                double cost = ins.c[0][g] + ins.c[g][ins.n + 1];
-                RouteColumn singleton = new RouteColumn(new int[]{g}, cost, qLocal[k]);
-                addRouteColumn(cplex, obj, coverEq, vehLimit, localIndexByGlobal, singleton, routeVars, existingRouteKeys,
-                        "init_" + t + "_" + k);
+            for (int s = 0; s < scenarioCount; s++) {
+                int supplier = scenarioSupplier[s];
+                double cost = ins.c[0][supplier] + ins.c[supplier][ins.n + 1];
+                ScenarioRouteColumn singleton = new ScenarioRouteColumn(new int[]{s}, cost, scenarioDemand[s]);
+                addScenarioRouteColumn(
+                        cplex,
+                        obj,
+                        coverEq,
+                        vehLimit,
+                        singleton,
+                        existingRouteKeys,
+                        "init_" + t + "_s" + s
+                );
             }
 
             int generatedColumns = 0;
-            double[] lastDualUiLocal = null;
+            double[] lastDualByScenario = null;
             double lastDualU0 = Double.NaN;
             String status = "Unknown";
             boolean optimal = false;
@@ -170,41 +192,40 @@ public final class PeriodRouteMasterLpSolver {
                 optimal = solved && status.startsWith("Optimal");
                 if (!solved) {
                     return new Result(false, false, false, false, status, Double.NaN,
-                            null, null, Double.NaN, generatedColumns, m);
+                            null, null, Double.NaN, generatedColumns, scenarioCount);
                 }
 
-                lastDualUiLocal = new double[m];
-                for (int k = 0; k < m; k++) {
-                    lastDualUiLocal[k] = cplex.getDual(coverEq[k]);
+                lastDualByScenario = new double[scenarioCount];
+                for (int s = 0; s < scenarioCount; s++) {
+                    lastDualByScenario[s] = cplex.getDual(coverEq[s]);
                 }
                 lastDualU0 = cplex.getDual(vehLimit);
 
-                PricingEspprcSolver.Result pricing = pricingSolver.findNegativeRoutes(
+                PricingEspprcSolver.ScenarioResult pricing = pricingSolver.findNegativeScenarioRoutes(
                         ins,
-                        activeCustomers,
-                        qLocal,
-                        lastDualUiLocal,
+                        scenarioSupplier,
+                        scenarioDemand,
+                        lastDualByScenario,
                         lastDualU0,
                         existingRouteKeys,
-                        maxColumnsPerPricing(m)
+                        maxColumnsPerPricing(Math.min(scenarioCount, ins.n))
                 );
 
                 if (!pricing.foundNegativeColumn) {
                     break;
                 }
 
-                ArrayList<RouteColumn> newRoutes = pricing.routes;
+                ArrayList<ScenarioRouteColumn> newRoutes = pricing.routes;
                 if (newRoutes == null || newRoutes.isEmpty()) {
-                    // Safety fallback: preserve old behavior if pricing only returns the best route.
-                    addRouteColumn(
-                            cplex, obj, coverEq, vehLimit, localIndexByGlobal, pricing.route, routeVars, existingRouteKeys,
+                    addScenarioRouteColumn(
+                            cplex, obj, coverEq, vehLimit, pricing.route, existingRouteKeys,
                             "cg_" + t + "_" + generatedColumns
                     );
                     generatedColumns++;
                 } else {
                     for (int r = 0; r < newRoutes.size(); r++) {
-                        addRouteColumn(
-                                cplex, obj, coverEq, vehLimit, localIndexByGlobal, newRoutes.get(r), routeVars, existingRouteKeys,
+                        addScenarioRouteColumn(
+                                cplex, obj, coverEq, vehLimit, newRoutes.get(r), existingRouteKeys,
                                 "cg_" + t + "_" + generatedColumns
                         );
                         generatedColumns++;
@@ -213,20 +234,28 @@ public final class PeriodRouteMasterLpSolver {
             }
 
             boolean artificialClean = true;
-            for (int k = 0; k < m; k++) {
-                if (cplex.getValue(artificial[k]) > ART_EPS) {
+            for (int s = 0; s < scenarioCount; s++) {
+                if (cplex.getValue(artificial[s]) > ART_EPS) {
                     artificialClean = false;
                     break;
                 }
             }
 
             double[] dualUiByGlobal = new double[ins.n + 1];
-            if (lastDualUiLocal != null) {
-                for (int k = 0; k < m; k++) {
-                    dualUiByGlobal[activeCustomers[k]] = lastDualUiLocal[k];
+            double[][] dualUiByPrev = new double[ins.n + 1][ins.l + 2];
+            if (lastDualByScenario != null) {
+                for (int s = 0; s < scenarioCount; s++) {
+                    int supplier = scenarioSupplier[s];
+                    int prev = scenarioPrev[s];
+                    dualUiByPrev[supplier][prev] = lastDualByScenario[s];
+                }
+                for (int i = 1; i <= ins.n; i++) {
+                    int v = prevVisitBySupplier[i];
+                    if (v >= 0 && v < dualUiByPrev[i].length) {
+                        dualUiByGlobal[i] = dualUiByPrev[i][v];
+                    }
                 }
             }
-            double[][] dualUiByPrev = buildDualByPrev(ins, t, dualUiByGlobal, prevVisitBySupplier);
 
             return new Result(
                     true,
@@ -239,7 +268,7 @@ public final class PeriodRouteMasterLpSolver {
                     dualUiByPrev,
                     lastDualU0,
                     generatedColumns,
-                    m
+                    scenarioCount
             );
         } catch (IloException e) {
             throw new RuntimeException("Failed to solve route-master LP at t=" + t, e);
@@ -540,6 +569,36 @@ public final class PeriodRouteMasterLpSolver {
         }
         IloNumVar var = cplex.numVar(col, 0.0, Double.MAX_VALUE, "xi_" + varName);
         routeVars.add(var);
+    }
+
+    private static void addScenarioRouteColumn(
+            IloCplex cplex,
+            IloObjective obj,
+            IloRange[] coverEq,
+            IloRange vehLimit,
+            ScenarioRouteColumn route,
+            HashSet<String> existingRouteKeys,
+            String varName
+    ) throws IloException {
+        if (route == null) {
+            return;
+        }
+        String key = route.key();
+        if (existingRouteKeys.contains(key)) {
+            return;
+        }
+        existingRouteKeys.add(key);
+
+        IloColumn col = cplex.column(obj, route.cost).and(cplex.column(vehLimit, 1.0));
+        boolean[] covered = new boolean[coverEq.length];
+        for (int p = 0; p < route.scenarioIndicesInOrder.length; p++) {
+            int s = route.scenarioIndicesInOrder[p];
+            if (s >= 0 && s < coverEq.length && !covered[s]) {
+                col = col.and(cplex.column(coverEq[s], 1.0));
+                covered[s] = true;
+            }
+        }
+        cplex.numVar(col, 0.0, Double.MAX_VALUE, "xi_s_" + varName);
     }
 
     private static void configureLp(IloCplex cplex) throws IloException {

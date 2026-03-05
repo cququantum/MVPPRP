@@ -65,7 +65,7 @@ public final class RoutingLowerBoundSolver {
                 q = Math.min(q, ins.s[i][t]);
                 horizonLoad += ins.s[i][t];
             }
-            if (!Double.isFinite(q)) {
+            if (Double.isNaN(q) || Double.isInfinite(q)) {
                 q = 0.0;
             }
             qMin[i] = Math.max(0.0, q);

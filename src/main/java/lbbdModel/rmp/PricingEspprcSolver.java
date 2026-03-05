@@ -34,6 +34,25 @@ public final class PricingEspprcSolver {
         }
     }
 
+    public static final class ScenarioResult {
+        public final boolean foundNegativeColumn;
+        public final double bestReducedCost;
+        public final ScenarioRouteColumn route;
+        public final ArrayList<ScenarioRouteColumn> routes;
+
+        public ScenarioResult(
+                boolean foundNegativeColumn,
+                double bestReducedCost,
+                ScenarioRouteColumn route,
+                ArrayList<ScenarioRouteColumn> routes
+        ) {
+            this.foundNegativeColumn = foundNegativeColumn;
+            this.bestReducedCost = bestReducedCost;
+            this.route = route;
+            this.routes = routes;
+        }
+    }
+
     public Result findBestNegativeRoute(
             Instance ins,
             int[] activeGlobalCustomers,
@@ -69,6 +88,53 @@ public final class PricingEspprcSolver {
             return new Result(true, search.bestReducedCost, search.bestRoute, routes);
         }
         return new Result(false, search.bestReducedCost, null, routes);
+    }
+
+    public ScenarioResult findNegativeScenarioRoutes(
+            Instance ins,
+            int[] supplierByScenario,
+            double[] demandByScenario,
+            double[] dualByScenario,
+            double dualU0,
+            HashSet<String> existingRouteKeys,
+            int maxColumns
+    ) {
+        int m = supplierByScenario.length;
+        if (m == 0) {
+            return new ScenarioResult(false, 0.0, null, new ArrayList<ScenarioRouteColumn>());
+        }
+        if (demandByScenario.length != m || dualByScenario.length != m) {
+            throw new IllegalArgumentException("Scenario arrays length mismatch");
+        }
+
+        ScenarioSearch search;
+        if (m <= 62 && ins.n <= 62) {
+            search = new ScenarioLongSearch(
+                    ins,
+                    supplierByScenario,
+                    demandByScenario,
+                    dualByScenario,
+                    dualU0,
+                    existingRouteKeys,
+                    maxColumns
+            );
+        } else {
+            search = new ScenarioBitSetSearch(
+                    ins,
+                    supplierByScenario,
+                    demandByScenario,
+                    dualByScenario,
+                    dualU0,
+                    existingRouteKeys,
+                    maxColumns
+            );
+        }
+        search.run();
+        ArrayList<ScenarioRouteColumn> routes = search.getCollectedRoutes();
+        if (search.bestRoute != null && search.bestReducedCost < -RC_EPS) {
+            return new ScenarioResult(true, search.bestReducedCost, search.bestRoute, routes);
+        }
+        return new ScenarioResult(false, search.bestReducedCost, null, routes);
     }
 
     private abstract static class Search {
@@ -302,13 +368,6 @@ public final class PricingEspprcSolver {
                             cur,
                             cur.visitedMask | bit
                     );
-                    // Early completion bound pruning: skip register if child can never beat best
-                    if (bestReducedCost < Double.POSITIVE_INFINITY) {
-                        double lb = child.travelCost + returnToDepot[nxt] - child.dualGain - dualU0;
-                        if (lb >= bestReducedCost - DOM_EPS) {
-                            continue;
-                        }
-                    }
                     if (register(child)) {
                         queue.addLast(child);
                     }
@@ -534,13 +593,6 @@ public final class PricingEspprcSolver {
                                 cur,
                                 nextVisited
                         );
-                        if (bestReducedCost < Double.POSITIVE_INFINITY) {
-                            double lb = child.travelCost + returnToDepot[nxt] - child.dualGain - dualU0;
-                            if (lb >= bestReducedCost - DOM_EPS) {
-                                nxt = cur.visited.nextClearBit(nxt + 1);
-                                continue;
-                            }
-                        }
                         if (register(child)) {
                             queue.addLast(child);
                         }
@@ -606,6 +658,453 @@ public final class PricingEspprcSolver {
             }
             BitSetStateKey other = (BitSetStateKey) o;
             return this.lastLocal == other.lastLocal && this.visited.equals(other.visited);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+    }
+
+    private abstract static class ScenarioSearch {
+        final Instance ins;
+        final int[] supplierByScenario;
+        final double[] demandByScenario;
+        final double[] dualByScenario;
+        final double dualU0;
+        final HashSet<String> existingRouteKeys;
+        final int maxColumns;
+        final ArrayList<ScenarioCollectedColumn> collected;
+        final HashSet<String> collectedKeys;
+
+        double bestReducedCost = Double.POSITIVE_INFINITY;
+        ScenarioRouteColumn bestRoute = null;
+
+        ScenarioSearch(
+                Instance ins,
+                int[] supplierByScenario,
+                double[] demandByScenario,
+                double[] dualByScenario,
+                double dualU0,
+                HashSet<String> existingRouteKeys,
+                int maxColumns
+        ) {
+            this.ins = ins;
+            this.supplierByScenario = supplierByScenario;
+            this.demandByScenario = demandByScenario;
+            this.dualByScenario = dualByScenario;
+            this.dualU0 = dualU0;
+            this.existingRouteKeys = existingRouteKeys;
+            this.maxColumns = Math.max(0, maxColumns);
+            this.collected = new ArrayList<ScenarioCollectedColumn>();
+            this.collectedKeys = new HashSet<String>();
+        }
+
+        abstract void run();
+
+        final ArrayList<ScenarioRouteColumn> getCollectedRoutes() {
+            ArrayList<ScenarioRouteColumn> out = new ArrayList<ScenarioRouteColumn>(collected.size());
+            for (int i = 0; i < collected.size(); i++) {
+                out.add(collected.get(i).route);
+            }
+            return out;
+        }
+
+        final void considerCompleteRoute(AbstractScenarioLabel label) {
+            int lastSupplier = supplierByScenario[label.lastScenario];
+            double fullCost = label.travelCost + ins.c[lastSupplier][ins.n + 1];
+            double reducedCost = fullCost - label.dualGain - dualU0;
+            boolean canImproveBest = reducedCost < bestReducedCost - DOM_EPS;
+            boolean canCollect = maxColumns > 0 && reducedCost < -RC_EPS
+                    && (collected.size() < maxColumns
+                    || reducedCost < collected.get(collected.size() - 1).reducedCost - DOM_EPS);
+            if (!canImproveBest && !canCollect) {
+                return;
+            }
+            int[] scenarioSeq = reconstructScenarioSeq(label);
+            String key = buildScenarioKey(scenarioSeq);
+            if (existingRouteKeys.contains(key)) {
+                return;
+            }
+            ScenarioRouteColumn route = new ScenarioRouteColumn(scenarioSeq, fullCost, label.load);
+            if (canImproveBest) {
+                bestReducedCost = reducedCost;
+                bestRoute = route;
+            }
+            if (maxColumns > 0 && reducedCost < -RC_EPS && !collectedKeys.contains(key)) {
+                maybeCollect(new ScenarioCollectedColumn(reducedCost, route, key));
+            }
+        }
+
+        private int[] reconstructScenarioSeq(AbstractScenarioLabel label) {
+            int[] seq = new int[label.depth];
+            AbstractScenarioLabel cur = label;
+            for (int p = label.depth - 1; p >= 0; p--) {
+                seq[p] = cur.lastScenario;
+                cur = cur.pred;
+            }
+            return seq;
+        }
+
+        private static String buildScenarioKey(int[] seq) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < seq.length; i++) {
+                if (i > 0) {
+                    sb.append('-');
+                }
+                sb.append('s').append(seq[i]);
+            }
+            return sb.toString();
+        }
+
+        private void maybeCollect(ScenarioCollectedColumn candidate) {
+            if (collected.size() >= maxColumns) {
+                ScenarioCollectedColumn worst = collected.get(collected.size() - 1);
+                if (candidate.reducedCost >= worst.reducedCost - DOM_EPS) {
+                    return;
+                }
+                collectedKeys.remove(worst.key);
+                collected.remove(collected.size() - 1);
+            }
+            int pos = collected.size();
+            while (pos > 0 && candidate.reducedCost < collected.get(pos - 1).reducedCost - DOM_EPS) {
+                pos--;
+            }
+            collected.add(pos, candidate);
+            collectedKeys.add(candidate.key);
+        }
+    }
+
+    private static final class ScenarioCollectedColumn {
+        final double reducedCost;
+        final ScenarioRouteColumn route;
+        final String key;
+
+        ScenarioCollectedColumn(double reducedCost, ScenarioRouteColumn route, String key) {
+            this.reducedCost = reducedCost;
+            this.route = route;
+            this.key = key;
+        }
+    }
+
+    private abstract static class AbstractScenarioLabel {
+        final int lastScenario;
+        final int depth;
+        final double load;
+        final double travelCost;
+        final double dualGain;
+        final AbstractScenarioLabel pred;
+
+        AbstractScenarioLabel(
+                int lastScenario,
+                int depth,
+                double load,
+                double travelCost,
+                double dualGain,
+                AbstractScenarioLabel pred
+        ) {
+            this.lastScenario = lastScenario;
+            this.depth = depth;
+            this.load = load;
+            this.travelCost = travelCost;
+            this.dualGain = dualGain;
+            this.pred = pred;
+        }
+    }
+
+    private static final class ScenarioLongSearch extends ScenarioSearch {
+        private final int scenarioCount;
+        private final long fullMask;
+        private final long[] scenarioBit;
+        private final long[] supplierBitByScenario;
+        private final double[] returnToDepot;
+        private final ArrayDeque<ScenarioLongLabel> queue;
+        private final HashMap<Long, ScenarioLongLabel>[] bestByMaskAtLast;
+
+        ScenarioLongSearch(
+                Instance ins,
+                int[] supplierByScenario,
+                double[] demandByScenario,
+                double[] dualByScenario,
+                double dualU0,
+                HashSet<String> existingRouteKeys,
+                int maxColumns
+        ) {
+            super(ins, supplierByScenario, demandByScenario, dualByScenario, dualU0, existingRouteKeys, maxColumns);
+            this.scenarioCount = supplierByScenario.length;
+            this.fullMask = (1L << scenarioCount) - 1L;
+            this.scenarioBit = new long[scenarioCount];
+            this.supplierBitByScenario = new long[scenarioCount];
+            this.returnToDepot = new double[scenarioCount];
+            for (int s = 0; s < scenarioCount; s++) {
+                scenarioBit[s] = 1L << s;
+                supplierBitByScenario[s] = 1L << (supplierByScenario[s] - 1);
+                returnToDepot[s] = ins.c[supplierByScenario[s]][ins.n + 1];
+            }
+            this.queue = new ArrayDeque<ScenarioLongLabel>();
+            @SuppressWarnings("unchecked")
+            HashMap<Long, ScenarioLongLabel>[] arr = (HashMap<Long, ScenarioLongLabel>[]) new HashMap[scenarioCount];
+            for (int s = 0; s < scenarioCount; s++) {
+                arr[s] = new HashMap<Long, ScenarioLongLabel>();
+            }
+            this.bestByMaskAtLast = arr;
+        }
+
+        @Override
+        void run() {
+            for (int s = 0; s < scenarioCount; s++) {
+                if (demandByScenario[s] > ins.Q + 1e-9) {
+                    continue;
+                }
+                long visitedMask = scenarioBit[s];
+                long supplierMask = supplierBitByScenario[s];
+                int supplier = supplierByScenario[s];
+                ScenarioLongLabel start = new ScenarioLongLabel(
+                        s,
+                        1,
+                        demandByScenario[s],
+                        ins.c[0][supplier],
+                        dualByScenario[s],
+                        null,
+                        visitedMask,
+                        supplierMask
+                );
+                if (register(start)) {
+                    queue.addLast(start);
+                }
+            }
+
+            while (!queue.isEmpty()) {
+                ScenarioLongLabel cur = queue.pollFirst();
+                if (!isCurrentBest(cur)) {
+                    continue;
+                }
+                considerCompleteRoute(cur);
+
+                long remaining = fullMask & ~cur.visitedMask;
+                while (remaining != 0L) {
+                    long bit = remaining & -remaining;
+                    int nxt = Long.numberOfTrailingZeros(bit);
+                    remaining ^= bit;
+
+                    long nxtSupplierBit = supplierBitByScenario[nxt];
+                    if ((cur.supplierMask & nxtSupplierBit) != 0L) {
+                        continue;
+                    }
+
+                    double newLoad = cur.load + demandByScenario[nxt];
+                    if (newLoad > ins.Q + 1e-9) {
+                        continue;
+                    }
+
+                    int curSupplier = supplierByScenario[cur.lastScenario];
+                    int nxtSupplier = supplierByScenario[nxt];
+                    ScenarioLongLabel child = new ScenarioLongLabel(
+                            nxt,
+                            cur.depth + 1,
+                            newLoad,
+                            cur.travelCost + ins.c[curSupplier][nxtSupplier],
+                            cur.dualGain + dualByScenario[nxt],
+                            cur,
+                            cur.visitedMask | bit,
+                            cur.supplierMask | nxtSupplierBit
+                    );
+                    if (register(child)) {
+                        queue.addLast(child);
+                    }
+                }
+            }
+        }
+
+        private boolean register(ScenarioLongLabel label) {
+            HashMap<Long, ScenarioLongLabel> map = bestByMaskAtLast[label.lastScenario];
+            ScenarioLongLabel incumbent = map.get(label.visitedMask);
+            if (incumbent != null && incumbent.travelCost <= label.travelCost + DOM_EPS) {
+                return false;
+            }
+            map.put(label.visitedMask, label);
+            return true;
+        }
+
+        private boolean isCurrentBest(ScenarioLongLabel label) {
+            return bestByMaskAtLast[label.lastScenario].get(label.visitedMask) == label;
+        }
+    }
+
+    private static final class ScenarioLongLabel extends AbstractScenarioLabel {
+        final long visitedMask;
+        final long supplierMask;
+
+        ScenarioLongLabel(
+                int lastScenario,
+                int depth,
+                double load,
+                double travelCost,
+                double dualGain,
+                AbstractScenarioLabel pred,
+                long visitedMask,
+                long supplierMask
+        ) {
+            super(lastScenario, depth, load, travelCost, dualGain, pred);
+            this.visitedMask = visitedMask;
+            this.supplierMask = supplierMask;
+        }
+    }
+
+    private static final class ScenarioBitSetSearch extends ScenarioSearch {
+        private final int scenarioCount;
+        private final double[] returnToDepot;
+        private final ArrayDeque<ScenarioBitSetLabel> queue;
+        private final HashMap<ScenarioBitSetStateKey, ScenarioBitSetLabel> bestByState;
+
+        ScenarioBitSetSearch(
+                Instance ins,
+                int[] supplierByScenario,
+                double[] demandByScenario,
+                double[] dualByScenario,
+                double dualU0,
+                HashSet<String> existingRouteKeys,
+                int maxColumns
+        ) {
+            super(ins, supplierByScenario, demandByScenario, dualByScenario, dualU0, existingRouteKeys, maxColumns);
+            this.scenarioCount = supplierByScenario.length;
+            this.returnToDepot = new double[scenarioCount];
+            for (int s = 0; s < scenarioCount; s++) {
+                this.returnToDepot[s] = ins.c[supplierByScenario[s]][ins.n + 1];
+            }
+            this.queue = new ArrayDeque<ScenarioBitSetLabel>();
+            this.bestByState = new HashMap<ScenarioBitSetStateKey, ScenarioBitSetLabel>();
+        }
+
+        @Override
+        void run() {
+            for (int s = 0; s < scenarioCount; s++) {
+                if (demandByScenario[s] > ins.Q + 1e-9) {
+                    continue;
+                }
+                BitSet visitedScenarios = new BitSet(scenarioCount);
+                visitedScenarios.set(s);
+                BitSet visitedSuppliers = new BitSet(ins.n + 1);
+                visitedSuppliers.set(supplierByScenario[s]);
+                int supplier = supplierByScenario[s];
+                ScenarioBitSetLabel start = new ScenarioBitSetLabel(
+                        s,
+                        1,
+                        demandByScenario[s],
+                        ins.c[0][supplier],
+                        dualByScenario[s],
+                        null,
+                        visitedScenarios,
+                        visitedSuppliers
+                );
+                if (register(start)) {
+                    queue.addLast(start);
+                }
+            }
+
+            while (!queue.isEmpty()) {
+                ScenarioBitSetLabel cur = queue.pollFirst();
+                if (!isCurrentBest(cur)) {
+                    continue;
+                }
+                considerCompleteRoute(cur);
+
+                int nxt = cur.visitedScenarios.nextClearBit(0);
+                while (nxt >= 0 && nxt < scenarioCount) {
+                    int nxtSupplier = supplierByScenario[nxt];
+                    if (cur.visitedSuppliers.get(nxtSupplier)) {
+                        nxt = cur.visitedScenarios.nextClearBit(nxt + 1);
+                        continue;
+                    }
+
+                    double newLoad = cur.load + demandByScenario[nxt];
+                    if (newLoad > ins.Q + 1e-9) {
+                        nxt = cur.visitedScenarios.nextClearBit(nxt + 1);
+                        continue;
+                    }
+
+                    BitSet nextVisitedScenarios = (BitSet) cur.visitedScenarios.clone();
+                    nextVisitedScenarios.set(nxt);
+                    BitSet nextVisitedSuppliers = (BitSet) cur.visitedSuppliers.clone();
+                    nextVisitedSuppliers.set(nxtSupplier);
+
+                    int curSupplier = supplierByScenario[cur.lastScenario];
+                    ScenarioBitSetLabel child = new ScenarioBitSetLabel(
+                            nxt,
+                            cur.depth + 1,
+                            newLoad,
+                            cur.travelCost + ins.c[curSupplier][nxtSupplier],
+                            cur.dualGain + dualByScenario[nxt],
+                            cur,
+                            nextVisitedScenarios,
+                            nextVisitedSuppliers
+                    );
+                    if (register(child)) {
+                        queue.addLast(child);
+                    }
+                    nxt = cur.visitedScenarios.nextClearBit(nxt + 1);
+                }
+            }
+        }
+
+        private boolean register(ScenarioBitSetLabel label) {
+            ScenarioBitSetStateKey key = new ScenarioBitSetStateKey(label.lastScenario, label.visitedScenarios);
+            ScenarioBitSetLabel incumbent = bestByState.get(key);
+            if (incumbent != null && incumbent.travelCost <= label.travelCost + DOM_EPS) {
+                return false;
+            }
+            bestByState.put(key, label);
+            return true;
+        }
+
+        private boolean isCurrentBest(ScenarioBitSetLabel label) {
+            ScenarioBitSetStateKey key = new ScenarioBitSetStateKey(label.lastScenario, label.visitedScenarios);
+            return bestByState.get(key) == label;
+        }
+    }
+
+    private static final class ScenarioBitSetLabel extends AbstractScenarioLabel {
+        final BitSet visitedScenarios;
+        final BitSet visitedSuppliers;
+
+        ScenarioBitSetLabel(
+                int lastScenario,
+                int depth,
+                double load,
+                double travelCost,
+                double dualGain,
+                AbstractScenarioLabel pred,
+                BitSet visitedScenarios,
+                BitSet visitedSuppliers
+        ) {
+            super(lastScenario, depth, load, travelCost, dualGain, pred);
+            this.visitedScenarios = visitedScenarios;
+            this.visitedSuppliers = visitedSuppliers;
+        }
+    }
+
+    private static final class ScenarioBitSetStateKey {
+        final int lastScenario;
+        final BitSet visitedScenarios;
+        final int hash;
+
+        ScenarioBitSetStateKey(int lastScenario, BitSet visitedScenarios) {
+            this.lastScenario = lastScenario;
+            this.visitedScenarios = visitedScenarios;
+            this.hash = 31 * lastScenario + visitedScenarios.hashCode();
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof ScenarioBitSetStateKey)) {
+                return false;
+            }
+            ScenarioBitSetStateKey other = (ScenarioBitSetStateKey) o;
+            return this.lastScenario == other.lastScenario
+                    && this.visitedScenarios.equals(other.visitedScenarios);
         }
 
         @Override

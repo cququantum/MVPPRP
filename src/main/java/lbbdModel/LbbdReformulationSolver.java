@@ -28,7 +28,7 @@ public final class LbbdReformulationSolver {
     private static final double INCUMBENT_PRUNE_TOL = 1e-4;
     private static final int MAX_ITERATIONS = 5000;
     private static final int MAX_RMP_PERIODS_PER_ITER = 3;
-    private static final boolean ENABLE_INCUMBENT_PRUNE_NOGOOD = true;
+    private static final boolean ENABLE_INCUMBENT_PRUNE_NOGOOD = false;
     private static final boolean ENABLE_GLOBAL_COMBINATION_OPT_CUT = true;
     private static final boolean ENABLE_ITER_TIMING_LOG = true;
     private static final boolean LOG_TO_CONSOLE = false;
@@ -524,8 +524,15 @@ public final class LbbdReformulationSolver {
 
                         double cutAtPoint = ins.K * rmpCut.dualU0;
                         for (int i = 1; i <= ins.n; i++) {
-                            if (point.prevVisit[i][bestT] >= 0) {
-                                cutAtPoint += rmpCut.dualUiByGlobal[i];
+                            for (int v = ins.pi[i][bestT]; v <= bestT - 1; v++) {
+                                if (!point.lambdaOne[i][v][bestT]) {
+                                    continue;
+                                }
+                                if (rmpCut.dualUiByPrev != null
+                                        && i < rmpCut.dualUiByPrev.length
+                                        && v < rmpCut.dualUiByPrev[i].length) {
+                                    cutAtPoint += rmpCut.dualUiByPrev[i][v];
+                                }
                             }
                         }
                         double cutPointTol = 1e-5 * Math.max(1.0, Math.abs(rmpCut.lpObjective));
