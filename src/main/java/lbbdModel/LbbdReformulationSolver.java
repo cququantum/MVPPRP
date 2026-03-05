@@ -8,6 +8,8 @@ import ilog.cplex.IloCplex;
 import instance.Instance;
 import lbbdModel.rmp.PeriodRouteMasterLpSolver;
 import lbbdModel.rmp.RoutingLowerBoundSolver;
+import lbbdModel.rmp.T1InitialCutSolver;
+import lbbdModel.rmp.T2InitialCutSolver;
 import model.CplexConfig;
 import model.SolveResult;
 
@@ -264,6 +266,37 @@ public final class LbbdReformulationSolver {
                     + " status=" + lbRResult.status
                     + " iters=" + lbRResult.iterations
                     + " cols=" + lbRResult.generatedColumns);
+
+            // === T1 Initial Cuts (speed.tex Section B.2, eq 4-9) ===
+            T1InitialCutSolver t1Solver = new T1InitialCutSolver(ins);
+            int t1CutsAdded = 0;
+            for (int t = 1; t <= ins.l; t++) {
+                T1InitialCutSolver.T1Result t1 = t1Solver.solve(t);
+                if (t1.feasible
+                        && t1.optimal
+                        && t1.pricingProvedOptimal
+                        && t1.artificialClean
+                        && t1.dualU0 <= 1e-7) {
+                    master.addDualInitialCut(t, t1.dualW, t1.dualU0, "T1_InitCut_t" + t);
+                    t1CutsAdded++;
+                }
+            }
+            System.out.println("[LBBD] T1 initial cuts added: " + t1CutsAdded + "/" + ins.l);
+
+            // === T2 Initial Cuts (speed.tex Section B.3, eq 4-12 in per-period form) ===
+            T2InitialCutSolver t2Solver = new T2InitialCutSolver(ins);
+            T2InitialCutSolver.T2Result t2 = t2Solver.solve();
+            int t2CutsAdded = 0;
+            if (t2.feasible && t2.optimal && t2.pricingProvedOptimal && t2.artificialClean
+                    && t2.dualWByPeriod != null && t2.dualU0ByPeriod != null) {
+                for (int t = 1; t <= ins.l; t++) {
+                    if (t2.dualU0ByPeriod[t] <= 1e-7) {
+                        master.addDualInitialCut(t, t2.dualWByPeriod[t], t2.dualU0ByPeriod[t], "T2_InitCut_t" + t);
+                        t2CutsAdded++;
+                    }
+                }
+            }
+            System.out.println("[LBBD] T2 initial cuts added: " + t2CutsAdded + "/" + ins.l);
 
             int iteration = 0;
             int feasibilityCuts = 0;
@@ -1383,6 +1416,75 @@ public final class LbbdReformulationSolver {
                 }
                 cplex.addEq(terminalFlow, 1.0, "TerminalFlow_" + i);
             }
+
+            // === Valid Inequality A.1: Minimum collection start time (eq 4-1/4-2) ===
+            {
+                double initialCap = ins.P00;
+                if (Math.abs(ins.k) <= 1e-12) {
+                    initialCap = Double.POSITIVE_INFINITY;
+                } else {
+                    initialCap += ins.I00 / ins.k;
+                }
+                double cumDemand = 0.0;
+                int tPrime = -1;
+                for (int t = 1; t <= l; t++) {
+                    cumDemand += ins.dt[t];
+                    if (initialCap < cumDemand - 1e-9) {
+                        tPrime = t;
+                        break;
+                    }
+                }
+                if (tPrime > 0) {
+                    IloLinearNumExpr expr = cplex.linearNumExpr();
+                    for (int tau = 1; tau <= tPrime; tau++) {
+                        for (int i = 1; i <= n; i++) {
+                            for (int v = ins.pi[i][tau]; v <= tau - 1; v++) {
+                                if (lambda[i][v][tau] != null) {
+                                    expr.addTerm(1.0, lambda[i][v][tau]);
+                                }
+                            }
+                        }
+                    }
+                    cplex.addGe(expr, 1.0, "VI_MinCollectStart");
+                }
+            }
+
+            // === Valid Inequality A.2: Per-period total capacity (eq 4-3) ===
+            for (int t = 1; t <= l; t++) {
+                IloLinearNumExpr expr = cplex.linearNumExpr();
+                boolean hasTerms = false;
+                for (int i = 1; i <= n; i++) {
+                    for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                        if (lambda[i][v][t] != null) {
+                            expr.addTerm(ins.g(i, v, t), lambda[i][v][t]);
+                            hasTerms = true;
+                        }
+                    }
+                }
+                if (hasTerms) {
+                    cplex.addLe(expr, (double) ins.K * ins.Q, "VI_TotalCap_" + t);
+                }
+            }
+
+            // === Valid Inequality A.3: Large-item constraint (eq 4-4) ===
+            for (int t = 1; t <= l; t++) {
+                IloLinearNumExpr expr = cplex.linearNumExpr();
+                boolean hasTerms = false;
+                for (int i = 1; i <= n; i++) {
+                    for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                        if (lambda[i][v][t] != null) {
+                            double gVal = ins.g(i, v, t);
+                            if (gVal > ins.Q / 2.0 + 1e-9) {
+                                expr.addTerm(1.0, lambda[i][v][t]);
+                                hasTerms = true;
+                            }
+                        }
+                    }
+                }
+                if (hasTerms) {
+                    cplex.addLe(expr, ins.K, "VI_BigItem_" + t);
+                }
+            }
         }
 
         MasterPoint extractPoint(Instance ins) throws IloException {
@@ -1558,6 +1660,29 @@ public final class LbbdReformulationSolver {
             double rhs = phiT - phiT * onesCount;
             optCutCount++;
             return cplex.addGe(expr, rhs, "LBBD_PeriodOptCut_" + optCutCount + "_t" + t);
+        }
+
+        IloRange addDualInitialCut(int t, double[][] dualW, double dualU0, String tag) throws IloException {
+            IloLinearNumExpr expr = cplex.linearNumExpr();
+            expr.addTerm(1.0, omega[t]);
+            double rhs = ins.K * dualU0;
+
+            for (int i = 1; i <= ins.n; i++) {
+                for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                    IloNumVar var = lambda[i][v][t];
+                    if (var == null) {
+                        continue;
+                    }
+                    double w = 0.0;
+                    if (dualW != null && i < dualW.length && v < dualW[i].length) {
+                        w = dualW[i][v];
+                    }
+                    if (Math.abs(w) > 1e-9) {
+                        expr.addTerm(-w, var);
+                    }
+                }
+            }
+            return cplex.addGe(expr, rhs, tag);
         }
 
         IloRange addPeriodRmpDualCut(int t, MasterPoint point, PeriodRouteMasterLpSolver.Result cut) throws IloException {
