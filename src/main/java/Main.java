@@ -25,7 +25,7 @@ public class Main {
             instancePaths = new String[args.length - startArg];
             System.arraycopy(args, startArg, instancePaths, 0, instancePaths.length);
         } else {
-            instancePaths = new String[]{"data/MVPRP/MVPRP2_15_3_2.txt"};
+            instancePaths = new String[]{"data/MVPRP/MVPRP2_10_3_2.txt"};
         }
 
         for (int idx = 0; idx < instancePaths.length; idx++) {
