@@ -267,12 +267,51 @@ public final class LbbdReformulationSolver {
                     + " iters=" + lbRResult.iterations
                     + " cols=" + lbRResult.generatedColumns);
 
-            // === T1 Initial Cuts (speed.tex Section B.2, eq 4-9) ===
-            T1InitialCutSolver t1Solver = new T1InitialCutSolver(ins);
+            // === T1 Initial Cuts (speed.tex Section B.2, eq 4-9), parallel across periods ===
             int t1CutsAdded = 0;
+            T1InitialCutSolver.T1Result[] t1Results = new T1InitialCutSolver.T1Result[ins.l + 1];
+            int t1Threads = Math.min(ins.l, Math.min(Runtime.getRuntime().availableProcessors(), 4));
+            ExecutorService t1Executor = t1Threads > 1 ? Executors.newFixedThreadPool(t1Threads) : null;
+            @SuppressWarnings("unchecked")
+            Future<T1InitialCutSolver.T1Result>[] t1Futures =
+                    (t1Executor != null) ? new Future[ins.l + 1] : null;
+            if (t1Executor != null) {
+                try {
+                    for (int t = 1; t <= ins.l; t++) {
+                        final int period = t;
+                        t1Futures[t] = t1Executor.submit(new Callable<T1InitialCutSolver.T1Result>() {
+                            @Override
+                            public T1InitialCutSolver.T1Result call() {
+                                return new T1InitialCutSolver(ins).solve(period);
+                            }
+                        });
+                    }
+                    for (int t = 1; t <= ins.l; t++) {
+                        try {
+                            t1Results[t] = t1Futures[t].get();
+                        } catch (Exception e) {
+                            System.err.println("[LBBD] T1 parallel solve failed for t=" + t + ": " + e.getMessage());
+                        }
+                    }
+                } finally {
+                    t1Executor.shutdownNow();
+                }
+                T1InitialCutSolver fallbackSolver = new T1InitialCutSolver(ins);
+                for (int t = 1; t <= ins.l; t++) {
+                    if (t1Results[t] == null) {
+                        t1Results[t] = fallbackSolver.solve(t);
+                    }
+                }
+            } else {
+                T1InitialCutSolver t1Solver = new T1InitialCutSolver(ins);
+                for (int t = 1; t <= ins.l; t++) {
+                    t1Results[t] = t1Solver.solve(t);
+                }
+            }
             for (int t = 1; t <= ins.l; t++) {
-                T1InitialCutSolver.T1Result t1 = t1Solver.solve(t);
-                if (t1.feasible
+                T1InitialCutSolver.T1Result t1 = t1Results[t];
+                if (t1 != null
+                        && t1.feasible
                         && t1.optimal
                         && t1.pricingProvedOptimal
                         && t1.artificialClean

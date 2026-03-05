@@ -17,7 +17,6 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
     private static final int EXACT_DP_MAX_N = 15;
 
     private final HashMap<Integer, ExactPeriodModel> exactModels = new HashMap<Integer, ExactPeriodModel>();
-    private final HashMap<Integer, LpPeriodModel> lpModels = new HashMap<Integer, LpPeriodModel>();
     private Instance subsetDpInstance = null;
     private ExactSubsetDpOracle subsetDpOracle = null;
 
@@ -32,34 +31,6 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
             this.optimal = optimal;
             this.status = status;
             this.objective = objective;
-        }
-    }
-
-    public static final class DualCutResult {
-        public final boolean feasible;
-        public final boolean optimal;
-        public final String status;
-        public final double lpObjective;
-        public final double constant;
-        public final double[] coeffZ;
-        public final double[] coeffQ;
-
-        public DualCutResult(
-                boolean feasible,
-                boolean optimal,
-                String status,
-                double lpObjective,
-                double constant,
-                double[] coeffZ,
-                double[] coeffQ
-        ) {
-            this.feasible = feasible;
-            this.optimal = optimal;
-            this.status = status;
-            this.lpObjective = lpObjective;
-            this.constant = constant;
-            this.coeffZ = coeffZ;
-            this.coeffQ = coeffQ;
         }
     }
 
@@ -93,48 +64,12 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
         }
     }
 
-    public DualCutResult solveLpDualCut(Instance ins, int t, double[] qBar, int[] zBar) {
-        validateInput(ins, t, qBar, zBar);
-
-        double totalPickup = totalPickup(ins, qBar);
-        int visitCount = visitCount(ins, zBar);
-        if (visitCount == 0 && totalPickup <= EPS) {
-            return new DualCutResult(
-                    true,
-                    true,
-                    "TrivialZeroLP",
-                    0.0,
-                    0.0,
-                    new double[ins.n + 1],
-                    new double[ins.n + 1]
-            );
-        }
-        if (totalPickup > ins.Q * ins.K + EPS) {
-            return new DualCutResult(false, false, "InfeasibleByTotalCapacity", Double.NaN, Double.NaN, null, null);
-        }
-
-        try {
-            LpPeriodModel model = lpModels.get(t);
-            if (model == null) {
-                model = new LpPeriodModel(ins, t);
-                lpModels.put(t, model);
-            }
-            return model.solve(ins, qBar, zBar, totalPickup);
-        } catch (IloException e) {
-            throw new RuntimeException("Failed to solve LP CVRP dual-cut subproblem at t=" + t, e);
-        }
-    }
-
     @Override
     public void close() {
         for (ExactPeriodModel model : exactModels.values()) {
             model.close();
         }
         exactModels.clear();
-        for (LpPeriodModel model : lpModels.values()) {
-            model.close();
-        }
-        lpModels.clear();
     }
 
     private static void validateInput(Instance ins, int t, double[] qBar, int[] zBar) {
@@ -436,7 +371,7 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
 
             IloLinearNumExpr vehCapExpr = cplex.linearNumExpr();
             vehCapExpr.addTerm(-ins.Q, m);
-            vehCap = cplex.addLe(vehCapExpr, 0.0, "VehicleCap_" + t);
+            vehCap = cplex.addLe(vehCapExpr, 0.0, "TotalPickupBound_" + t);
 
             for (int i = 1; i <= n; i++) {
                 IloLinearNumExpr out = cplex.linearNumExpr();
@@ -536,177 +471,4 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
         }
     }
 
-    private static final class LpPeriodModel {
-        private final Instance ins;
-        private final int t;
-        private final int n;
-        private final int nodeCount;
-        private final IloCplex cplex;
-        private final IloRange vehCap;
-        private final IloRange[] visitLink;
-        private final IloRange[][] mtzRows;
-
-        LpPeriodModel(Instance ins, int t) throws IloException {
-            this.ins = ins;
-            this.t = t;
-            this.n = ins.n;
-            this.nodeCount = ins.nodeCount;
-            this.cplex = new IloCplex();
-            configure(cplex);
-            cplex.setParam(IloCplex.Param.RootAlgorithm, IloCplex.Algorithm.Dual);
-
-            IloNumVar m = cplex.numVar(0.0, ins.K, "m_lp_" + t);
-            IloNumVar[] u = new IloNumVar[nodeCount];
-            IloNumVar[][] x = new IloNumVar[nodeCount][nodeCount];
-            visitLink = new IloRange[n + 1];
-            mtzRows = new IloRange[nodeCount][nodeCount];
-
-            for (int i = 0; i < nodeCount; i++) {
-                u[i] = cplex.numVar(0.0, Double.MAX_VALUE, "u_lp_" + i + "_" + t);
-            }
-            for (int i = 0; i < nodeCount; i++) {
-                for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
-                        continue;
-                    }
-                    x[i][j] = cplex.numVar(0.0, 1.0, "x_lp_" + i + "_" + j + "_" + t);
-                }
-            }
-
-            IloLinearNumExpr obj = cplex.linearNumExpr();
-            for (int i = 0; i < nodeCount; i++) {
-                for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
-                        continue;
-                    }
-                    obj.addTerm(ins.c[i][j], x[i][j]);
-                }
-            }
-            cplex.addMinimize(obj);
-
-            IloLinearNumExpr vehCapExpr = cplex.linearNumExpr();
-            vehCapExpr.addTerm(-ins.Q, m);
-            vehCap = cplex.addLe(vehCapExpr, 0.0, "VehicleCapLP_" + t);
-
-            for (int i = 1; i <= n; i++) {
-                IloLinearNumExpr out = cplex.linearNumExpr();
-                IloLinearNumExpr in = cplex.linearNumExpr();
-                for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
-                        continue;
-                    }
-                    out.addTerm(1.0, x[i][j]);
-                    in.addTerm(1.0, x[j][i]);
-                }
-                cplex.addEq(out, in, "FlowBalanceLP_" + i + "_" + t);
-            }
-
-            IloLinearNumExpr depart = cplex.linearNumExpr();
-            for (int j = 1; j <= n; j++) {
-                depart.addTerm(1.0, x[0][j]);
-            }
-            cplex.addEq(depart, m, "DepartFactoryLP_" + t);
-
-            IloLinearNumExpr back = cplex.linearNumExpr();
-            for (int i = 1; i <= n; i++) {
-                back.addTerm(1.0, x[i][n + 1]);
-            }
-            cplex.addEq(back, m, "ReturnFactoryLP_" + t);
-
-            for (int j = 1; j <= n; j++) {
-                IloLinearNumExpr incoming = cplex.linearNumExpr();
-                for (int i = 0; i < nodeCount; i++) {
-                    if (i == j) {
-                        continue;
-                    }
-                    incoming.addTerm(1.0, x[i][j]);
-                }
-                visitLink[j] = cplex.addEq(incoming, 0.0, "VisitLinkLP_" + j + "_" + t);
-            }
-
-            for (int i = 0; i < nodeCount; i++) {
-                for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
-                        continue;
-                    }
-                    IloLinearNumExpr mtz = cplex.linearNumExpr();
-                    mtz.addTerm(1.0, u[j]);
-                    mtz.addTerm(-1.0, u[i]);
-                    mtz.addTerm(-ins.bigM, x[i][j]);
-                    mtzRows[i][j] = cplex.addGe(mtz, -ins.bigM, "MTZLP_" + i + "_" + j + "_" + t);
-                }
-            }
-
-            for (int i = 0; i < nodeCount; i++) {
-                cplex.addLe(u[i], ins.Q, "LoadCapLP_" + i + "_" + t);
-            }
-            cplex.addEq(u[0], 0.0, "DepotLoadLP_" + t);
-        }
-
-        DualCutResult solve(Instance ins, double[] qBar, int[] zBar, double totalPickup) throws IloException {
-            vehCap.setUB(-totalPickup);
-
-            for (int j = 1; j <= n; j++) {
-                double rhs = zBar[j];
-                visitLink[j].setBounds(rhs, rhs);
-            }
-            updateMtzRhs(qBar);
-
-            boolean solved = cplex.solve();
-            String status = cplex.getStatus().toString();
-            boolean optimal = status.startsWith("Optimal");
-            if (!solved) {
-                return new DualCutResult(false, false, status, Double.NaN, Double.NaN, null, null);
-            }
-
-            double[] coeffZ = new double[n + 1];
-            double[] coeffQ = new double[n + 1];
-
-            double dualVehCap = cplex.getDual(vehCap);
-            for (int i = 1; i <= n; i++) {
-                coeffQ[i] += -dualVehCap;
-            }
-
-            for (int j = 1; j <= n; j++) {
-                coeffZ[j] = cplex.getDual(visitLink[j]);
-            }
-
-            for (int i = 1; i <= n; i++) {
-                for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
-                        continue;
-                    }
-                    coeffQ[i] += cplex.getDual(mtzRows[i][j]);
-                }
-            }
-
-            double lpObj = cplex.getObjValue();
-            double constant = lpObj;
-            for (int i = 1; i <= n; i++) {
-                constant -= coeffZ[i] * zBar[i];
-                constant -= coeffQ[i] * qBar[i];
-            }
-
-            return new DualCutResult(true, optimal, status, lpObj, constant, coeffZ, coeffQ);
-        }
-
-        private void updateMtzRhs(double[] qBar) throws IloException {
-            for (int i = 0; i < nodeCount; i++) {
-                double rhs = -ins.bigM;
-                if (isPickupNode(i, n)) {
-                    rhs += qBar[i];
-                }
-                for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
-                        continue;
-                    }
-                    mtzRows[i][j].setLB(rhs);
-                }
-            }
-        }
-
-        void close() {
-            cplex.end();
-        }
-    }
 }

@@ -12,7 +12,7 @@ public class Main {
     private static final double RESULT_TOL = 1e-4;
 
     public static void main(String[] args) {
-        SolverMode solverMode = SolverMode.LBBD;
+        SolverMode solverMode = SolverMode.ALL;
         int startArg = 0;
         if (args.length > 0 && args[0].startsWith("--solver=")) {
             solverMode = parseSolverMode(args[0].substring("--solver=".length()));
