@@ -276,7 +276,8 @@ public final class LbbdReformulationSolver {
                         && t1.optimal
                         && t1.pricingProvedOptimal
                         && t1.artificialClean
-                        && t1.dualU0 <= 1e-7) {
+                        && t1.dualU0 <= 1e-7
+                        && hasMeaningfulDualCoeffs(t, t1.dualW, t1.dualU0)) {
                     master.addDualInitialCut(t, t1.dualW, t1.dualU0, "T1_InitCut_t" + t);
                     t1CutsAdded++;
                 }
@@ -290,7 +291,8 @@ public final class LbbdReformulationSolver {
             if (t2.feasible && t2.optimal && t2.pricingProvedOptimal && t2.artificialClean
                     && t2.dualWByPeriod != null && t2.dualU0ByPeriod != null) {
                 for (int t = 1; t <= ins.l; t++) {
-                    if (t2.dualU0ByPeriod[t] <= 1e-7) {
+                    if (t2.dualU0ByPeriod[t] <= 1e-7
+                            && hasMeaningfulDualCoeffs(t, t2.dualWByPeriod[t], t2.dualU0ByPeriod[t])) {
                         master.addDualInitialCut(t, t2.dualWByPeriod[t], t2.dualU0ByPeriod[t], "T2_InitCut_t" + t);
                         t2CutsAdded++;
                     }
@@ -797,6 +799,26 @@ public final class LbbdReformulationSolver {
                 }
             }
         }
+    }
+
+    /**
+     * Skip degenerate initial cuts: all-zero coefficients imply omega[t] >= 0.
+     */
+    private boolean hasMeaningfulDualCoeffs(int t, double[][] dualW, double dualU0) {
+        if (Math.abs(dualU0) > 1e-9) {
+            return true;
+        }
+        if (dualW == null) {
+            return false;
+        }
+        for (int i = 1; i <= ins.n; i++) {
+            for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                if (i < dualW.length && dualW[i] != null && v < dualW[i].length && Math.abs(dualW[i][v]) > 1e-9) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private SolveResult tryValidateByHint(

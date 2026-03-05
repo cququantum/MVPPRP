@@ -204,7 +204,10 @@ public final class T2InitialCutSolver {
                 cplex.addEq(terminalFlow, 1.0, "T2_TerminalFlow_" + i);
             }
 
-            final double artificialPenalty = computeArtificialPenalty(ins, ins.n);
+            // T2 is a global LP across all periods. Penalty must dominate
+            // routing and non-routing objective parts to avoid artificial usage.
+            final double singlePeriodPenalty = computeArtificialPenalty(ins, ins.n);
+            final double artificialPenalty = singlePeriodPenalty + estimateNonRoutingObjScale(ins);
             for (int t = 1; t <= l; t++) {
                 ArrayList<Integer> supplierList = new ArrayList<Integer>();
                 ArrayList<Integer> prevList = new ArrayList<Integer>();
@@ -274,9 +277,11 @@ public final class T2InitialCutSolver {
                 boolean solved = cplex.solve();
                 String status = cplex.getStatus().toString();
                 optimal = solved && status.startsWith("Optimal");
-                if (!solved || !optimal) {
+                if (!solved) {
                     return new T2Result(false, false, false, false, Double.NaN, null, null, totalGeneratedColumns);
                 }
+                // Allow "Feasible" in intermediate CG iterations and keep pricing.
+                // Final pricingProvedOptimal will depend on the final LP status.
 
                 boolean foundAnyNewColumn = false;
                 for (int t = 1; t <= l; t++) {
@@ -372,7 +377,7 @@ public final class T2InitialCutSolver {
             return new T2Result(
                     true,
                     optimal,
-                    true,
+                    optimal,
                     artificialClean,
                     cplex.getObjValue(),
                     dualWByPeriod,
@@ -434,6 +439,30 @@ public final class T2InitialCutSolver {
             }
         }
         return 1_000_000.0 + maxArc * (customerCount + 2);
+    }
+
+    /**
+     * Estimate non-routing objective scale in T2 global LP, so artificial penalty
+     * dominates production/setup/inventory parts as well.
+     */
+    private static double estimateNonRoutingObjScale(Instance ins) {
+        double scale = 0.0;
+        for (int t = 1; t <= ins.l; t++) {
+            scale += ins.u * ins.C;
+            scale += ins.f;
+            scale += ins.h0 * ins.L0;
+            scale += ins.hp * ins.Lp;
+        }
+        for (int i = 1; i <= ins.n; i++) {
+            for (int t = 1; t <= ins.l + 1; t++) {
+                for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                    if (ins.g(i, v, t) <= ins.Q + 1e-9) {
+                        scale = Math.max(scale, ins.e(i, v, t));
+                    }
+                }
+            }
+        }
+        return scale;
     }
 
     private static void configureLp(IloCplex cplex) throws IloException {
