@@ -12,7 +12,7 @@ public class Main {
     private static final double RESULT_TOL = 1e-4;
 
     public static void main(String[] args) {
-        SolverMode solverMode = SolverMode.ALL;
+        SolverMode solverMode = SolverMode.LBBD;
         int startArg = 0;
         if (args.length > 0 && args[0].startsWith("--solver=")) {
             solverMode = parseSolverMode(args[0].substring("--solver=".length()));
@@ -25,7 +25,7 @@ public class Main {
             instancePaths = new String[args.length - startArg];
             System.arraycopy(args, startArg, instancePaths, 0, instancePaths.length);
         } else {
-            instancePaths = new String[]{"data/MVPRP/MVPRP1_10_3_2.txt"};
+            instancePaths = new String[]{"data/MVPRP/MVPRP2_10_3_2.txt"};
         }
 
         for (int idx = 0; idx < instancePaths.length; idx++) {
