@@ -351,7 +351,7 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
             }
             for (int i = 0; i < nodeCount; i++) {
                 for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
+                    if (i == j || !isValidArc(i, j, n)) {
                         continue;
                     }
                     x[i][j] = cplex.boolVar("x_" + i + "_" + j + "_" + t);
@@ -361,7 +361,7 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
             IloLinearNumExpr obj = cplex.linearNumExpr();
             for (int i = 0; i < nodeCount; i++) {
                 for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
+                    if (x[i][j] == null) {
                         continue;
                     }
                     obj.addTerm(ins.c[i][j], x[i][j]);
@@ -377,34 +377,38 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
                 IloLinearNumExpr out = cplex.linearNumExpr();
                 IloLinearNumExpr in = cplex.linearNumExpr();
                 for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
-                        continue;
+                    if (x[i][j] != null) {
+                        out.addTerm(1.0, x[i][j]);
                     }
-                    out.addTerm(1.0, x[i][j]);
-                    in.addTerm(1.0, x[j][i]);
+                    if (x[j][i] != null) {
+                        in.addTerm(1.0, x[j][i]);
+                    }
                 }
                 cplex.addEq(out, in, "FlowBalance_" + i + "_" + t);
             }
 
             IloLinearNumExpr depart = cplex.linearNumExpr();
             for (int j = 1; j <= n; j++) {
-                depart.addTerm(1.0, x[0][j]);
+                if (x[0][j] != null) {
+                    depart.addTerm(1.0, x[0][j]);
+                }
             }
             cplex.addEq(depart, m, "DepartFactory_" + t);
 
             IloLinearNumExpr back = cplex.linearNumExpr();
             for (int i = 1; i <= n; i++) {
-                back.addTerm(1.0, x[i][n + 1]);
+                if (x[i][n + 1] != null) {
+                    back.addTerm(1.0, x[i][n + 1]);
+                }
             }
             cplex.addEq(back, m, "ReturnFactory_" + t);
 
             for (int j = 1; j <= n; j++) {
                 IloLinearNumExpr incoming = cplex.linearNumExpr();
                 for (int i = 0; i < nodeCount; i++) {
-                    if (i == j) {
-                        continue;
+                    if (x[i][j] != null) {
+                        incoming.addTerm(1.0, x[i][j]);
                     }
-                    incoming.addTerm(1.0, x[i][j]);
                 }
                 visitLink[j] = cplex.addEq(incoming, 0.0, "VisitLink_" + j + "_" + t);
             }
@@ -412,7 +416,7 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
 
             for (int i = 0; i < nodeCount; i++) {
                 for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
+                    if (x[i][j] == null) {
                         continue;
                     }
                     IloLinearNumExpr mtz = cplex.linearNumExpr();
@@ -458,12 +462,22 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
                     rhs += qBar[i];
                 }
                 for (int j = 0; j < nodeCount; j++) {
-                    if (i == j) {
+                    if (mtzRows[i][j] == null) {
                         continue;
                     }
                     mtzRows[i][j].setLB(rhs);
                 }
             }
+        }
+
+        private static boolean isValidArc(int i, int j, int n) {
+            int returnDepot = n + 1;
+            if (i == j) return false;
+            if (i == returnDepot) return false;
+            if (i == 0 && (j < 1 || j > n)) return false;
+            if (j == 0) return false;
+            if (j == returnDepot && (i < 1 || i > n)) return false;
+            return true;
         }
 
         void close() {

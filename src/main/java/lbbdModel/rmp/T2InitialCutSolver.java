@@ -114,7 +114,7 @@ public final class T2InitialCutSolver {
             for (int i = 1; i <= n; i++) {
                 for (int t = 1; t <= l + 1; t++) {
                     for (int v = ins.pi[i][t]; v <= t - 1; v++) {
-                        if (ins.g(i, v, t) > ins.Q + 1e-9) {
+                        if (t <= l && ins.g(i, v, t) > ins.Q + 1e-9) {
                             continue;
                         }
                         IloNumVar var = cplex.numVar(0.0, 1.0, "t2_lambda_" + i + "_" + v + "_" + t);
