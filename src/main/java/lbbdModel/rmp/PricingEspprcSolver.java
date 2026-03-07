@@ -19,6 +19,7 @@ public final class PricingEspprcSolver {
     private static final double RC_EPS = 1e-8;
     private static final double DOM_EPS = 1e-12;
     private static final int SUPERSET_CLEANUP_MAX_EXTRA_BITS = 7;
+    private static final long BIDIRECTIONAL_RELAXED_TIME_BUDGET_NS = 300_000_000L;
 
     /**
      * Optional branch-node route restrictions for branch-and-price.
@@ -167,12 +168,27 @@ public final class PricingEspprcSolver {
         if (activeGlobalCustomers.length == 0) {
             return new Result(false, 0.0, null, new ArrayList<RouteColumn>());
         }
-        Search search;
         if (activeGlobalCustomers.length <= 62) {
-            search = new LongMaskSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns, constraints);
-        } else {
-            search = new BitSetSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns, constraints);
+            Search bidirectional = new BidirectionalLongSearch(
+                    ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns, constraints
+            );
+            bidirectional.run();
+            ArrayList<RouteColumn> routes = bidirectional.getCollectedRoutes();
+            if (bidirectional.bestRoute != null && bidirectional.bestReducedCost < -RC_EPS) {
+                return new Result(true, bidirectional.bestReducedCost, bidirectional.bestRoute, routes);
+            }
+            // Keep the existing exact single-direction search as a no-negative-column confirmation fallback.
+            Search fallback = new LongMaskSearch(
+                    ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns, constraints
+            );
+            fallback.run();
+            ArrayList<RouteColumn> fallbackRoutes = fallback.getCollectedRoutes();
+            if (fallback.bestRoute != null && fallback.bestReducedCost < -RC_EPS) {
+                return new Result(true, fallback.bestReducedCost, fallback.bestRoute, fallbackRoutes);
+            }
+            return new Result(false, fallback.bestReducedCost, null, fallbackRoutes);
         }
+        Search search = new BitSetSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns, constraints);
         search.run();
         ArrayList<RouteColumn> routes = search.getCollectedRoutes();
         if (search.bestRoute != null && search.bestReducedCost < -RC_EPS) {
@@ -191,13 +207,60 @@ public final class PricingEspprcSolver {
             int maxColumns,
             RoutePricingConstraints constraints
     ) {
+        Result bidirectional = findNegativeRoutesBidirectionalRelaxedOnly(
+                ins,
+                activeGlobalCustomers,
+                qLocal,
+                dualUiLocal,
+                dualU0,
+                existingRouteKeys,
+                maxColumns,
+                constraints
+        );
+        if (bidirectional.foundNegativeColumn) {
+            return bidirectional;
+        }
+        if (activeGlobalCustomers.length == 0) {
+            return bidirectional;
+        }
+        if (activeGlobalCustomers.length > 62) {
+            return bidirectional;
+        }
+        NgRelaxedLongSearch fallback = new NgRelaxedLongSearch(
+                ins,
+                activeGlobalCustomers,
+                qLocal,
+                dualUiLocal,
+                dualU0,
+                existingRouteKeys,
+                maxColumns,
+                constraints
+        );
+        fallback.run();
+        ArrayList<RouteColumn> fallbackRoutes = fallback.getCollectedRoutes();
+        if (fallback.bestRoute != null && fallback.bestReducedCost < -RC_EPS) {
+            return new Result(true, fallback.bestReducedCost, fallback.bestRoute, fallbackRoutes);
+        }
+        return new Result(false, fallback.bestReducedCost, null, fallbackRoutes);
+    }
+
+    private Result findNegativeRoutesBidirectionalRelaxedOnly(
+            Instance ins,
+            int[] activeGlobalCustomers,
+            double[] qLocal,
+            double[] dualUiLocal,
+            double dualU0,
+            HashSet<String> existingRouteKeys,
+            int maxColumns,
+            RoutePricingConstraints constraints
+    ) {
         if (activeGlobalCustomers.length == 0) {
             return new Result(false, 0.0, null, new ArrayList<RouteColumn>());
         }
         if (activeGlobalCustomers.length > 62) {
             return new Result(false, 0.0, null, new ArrayList<RouteColumn>());
         }
-        NgRelaxedLongSearch search = new NgRelaxedLongSearch(
+        BidirectionalNgRelaxedLongSearch search = new BidirectionalNgRelaxedLongSearch(
                 ins,
                 activeGlobalCustomers,
                 qLocal,
@@ -209,7 +272,7 @@ public final class PricingEspprcSolver {
         );
         search.run();
         ArrayList<RouteColumn> routes = search.getCollectedRoutes();
-        if (search.bestRoute != null && search.bestReducedCost < -RC_EPS) {
+        if (!search.aborted && search.bestRoute != null && search.bestReducedCost < -RC_EPS) {
             return new Result(true, search.bestReducedCost, search.bestRoute, routes);
         }
         return new Result(false, search.bestReducedCost, null, routes);
@@ -225,7 +288,7 @@ public final class PricingEspprcSolver {
             int maxColumns,
             RoutePricingConstraints constraints
     ) {
-        Result relaxed = findNegativeRoutesRelaxedOnly(
+        Result relaxed = findNegativeRoutesBidirectionalRelaxedOnly(
                 ins,
                 activeGlobalCustomers,
                 qLocal,
@@ -417,6 +480,11 @@ public final class PricingEspprcSolver {
             int lastGlobalNode = customers[label.lastLocal];
             double fullCost = label.travelCost + ins.c[lastGlobalNode][ins.n + 1];
             double reducedCost = fullCost - label.dualGain - label.arcDualGain - dualU0 - returnArcDual(label.lastLocal);
+            int[] globals = reconstructGlobals(label);
+            considerCandidateRoute(globals, fullCost, label.load, reducedCost);
+        }
+
+        final void considerCandidateRoute(int[] globals, double fullCost, double load, double reducedCost) {
             boolean canImproveBest = reducedCost < bestReducedCost - DOM_EPS;
             boolean canCollect = maxColumns > 0 && reducedCost < -RC_EPS
                     && (collected.size() < maxColumns
@@ -424,12 +492,11 @@ public final class PricingEspprcSolver {
             if (!canImproveBest && !canCollect) {
                 return;
             }
-            int[] globals = reconstructGlobals(label);
-            String key = buildRouteKey(globals);
+            RouteColumn route = new RouteColumn(globals, fullCost, load);
+            String key = route.key();
             if (existingKeys.contains(key)) {
                 return;
             }
-            RouteColumn route = new RouteColumn(globals, fullCost, label.load);
             if (canImproveBest) {
                 bestReducedCost = reducedCost;
                 bestRoute = route;
@@ -447,17 +514,6 @@ public final class PricingEspprcSolver {
                 cur = cur.pred;
             }
             return globals;
-        }
-
-        private String buildRouteKey(int[] globals) {
-            StringBuilder sb = new StringBuilder();
-            for (int idx = 0; idx < globals.length; idx++) {
-                if (idx > 0) {
-                    sb.append('-');
-                }
-                sb.append(globals[idx]);
-            }
-            return sb.toString();
         }
 
         private void maybeCollect(CollectedColumn candidate) {
@@ -645,6 +701,643 @@ public final class PricingEspprcSolver {
             this.arcDualGain = arcDualGain;
             this.partialReducedCost = travelCost - dualGain - arcDualGain;
             this.pred = pred;
+        }
+    }
+
+    private static final class BidirectionalLongSearch extends Search {
+        private final int customerCount;
+        private final long fullMask;
+        private final long[] localBit;
+        private final ArrayList<ForwardLabel>[] forwardUnextended;
+        private final ArrayList<ForwardLabel>[] forwardExtended;
+        private final ArrayList<BackwardLabel>[] backwardUnextended;
+        private final ArrayList<BackwardLabel>[] backwardExtended;
+        private final HashMap<Long, ForwardLabel>[] bestForwardByMaskAtLast;
+        private final HashMap<Long, BackwardLabel>[] bestBackwardByMaskAtFirst;
+        private final double stepSize;
+
+        BidirectionalLongSearch(
+                Instance ins,
+                int[] customers,
+                double[] q,
+                double[] dual,
+                double dualU0,
+                HashSet<String> existingKeys,
+                int maxColumns,
+                RoutePricingConstraints constraints
+        ) {
+            super(ins, customers, q, dual, dualU0, existingKeys, maxColumns, constraints);
+            this.customerCount = customers.length;
+            this.fullMask = (1L << customers.length) - 1L;
+            this.localBit = new long[customers.length];
+            for (int local = 0; local < customers.length; local++) {
+                this.localBit[local] = 1L << local;
+            }
+            @SuppressWarnings("unchecked")
+            ArrayList<ForwardLabel>[] fUn = (ArrayList<ForwardLabel>[]) new ArrayList[customerCount];
+            @SuppressWarnings("unchecked")
+            ArrayList<ForwardLabel>[] fEx = (ArrayList<ForwardLabel>[]) new ArrayList[customerCount];
+            @SuppressWarnings("unchecked")
+            ArrayList<BackwardLabel>[] bUn = (ArrayList<BackwardLabel>[]) new ArrayList[customerCount];
+            @SuppressWarnings("unchecked")
+            ArrayList<BackwardLabel>[] bEx = (ArrayList<BackwardLabel>[]) new ArrayList[customerCount];
+            @SuppressWarnings("unchecked")
+            HashMap<Long, ForwardLabel>[] fBest = (HashMap<Long, ForwardLabel>[]) new HashMap[customerCount];
+            @SuppressWarnings("unchecked")
+            HashMap<Long, BackwardLabel>[] bBest = (HashMap<Long, BackwardLabel>[]) new HashMap[customerCount];
+            for (int local = 0; local < customerCount; local++) {
+                fUn[local] = new ArrayList<ForwardLabel>();
+                fEx[local] = new ArrayList<ForwardLabel>();
+                bUn[local] = new ArrayList<BackwardLabel>();
+                bEx[local] = new ArrayList<BackwardLabel>();
+                fBest[local] = new HashMap<Long, ForwardLabel>();
+                bBest[local] = new HashMap<Long, BackwardLabel>();
+            }
+            this.forwardUnextended = fUn;
+            this.forwardExtended = fEx;
+            this.backwardUnextended = bUn;
+            this.backwardExtended = bEx;
+            this.bestForwardByMaskAtLast = fBest;
+            this.bestBackwardByMaskAtFirst = bBest;
+            this.stepSize = Math.max(1.0, ins.Q / 15.0);
+        }
+
+        @Override
+        void run() {
+            initializeBoundaryLabels();
+            if (customerCount == 0) {
+                return;
+            }
+
+            double forwardLimit = stepSize;
+            double backwardLimit = stepSize;
+            while (true) {
+                extendForwardUpTo(forwardLimit);
+                extendBackwardUpTo(backwardLimit);
+                joinExtendedLabels();
+
+                if (forwardLimit + backwardLimit >= ins.Q - 1e-9) {
+                    extendForwardUpTo(ins.Q + 1.0);
+                    extendBackwardUpTo(ins.Q + 1.0);
+                    joinExtendedLabels();
+                    return;
+                }
+
+                int remainingForward = countRemaining(forwardUnextended);
+                int remainingBackward = countRemaining(backwardUnextended);
+                if (remainingForward == 0 && remainingBackward == 0) {
+                    return;
+                }
+
+                if (remainingForward <= remainingBackward) {
+                    forwardLimit = Math.min(ins.Q, forwardLimit + stepSize);
+                } else {
+                    backwardLimit = Math.min(ins.Q, backwardLimit + stepSize);
+                }
+            }
+        }
+
+        @Override
+        boolean isStartAllowed(int startLocal) {
+            return isStartArcAllowed(startLocal);
+        }
+
+        @Override
+        boolean canExtend(AbstractLabel label, int nextLocal) {
+            if (!isInternalArcAllowed(label.lastLocal, nextLocal)) {
+                return false;
+            }
+            if ((localBit[nextLocal] & ((ForwardLabel) label).visitedMask) != 0L) {
+                return false;
+            }
+            return !violatesForbiddenPairMask(((ForwardLabel) label).visitedMask, nextLocal);
+        }
+
+        @Override
+        boolean isCompleteRouteAllowed(AbstractLabel label) {
+            return isReturnArcAllowed(label.lastLocal)
+                    && isRouteMaskAllowed(((ForwardLabel) label).visitedMask);
+        }
+
+        private void initializeBoundaryLabels() {
+            for (int local = 0; local < customerCount; local++) {
+                if (q[local] > ins.Q + 1e-9) {
+                    continue;
+                }
+                long mask = localBit[local];
+                int global = customers[local];
+
+                if (isStartAllowed(local)) {
+                    ForwardLabel forward = new ForwardLabel(
+                            local,
+                            1,
+                            q[local],
+                            ins.c[0][global],
+                            dual[local],
+                            0.0,
+                            null,
+                            mask
+                    );
+                    if (registerForward(forward)) {
+                        forwardUnextended[local].add(forward);
+                    }
+                }
+
+                if (isReturnArcAllowed(local)) {
+                    BackwardLabel backward = new BackwardLabel(
+                            local,
+                            1,
+                            q[local],
+                            ins.c[global][ins.n + 1],
+                            dual[local],
+                            returnArcDual(local),
+                            null,
+                            mask
+                    );
+                    if (registerBackward(backward)) {
+                        backwardUnextended[local].add(backward);
+                    }
+                }
+            }
+        }
+
+        private void extendForwardUpTo(double loadLimit) {
+            while (true) {
+                ForwardLabel label = pollForward(loadLimit);
+                if (label == null) {
+                    return;
+                }
+                if (!isCurrentForward(label)) {
+                    continue;
+                }
+                forwardExtended[label.lastLocal].add(label);
+                considerCompleteRoute(label);
+                if (!canStillReachUsefulRoute(label)) {
+                    continue;
+                }
+
+                long remaining = fullMask & ~label.visitedMask;
+                while (remaining != 0L) {
+                    long bit = remaining & -remaining;
+                    int next = Long.numberOfTrailingZeros(bit);
+                    remaining ^= bit;
+
+                    if (!canExtend(label, next)) {
+                        continue;
+                    }
+                    double newLoad = label.load + q[next];
+                    if (newLoad > ins.Q + 1e-9) {
+                        continue;
+                    }
+                    int fromGlobal = customers[label.lastLocal];
+                    int toGlobal = customers[next];
+                    ForwardLabel child = new ForwardLabel(
+                            next,
+                            label.depth + 1,
+                            newLoad,
+                            label.travelCost + ins.c[fromGlobal][toGlobal],
+                            label.dualGain + dual[next],
+                            label.arcDualGain + transitionArcDual(label.lastLocal, next),
+                            label,
+                            label.visitedMask | bit
+                    );
+                    if (registerForward(child)) {
+                        forwardUnextended[next].add(child);
+                    }
+                }
+            }
+        }
+
+        private void extendBackwardUpTo(double loadLimit) {
+            while (true) {
+                BackwardLabel label = pollBackward(loadLimit);
+                if (label == null) {
+                    return;
+                }
+                if (!isCurrentBackward(label)) {
+                    continue;
+                }
+                backwardExtended[label.firstLocal].add(label);
+                considerCompleteBackwardRoute(label);
+
+                long remaining = fullMask & ~label.visitedMask;
+                while (remaining != 0L) {
+                    long bit = remaining & -remaining;
+                    int prev = Long.numberOfTrailingZeros(bit);
+                    remaining ^= bit;
+
+                    if (!canPrependBackward(label, prev)) {
+                        continue;
+                    }
+                    double newLoad = label.load + q[prev];
+                    if (newLoad > ins.Q + 1e-9) {
+                        continue;
+                    }
+                    int prevGlobal = customers[prev];
+                    int firstGlobal = customers[label.firstLocal];
+                    BackwardLabel child = new BackwardLabel(
+                            prev,
+                            label.depth + 1,
+                            newLoad,
+                            ins.c[prevGlobal][firstGlobal] + label.travelCost,
+                            label.dualGain + dual[prev],
+                            label.arcDualGain + transitionArcDual(prev, label.firstLocal),
+                            label,
+                            label.visitedMask | bit
+                    );
+                    if (registerBackward(child)) {
+                        backwardUnextended[prev].add(child);
+                    }
+                }
+            }
+        }
+
+        private void joinExtendedLabels() {
+            for (int forwardLast = 0; forwardLast < customerCount; forwardLast++) {
+                ArrayList<ForwardLabel> fLabels = forwardExtended[forwardLast];
+                if (fLabels.isEmpty()) {
+                    continue;
+                }
+                for (int backwardFirst = 0; backwardFirst < customerCount; backwardFirst++) {
+                    if (!isInternalArcAllowed(forwardLast, backwardFirst)) {
+                        continue;
+                    }
+                    ArrayList<BackwardLabel> bLabels = backwardExtended[backwardFirst];
+                    if (bLabels.isEmpty()) {
+                        continue;
+                    }
+                    for (int fi = 0; fi < fLabels.size(); fi++) {
+                        ForwardLabel fLabel = fLabels.get(fi);
+                        for (int bi = 0; bi < bLabels.size(); bi++) {
+                            BackwardLabel bLabel = bLabels.get(bi);
+                            if ((fLabel.visitedMask & bLabel.visitedMask) != 0L) {
+                                continue;
+                            }
+                            double combinedLoad = fLabel.load + bLabel.load;
+                            if (combinedLoad > ins.Q + 1e-9) {
+                                continue;
+                            }
+                            long routeMask = fLabel.visitedMask | bLabel.visitedMask;
+                            if (!isRouteMaskAllowed(routeMask)) {
+                                continue;
+                            }
+                            double fullCost = fLabel.travelCost
+                                    + ins.c[customers[fLabel.lastLocal]][customers[bLabel.firstLocal]]
+                                    + bLabel.travelCost;
+                            double reducedCost = fullCost
+                                    - fLabel.dualGain
+                                    - bLabel.dualGain
+                                    - fLabel.arcDualGain
+                                    - bLabel.arcDualGain
+                                    - transitionArcDual(fLabel.lastLocal, bLabel.firstLocal)
+                                    - dualU0;
+                            int[] globals = combine(reconstructForwardGlobals(fLabel), reconstructBackwardGlobals(bLabel));
+                            considerCandidateRoute(globals, fullCost, combinedLoad, reducedCost);
+                        }
+                    }
+                }
+            }
+        }
+
+        private void considerCompleteBackwardRoute(BackwardLabel label) {
+            if (!isStartArcAllowed(label.firstLocal)) {
+                return;
+            }
+            if (!isRouteMaskAllowed(label.visitedMask)) {
+                return;
+            }
+            double fullCost = ins.c[0][customers[label.firstLocal]] + label.travelCost;
+            double reducedCost = fullCost - label.dualGain - label.arcDualGain - dualU0;
+            considerCandidateRoute(reconstructBackwardGlobals(label), fullCost, label.load, reducedCost);
+        }
+
+        private boolean canPrependBackward(BackwardLabel label, int prevLocal) {
+            if (!isInternalArcAllowed(prevLocal, label.firstLocal)) {
+                return false;
+            }
+            if ((label.visitedMask & localBit[prevLocal]) != 0L) {
+                return false;
+            }
+            return !violatesForbiddenPairMask(label.visitedMask, prevLocal);
+        }
+
+        private boolean isRouteMaskAllowed(long visitedMask) {
+            if (constraints == null) {
+                return true;
+            }
+            if (constraints.forbiddenWithLocalLong != null) {
+                long bits = visitedMask;
+                while (bits != 0L) {
+                    int local = Long.numberOfTrailingZeros(bits);
+                    if ((visitedMask & constraints.forbiddenWithLocalLong[local]) != 0L) {
+                        return false;
+                    }
+                    bits ^= (bits & -bits);
+                }
+            } else if (constraints.forbiddenWithLocalBits != null) {
+                BitSet visited = bitSetFromMask(visitedMask);
+                int bit = visited.nextSetBit(0);
+                while (bit >= 0) {
+                    BitSet forbidden = constraints.forbiddenWithLocalBits[bit];
+                    if (forbidden != null) {
+                        BitSet overlap = (BitSet) visited.clone();
+                        overlap.and(forbidden);
+                        if (!overlap.isEmpty()) {
+                            return false;
+                        }
+                    }
+                    bit = visited.nextSetBit(bit + 1);
+                }
+            }
+
+            if (constraints.requiredWithLocalLong != null) {
+                long bits = visitedMask;
+                while (bits != 0L) {
+                    int local = Long.numberOfTrailingZeros(bits);
+                    if ((visitedMask & constraints.requiredWithLocalLong[local]) != constraints.requiredWithLocalLong[local]) {
+                        return false;
+                    }
+                    bits ^= (bits & -bits);
+                }
+            } else if (constraints.requiredWithLocalBits != null) {
+                BitSet visited = bitSetFromMask(visitedMask);
+                int bit = visited.nextSetBit(0);
+                while (bit >= 0) {
+                    BitSet required = constraints.requiredWithLocalBits[bit];
+                    if (required != null) {
+                        BitSet missing = (BitSet) required.clone();
+                        missing.andNot(visited);
+                        if (!missing.isEmpty()) {
+                            return false;
+                        }
+                    }
+                    bit = visited.nextSetBit(bit + 1);
+                }
+            }
+            return true;
+        }
+
+        private boolean violatesForbiddenPairMask(long visitedMask, int candidateLocal) {
+            if (constraints == null) {
+                return false;
+            }
+            if (constraints.forbiddenWithLocalLong != null) {
+                return (visitedMask & constraints.forbiddenWithLocalLong[candidateLocal]) != 0L;
+            }
+            if (constraints.forbiddenWithLocalBits != null) {
+                BitSet forbidden = constraints.forbiddenWithLocalBits[candidateLocal];
+                if (forbidden == null || forbidden.isEmpty()) {
+                    return false;
+                }
+                BitSet visited = bitSetFromMask(visitedMask);
+                visited.and(forbidden);
+                return !visited.isEmpty();
+            }
+            return false;
+        }
+
+        private BitSet bitSetFromMask(long mask) {
+            BitSet bits = new BitSet(customerCount);
+            long remaining = mask;
+            while (remaining != 0L) {
+                long bit = remaining & -remaining;
+                bits.set(Long.numberOfTrailingZeros(bit));
+                remaining ^= bit;
+            }
+            return bits;
+        }
+
+        private ForwardLabel pollForward(double loadLimit) {
+            for (int local = 0; local < customerCount; local++) {
+                ArrayList<ForwardLabel> labels = forwardUnextended[local];
+                for (int idx = 0; idx < labels.size(); idx++) {
+                    ForwardLabel label = labels.get(idx);
+                    if (label.load <= loadLimit + 1e-9) {
+                        labels.remove(idx);
+                        return label;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private BackwardLabel pollBackward(double loadLimit) {
+            for (int local = 0; local < customerCount; local++) {
+                ArrayList<BackwardLabel> labels = backwardUnextended[local];
+                for (int idx = 0; idx < labels.size(); idx++) {
+                    BackwardLabel label = labels.get(idx);
+                    if (label.load <= loadLimit + 1e-9) {
+                        labels.remove(idx);
+                        return label;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private int countRemaining(ArrayList<?>[] lists) {
+            int total = 0;
+            for (int local = 0; local < lists.length; local++) {
+                total += lists[local].size();
+            }
+            return total;
+        }
+
+        private boolean registerForward(ForwardLabel label) {
+            HashMap<Long, ForwardLabel> exactMap = bestForwardByMaskAtLast[label.lastLocal];
+            ForwardLabel incumbent = exactMap.get(label.visitedMask);
+            if (incumbent != null && incumbent.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
+                return false;
+            }
+            if (isForwardDominatedBySubset(label, exactMap)) {
+                return false;
+            }
+            exactMap.put(label.visitedMask, label);
+            removeDominatedForwardSupersets(label, exactMap);
+            return true;
+        }
+
+        private boolean registerBackward(BackwardLabel label) {
+            HashMap<Long, BackwardLabel> exactMap = bestBackwardByMaskAtFirst[label.firstLocal];
+            BackwardLabel incumbent = exactMap.get(label.visitedMask);
+            if (incumbent != null && incumbent.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
+                return false;
+            }
+            if (isBackwardDominatedBySubset(label, exactMap)) {
+                return false;
+            }
+            exactMap.put(label.visitedMask, label);
+            removeDominatedBackwardSupersets(label, exactMap);
+            return true;
+        }
+
+        private boolean isCurrentForward(ForwardLabel label) {
+            return bestForwardByMaskAtLast[label.lastLocal].get(label.visitedMask) == label;
+        }
+
+        private boolean isCurrentBackward(BackwardLabel label) {
+            return bestBackwardByMaskAtFirst[label.firstLocal].get(label.visitedMask) == label;
+        }
+
+        private boolean isForwardDominatedBySubset(ForwardLabel label, HashMap<Long, ForwardLabel> exactMap) {
+            if (label.depth <= 1) {
+                return false;
+            }
+            long lastBit = localBit[label.lastLocal];
+            long free = label.visitedMask ^ lastBit;
+            long subFree = free;
+            while (subFree != 0L) {
+                long subsetMask = subFree | lastBit;
+                ForwardLabel subset = exactMap.get(subsetMask);
+                if (subset != null && subset.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
+                    return true;
+                }
+                subFree = (subFree - 1L) & free;
+            }
+            return false;
+        }
+
+        private boolean isBackwardDominatedBySubset(BackwardLabel label, HashMap<Long, BackwardLabel> exactMap) {
+            if (label.depth <= 1) {
+                return false;
+            }
+            long firstBit = localBit[label.firstLocal];
+            long free = label.visitedMask ^ firstBit;
+            long subFree = free;
+            while (subFree != 0L) {
+                long subsetMask = subFree | firstBit;
+                BackwardLabel subset = exactMap.get(subsetMask);
+                if (subset != null && subset.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
+                    return true;
+                }
+                subFree = (subFree - 1L) & free;
+            }
+            return false;
+        }
+
+        private void removeDominatedForwardSupersets(ForwardLabel label, HashMap<Long, ForwardLabel> exactMap) {
+            removeDominatedSupersets(label.visitedMask, label.lastLocal, label.partialReducedCost, exactMap);
+        }
+
+        private void removeDominatedBackwardSupersets(BackwardLabel label, HashMap<Long, BackwardLabel> exactMap) {
+            removeDominatedSupersets(label.visitedMask, label.firstLocal, label.partialReducedCost, exactMap);
+        }
+
+        private <T extends PartialRcState> void removeDominatedSupersets(
+                long mask,
+                int fixedLocal,
+                double partialReducedCost,
+                HashMap<Long, T> exactMap
+        ) {
+            long fixedBit = localBit[fixedLocal];
+            long baseMask = mask | fixedBit;
+            long extraPool = fullMask & ~baseMask;
+            int extraCount = Long.bitCount(extraPool);
+            if (extraCount == 0 || extraCount > SUPERSET_CLEANUP_MAX_EXTRA_BITS) {
+                return;
+            }
+            long add = extraPool;
+            while (add != 0L) {
+                T other = exactMap.get(baseMask | add);
+                if (other != null && partialReducedCost <= other.partialReducedCost() + DOM_EPS) {
+                    exactMap.remove(baseMask | add);
+                }
+                add = (add - 1L) & extraPool;
+            }
+        }
+
+        private int[] reconstructForwardGlobals(ForwardLabel label) {
+            int[] globals = new int[label.depth];
+            ForwardLabel cur = label;
+            for (int pos = label.depth - 1; pos >= 0; pos--) {
+                globals[pos] = customers[cur.lastLocal];
+                cur = cur.pred;
+            }
+            return globals;
+        }
+
+        private int[] reconstructBackwardGlobals(BackwardLabel label) {
+            int[] globals = new int[label.depth];
+            BackwardLabel cur = label;
+            for (int pos = 0; pos < label.depth; pos++) {
+                globals[pos] = customers[cur.firstLocal];
+                cur = cur.pred;
+            }
+            return globals;
+        }
+
+        private int[] combine(int[] left, int[] right) {
+            int[] out = new int[left.length + right.length];
+            System.arraycopy(left, 0, out, 0, left.length);
+            System.arraycopy(right, 0, out, left.length, right.length);
+            return out;
+        }
+    }
+
+    private interface PartialRcState {
+        double partialReducedCost();
+    }
+
+    private static final class ForwardLabel extends AbstractLabel implements PartialRcState {
+        final long visitedMask;
+        final ForwardLabel pred;
+
+        ForwardLabel(
+                int lastLocal,
+                int depth,
+                double load,
+                double travelCost,
+                double dualGain,
+                double arcDualGain,
+                ForwardLabel pred,
+                long visitedMask
+        ) {
+            super(lastLocal, depth, load, travelCost, dualGain, arcDualGain, pred);
+            this.pred = pred;
+            this.visitedMask = visitedMask;
+        }
+
+        @Override
+        public double partialReducedCost() {
+            return partialReducedCost;
+        }
+    }
+
+    private static final class BackwardLabel implements PartialRcState {
+        final int firstLocal;
+        final int depth;
+        final double load;
+        final double travelCost; // first -> ... -> return depot
+        final double dualGain;
+        final double arcDualGain;
+        final double partialReducedCost;
+        final BackwardLabel pred; // next customer toward the return depot
+        final long visitedMask;
+
+        BackwardLabel(
+                int firstLocal,
+                int depth,
+                double load,
+                double travelCost,
+                double dualGain,
+                double arcDualGain,
+                BackwardLabel pred,
+                long visitedMask
+        ) {
+            this.firstLocal = firstLocal;
+            this.depth = depth;
+            this.load = load;
+            this.travelCost = travelCost;
+            this.dualGain = dualGain;
+            this.arcDualGain = arcDualGain;
+            this.partialReducedCost = travelCost - dualGain - arcDualGain;
+            this.pred = pred;
+            this.visitedMask = visitedMask;
+        }
+
+        @Override
+        public double partialReducedCost() {
+            return partialReducedCost;
         }
     }
 
@@ -1547,6 +2240,818 @@ public final class PricingEspprcSolver {
             }
             collected.add(pos, candidate);
             collectedKeys.add(candidate.key);
+        }
+    }
+
+    private static final class BidirectionalNgRelaxedLongSearch {
+        private static final int DEFAULT_NG_SIZE = 5;
+
+        final Instance ins;
+        final int[] customers;
+        final double[] q;
+        final double[] dual;
+        final double dualU0;
+        final HashSet<String> existingKeys;
+        final int maxColumns;
+        final RoutePricingConstraints constraints;
+        final long[] localBit;
+        final ArrayList<CollectedColumn> collected;
+        final HashSet<String> collectedKeys;
+        final long[] ngMaskByLocal;
+        final int maxDepth;
+        final double stepSize;
+        boolean aborted = false;
+
+        double bestReducedCost = Double.POSITIVE_INFINITY;
+        RouteColumn bestRoute = null;
+
+        private double bestAnyReducedCost = Double.POSITIVE_INFINITY;
+        private int[] bestAnyLocals = null;
+
+        BidirectionalNgRelaxedLongSearch(
+                Instance ins,
+                int[] customers,
+                double[] q,
+                double[] dual,
+                double dualU0,
+                HashSet<String> existingKeys,
+                int maxColumns,
+                RoutePricingConstraints constraints
+        ) {
+            this.ins = ins;
+            this.customers = customers;
+            this.q = q;
+            this.dual = dual;
+            this.dualU0 = dualU0;
+            this.existingKeys = existingKeys;
+            this.maxColumns = Math.max(0, maxColumns);
+            this.constraints = constraints;
+            this.localBit = new long[customers.length];
+            for (int local = 0; local < customers.length; local++) {
+                this.localBit[local] = 1L << local;
+            }
+            this.collected = new ArrayList<CollectedColumn>();
+            this.collectedKeys = new HashSet<String>();
+            this.ngMaskByLocal = buildInitialNgMasks();
+            this.maxDepth = Math.max(customers.length + 2, Math.min(customers.length * 2, customers.length + 10));
+            this.stepSize = Math.max(1.0, ins.Q / 4.0);
+        }
+
+        ArrayList<RouteColumn> getCollectedRoutes() {
+            ArrayList<RouteColumn> out = new ArrayList<RouteColumn>(collected.size());
+            for (int idx = 0; idx < collected.size(); idx++) {
+                out.add(collected.get(idx).route);
+            }
+            return out;
+        }
+
+        void run() {
+            long startNs = System.nanoTime();
+            int rounds = Math.max(1, Math.min(customers.length, 3));
+            for (int round = 0; round < rounds; round++) {
+                bestAnyReducedCost = Double.POSITIVE_INFINITY;
+                bestAnyLocals = null;
+                searchOnce(startNs);
+                if (aborted || !collected.isEmpty()) {
+                    return;
+                }
+                if (bestAnyLocals == null || bestAnyReducedCost >= -RC_EPS) {
+                    return;
+                }
+                if (!updateNgSetsFromCycles(bestAnyLocals)) {
+                    return;
+                }
+            }
+        }
+
+        private void searchOnce(long startNs) {
+            @SuppressWarnings("unchecked")
+            ArrayList<RelaxForwardLabel>[] forwardUnextended = (ArrayList<RelaxForwardLabel>[]) new ArrayList[customers.length];
+            @SuppressWarnings("unchecked")
+            ArrayList<RelaxForwardLabel>[] forwardExtended = (ArrayList<RelaxForwardLabel>[]) new ArrayList[customers.length];
+            @SuppressWarnings("unchecked")
+            ArrayList<RelaxBackwardLabel>[] backwardUnextended = (ArrayList<RelaxBackwardLabel>[]) new ArrayList[customers.length];
+            @SuppressWarnings("unchecked")
+            ArrayList<RelaxBackwardLabel>[] backwardExtended = (ArrayList<RelaxBackwardLabel>[]) new ArrayList[customers.length];
+            for (int local = 0; local < customers.length; local++) {
+                forwardUnextended[local] = new ArrayList<RelaxForwardLabel>();
+                forwardExtended[local] = new ArrayList<RelaxForwardLabel>();
+                backwardUnextended[local] = new ArrayList<RelaxBackwardLabel>();
+                backwardExtended[local] = new ArrayList<RelaxBackwardLabel>();
+            }
+
+            initializeBoundaryRelaxedLabels(forwardUnextended, backwardUnextended);
+
+            double forwardLimit = stepSize;
+            double backwardLimit = stepSize;
+            while (true) {
+                if (isOverBudget(startNs)) {
+                    aborted = true;
+                    return;
+                }
+                extendForward(forwardUnextended, forwardExtended, forwardLimit, startNs);
+                if (aborted) {
+                    return;
+                }
+                extendBackward(backwardUnextended, backwardExtended, backwardLimit, startNs);
+                if (aborted) {
+                    return;
+                }
+                joinRelaxedLabels(forwardExtended, backwardExtended, startNs);
+                if (!collected.isEmpty()) {
+                    return;
+                }
+                if (forwardLimit + backwardLimit >= ins.Q - 1e-9) {
+                    extendForward(forwardUnextended, forwardExtended, ins.Q + 1.0, startNs);
+                    if (aborted) {
+                        return;
+                    }
+                    extendBackward(backwardUnextended, backwardExtended, ins.Q + 1.0, startNs);
+                    if (aborted) {
+                        return;
+                    }
+                    joinRelaxedLabels(forwardExtended, backwardExtended, startNs);
+                    return;
+                }
+                int remainingForward = countRemaining(forwardUnextended);
+                int remainingBackward = countRemaining(backwardUnextended);
+                if (remainingForward == 0 && remainingBackward == 0) {
+                    return;
+                }
+                if (remainingForward <= remainingBackward) {
+                    forwardLimit = Math.min(ins.Q, forwardLimit + stepSize);
+                } else {
+                    backwardLimit = Math.min(ins.Q, backwardLimit + stepSize);
+                }
+            }
+        }
+
+        private void initializeBoundaryRelaxedLabels(
+                ArrayList<RelaxForwardLabel>[] forwardUnextended,
+                ArrayList<RelaxBackwardLabel>[] backwardUnextended
+        ) {
+            for (int local = 0; local < customers.length; local++) {
+                if (q[local] > ins.Q + 1e-9) {
+                    continue;
+                }
+                long bit = localBit[local];
+                double load = q[local];
+                long memory = capacityForbiddenMask(load) | bit;
+                int global = customers[local];
+
+                if (constraints == null || constraints.forbiddenStartLocal == null || !constraints.forbiddenStartLocal[local]) {
+                    forwardUnextended[local].add(new RelaxForwardLabel(
+                            local,
+                            1,
+                            load,
+                            ins.c[0][global],
+                            dual[local],
+                            0.0,
+                            memory,
+                            bit,
+                            0L,
+                            null
+                    ));
+                }
+
+                if (constraints == null || constraints.forbiddenReturnLocal == null || !constraints.forbiddenReturnLocal[local]) {
+                    backwardUnextended[local].add(new RelaxBackwardLabel(
+                            local,
+                            1,
+                            load,
+                            ins.c[global][ins.n + 1],
+                            dual[local],
+                            returnArcDual(local),
+                            memory,
+                            bit,
+                            0L,
+                            null
+                    ));
+                }
+            }
+        }
+
+        private void extendForward(
+                ArrayList<RelaxForwardLabel>[] forwardUnextended,
+                ArrayList<RelaxForwardLabel>[] forwardExtended,
+                double loadLimit,
+                long startNs
+        ) {
+            while (true) {
+                if (isOverBudget(startNs)) {
+                    aborted = true;
+                    return;
+                }
+                RelaxForwardLabel label = pollForward(forwardUnextended, loadLimit);
+                if (label == null) {
+                    return;
+                }
+                forwardExtended[label.lastLocal].add(label);
+                considerForwardCompleteRoute(label);
+                if (label.depth >= maxDepth) {
+                    continue;
+                }
+                for (int next = 0; next < customers.length; next++) {
+                    if (!canExtendForwardRelaxed(label, next)) {
+                        continue;
+                    }
+                    double newLoad = label.load + q[next];
+                    if (newLoad > ins.Q + 1e-9) {
+                        continue;
+                    }
+                    int fromGlobal = customers[label.lastLocal];
+                    int toGlobal = customers[next];
+                    long nextBit = localBit[next];
+                    long nextAllVisited = label.allVisitedMask | nextBit;
+                    long nextRepeated = label.repeatedMask | (label.allVisitedMask & nextBit);
+                    long nextMemory = (label.memoryMask & ngMaskByLocal[next]) | nextBit | capacityForbiddenMask(newLoad);
+                    RelaxForwardLabel child = new RelaxForwardLabel(
+                            next,
+                            label.depth + 1,
+                            newLoad,
+                            label.travelCost + ins.c[fromGlobal][toGlobal],
+                            label.dualGain + dual[next],
+                            label.arcDualGain + transitionArcDual(label.lastLocal, next),
+                            nextMemory,
+                            nextAllVisited,
+                            nextRepeated,
+                            label
+                    );
+                    if (registerRelaxed(forwardUnextended[next], child)) {
+                        forwardUnextended[next].add(child);
+                    }
+                }
+            }
+        }
+
+        private void extendBackward(
+                ArrayList<RelaxBackwardLabel>[] backwardUnextended,
+                ArrayList<RelaxBackwardLabel>[] backwardExtended,
+                double loadLimit,
+                long startNs
+        ) {
+            while (true) {
+                if (isOverBudget(startNs)) {
+                    aborted = true;
+                    return;
+                }
+                RelaxBackwardLabel label = pollBackward(backwardUnextended, loadLimit);
+                if (label == null) {
+                    return;
+                }
+                backwardExtended[label.firstLocal].add(label);
+                considerBackwardCompleteRoute(label);
+                if (label.depth >= maxDepth) {
+                    continue;
+                }
+                for (int prev = 0; prev < customers.length; prev++) {
+                    if (!canPrependBackwardRelaxed(label, prev)) {
+                        continue;
+                    }
+                    double newLoad = label.load + q[prev];
+                    if (newLoad > ins.Q + 1e-9) {
+                        continue;
+                    }
+                    int prevGlobal = customers[prev];
+                    int firstGlobal = customers[label.firstLocal];
+                    long prevBit = localBit[prev];
+                    long nextAllVisited = label.allVisitedMask | prevBit;
+                    long nextRepeated = label.repeatedMask | (label.allVisitedMask & prevBit);
+                    long nextMemory = (label.memoryMask & ngMaskByLocal[prev]) | prevBit | capacityForbiddenMask(newLoad);
+                    RelaxBackwardLabel child = new RelaxBackwardLabel(
+                            prev,
+                            label.depth + 1,
+                            newLoad,
+                            ins.c[prevGlobal][firstGlobal] + label.travelCost,
+                            label.dualGain + dual[prev],
+                            label.arcDualGain + transitionArcDual(prev, label.firstLocal),
+                            nextMemory,
+                            nextAllVisited,
+                            nextRepeated,
+                            label
+                    );
+                    if (registerRelaxed(backwardUnextended[prev], child)) {
+                        backwardUnextended[prev].add(child);
+                    }
+                }
+            }
+        }
+
+        private void joinRelaxedLabels(
+                ArrayList<RelaxForwardLabel>[] forwardExtended,
+                ArrayList<RelaxBackwardLabel>[] backwardExtended,
+                long startNs
+        ) {
+            for (int forwardLast = 0; forwardLast < customers.length; forwardLast++) {
+                if (isOverBudget(startNs)) {
+                    aborted = true;
+                    return;
+                }
+                ArrayList<RelaxForwardLabel> fLabels = forwardExtended[forwardLast];
+                if (fLabels.isEmpty()) {
+                    continue;
+                }
+                for (int backwardFirst = 0; backwardFirst < customers.length; backwardFirst++) {
+                    if (isOverBudget(startNs)) {
+                        aborted = true;
+                        return;
+                    }
+                    if (constraints != null && constraints.forbiddenArcLocal != null
+                            && constraints.forbiddenArcLocal[forwardLast][backwardFirst]) {
+                        continue;
+                    }
+                    ArrayList<RelaxBackwardLabel> bLabels = backwardExtended[backwardFirst];
+                    if (bLabels.isEmpty()) {
+                        continue;
+                    }
+                    for (int fi = 0; fi < fLabels.size(); fi++) {
+                        RelaxForwardLabel fLabel = fLabels.get(fi);
+                        for (int bi = 0; bi < bLabels.size(); bi++) {
+                            RelaxBackwardLabel bLabel = bLabels.get(bi);
+                            if ((fLabel.memoryMask & bLabel.allVisitedMask) != 0L
+                                    || (bLabel.memoryMask & fLabel.allVisitedMask) != 0L) {
+                                continue;
+                            }
+                            double load = fLabel.load + bLabel.load;
+                            if (load > ins.Q + 1e-9) {
+                                continue;
+                            }
+                            long allVisited = fLabel.allVisitedMask | bLabel.allVisitedMask;
+                            if (!isRequiredSetSatisfied(allVisited) || violatesRouteLevelPairs(allVisited)) {
+                                continue;
+                            }
+                            long repeated = fLabel.repeatedMask | bLabel.repeatedMask | (fLabel.allVisitedMask & bLabel.allVisitedMask);
+                            double fullCost = fLabel.travelCost
+                                    + ins.c[customers[fLabel.lastLocal]][customers[bLabel.firstLocal]]
+                                    + bLabel.travelCost;
+                            double reducedCost = fullCost
+                                    - fLabel.dualGain
+                                    - bLabel.dualGain
+                                    - fLabel.arcDualGain
+                                    - bLabel.arcDualGain
+                                    - transitionArcDual(fLabel.lastLocal, bLabel.firstLocal)
+                                    - dualU0;
+                            int[] locals = combineLocals(reconstructForwardLocals(fLabel), reconstructBackwardLocals(bLabel));
+                            considerAnyCandidate(reducedCost, locals);
+                            if (repeated != 0L || reducedCost >= -RC_EPS) {
+                                continue;
+                            }
+                            considerElementaryCandidate(locals, fullCost, load, reducedCost);
+                            if (collected.size() >= maxColumns && maxColumns > 0) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private boolean isOverBudget(long startNs) {
+            return System.nanoTime() - startNs > BIDIRECTIONAL_RELAXED_TIME_BUDGET_NS;
+        }
+
+        private void considerForwardCompleteRoute(RelaxForwardLabel label) {
+            if (constraints != null && constraints.forbiddenReturnLocal != null
+                    && constraints.forbiddenReturnLocal[label.lastLocal]) {
+                return;
+            }
+            if (!isRequiredSetSatisfied(label.allVisitedMask) || violatesRouteLevelPairs(label.allVisitedMask)) {
+                return;
+            }
+            double fullCost = label.travelCost + ins.c[customers[label.lastLocal]][ins.n + 1];
+            double reducedCost = fullCost - label.dualGain - label.arcDualGain - dualU0 - returnArcDual(label.lastLocal);
+            int[] locals = reconstructForwardLocals(label);
+            considerAnyCandidate(reducedCost, locals);
+            if (label.repeatedMask != 0L || reducedCost >= -RC_EPS) {
+                return;
+            }
+            considerElementaryCandidate(locals, fullCost, label.load, reducedCost);
+        }
+
+        private void considerBackwardCompleteRoute(RelaxBackwardLabel label) {
+            if (constraints != null && constraints.forbiddenStartLocal != null
+                    && constraints.forbiddenStartLocal[label.firstLocal]) {
+                return;
+            }
+            if (!isRequiredSetSatisfied(label.allVisitedMask) || violatesRouteLevelPairs(label.allVisitedMask)) {
+                return;
+            }
+            double fullCost = ins.c[0][customers[label.firstLocal]] + label.travelCost;
+            double reducedCost = fullCost - label.dualGain - label.arcDualGain - dualU0;
+            int[] locals = reconstructBackwardLocals(label);
+            considerAnyCandidate(reducedCost, locals);
+            if (label.repeatedMask != 0L || reducedCost >= -RC_EPS) {
+                return;
+            }
+            considerElementaryCandidate(locals, fullCost, label.load, reducedCost);
+        }
+
+        private void considerAnyCandidate(double reducedCost, int[] locals) {
+            if (reducedCost < bestAnyReducedCost - DOM_EPS) {
+                bestAnyReducedCost = reducedCost;
+                bestAnyLocals = locals;
+            }
+        }
+
+        private void considerElementaryCandidate(int[] locals, double fullCost, double load, double reducedCost) {
+            int[] globals = new int[locals.length];
+            for (int idx = 0; idx < locals.length; idx++) {
+                globals[idx] = customers[locals[idx]];
+            }
+            RouteColumn route = new RouteColumn(globals, fullCost, load);
+            String key = route.key();
+            if (existingKeys.contains(key) || collectedKeys.contains(key)) {
+                return;
+            }
+            if (reducedCost < bestReducedCost - DOM_EPS) {
+                bestReducedCost = reducedCost;
+                bestRoute = route;
+            }
+            maybeCollect(new CollectedColumn(reducedCost, route, key));
+        }
+
+        private boolean canExtendForwardRelaxed(RelaxForwardLabel label, int nextLocal) {
+            if (nextLocal == label.lastLocal) {
+                return false;
+            }
+            if ((label.memoryMask & localBit[nextLocal]) != 0L) {
+                return false;
+            }
+            if (constraints != null && constraints.forbiddenArcLocal != null
+                    && constraints.forbiddenArcLocal[label.lastLocal][nextLocal]) {
+                return false;
+            }
+            if (constraints != null && constraints.forbiddenWithLocalLong != null
+                    && (label.allVisitedMask & constraints.forbiddenWithLocalLong[nextLocal]) != 0L) {
+                return false;
+            }
+            return true;
+        }
+
+        private boolean canPrependBackwardRelaxed(RelaxBackwardLabel label, int prevLocal) {
+            if (prevLocal == label.firstLocal) {
+                return false;
+            }
+            if ((label.memoryMask & localBit[prevLocal]) != 0L) {
+                return false;
+            }
+            if (constraints != null && constraints.forbiddenArcLocal != null
+                    && constraints.forbiddenArcLocal[prevLocal][label.firstLocal]) {
+                return false;
+            }
+            if (constraints != null && constraints.forbiddenWithLocalLong != null
+                    && (label.allVisitedMask & constraints.forbiddenWithLocalLong[prevLocal]) != 0L) {
+                return false;
+            }
+            return true;
+        }
+
+        private boolean isRequiredSetSatisfied(long visitedMask) {
+            if (constraints == null || constraints.requiredWithLocalLong == null) {
+                return true;
+            }
+            long bits = visitedMask;
+            while (bits != 0L) {
+                int local = Long.numberOfTrailingZeros(bits);
+                if ((visitedMask & constraints.requiredWithLocalLong[local]) != constraints.requiredWithLocalLong[local]) {
+                    return false;
+                }
+                bits ^= (bits & -bits);
+            }
+            return true;
+        }
+
+        private boolean violatesRouteLevelPairs(long visitedMask) {
+            if (constraints == null) {
+                return false;
+            }
+            if (constraints.forbiddenWithLocalLong != null) {
+                long bits = visitedMask;
+                while (bits != 0L) {
+                    int local = Long.numberOfTrailingZeros(bits);
+                    if ((visitedMask & constraints.forbiddenWithLocalLong[local]) != 0L) {
+                        return true;
+                    }
+                    bits ^= (bits & -bits);
+                }
+            }
+            return false;
+        }
+
+        private boolean registerRelaxed(ArrayList<? extends RelaxLabelState> labelsBase, RelaxLabelState candidate) {
+            @SuppressWarnings("unchecked")
+            ArrayList<RelaxLabelState> labels = (ArrayList<RelaxLabelState>) labelsBase;
+            for (int idx = 0; idx < labels.size(); idx++) {
+                RelaxLabelState incumbent = labels.get(idx);
+                if (dominates(incumbent, candidate)) {
+                    return false;
+                }
+            }
+            for (int idx = 0; idx < labels.size(); idx++) {
+                if (dominates(candidate, labels.get(idx))) {
+                    labels.remove(idx);
+                    idx--;
+                }
+            }
+            return true;
+        }
+
+        private boolean dominates(RelaxLabelState a, RelaxLabelState b) {
+            if (a.load() > b.load() + 1e-9) {
+                return false;
+            }
+            if (a.partialReducedCost() > b.partialReducedCost() + DOM_EPS) {
+                return false;
+            }
+            if ((a.memoryMask() & b.memoryMask()) != a.memoryMask()) {
+                return false;
+            }
+            return (a.repeatedMask() & ~b.repeatedMask()) == 0L;
+        }
+
+        private RelaxForwardLabel pollForward(ArrayList<RelaxForwardLabel>[] labels, double loadLimit) {
+            for (int local = 0; local < labels.length; local++) {
+                ArrayList<RelaxForwardLabel> list = labels[local];
+                for (int idx = 0; idx < list.size(); idx++) {
+                    RelaxForwardLabel label = list.get(idx);
+                    if (label.load <= loadLimit + 1e-9) {
+                        list.remove(idx);
+                        return label;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private RelaxBackwardLabel pollBackward(ArrayList<RelaxBackwardLabel>[] labels, double loadLimit) {
+            for (int local = 0; local < labels.length; local++) {
+                ArrayList<RelaxBackwardLabel> list = labels[local];
+                for (int idx = 0; idx < list.size(); idx++) {
+                    RelaxBackwardLabel label = list.get(idx);
+                    if (label.load <= loadLimit + 1e-9) {
+                        list.remove(idx);
+                        return label;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private int countRemaining(ArrayList<?>[] labels) {
+            int total = 0;
+            for (int local = 0; local < labels.length; local++) {
+                total += labels[local].size();
+            }
+            return total;
+        }
+
+        private long[] buildInitialNgMasks() {
+            int m = customers.length;
+            int ngSize = Math.max(1, Math.min(DEFAULT_NG_SIZE, m));
+            long[] masks = new long[m];
+            for (int i = 0; i < m; i++) {
+                masks[i] = localBit[i];
+                boolean[] selected = new boolean[m];
+                selected[i] = true;
+                for (int count = 1; count < ngSize; count++) {
+                    double best = Double.POSITIVE_INFINITY;
+                    int bestIdx = -1;
+                    int gi = customers[i];
+                    for (int j = 0; j < m; j++) {
+                        if (selected[j]) {
+                            continue;
+                        }
+                        int gj = customers[j];
+                        double dist = ins.c[gi][gj];
+                        if (dist < best - 1e-12) {
+                            best = dist;
+                            bestIdx = j;
+                        }
+                    }
+                    if (bestIdx < 0) {
+                        break;
+                    }
+                    selected[bestIdx] = true;
+                    masks[i] |= localBit[bestIdx];
+                }
+            }
+            return masks;
+        }
+
+        private long capacityForbiddenMask(double load) {
+            double rem = ins.Q - load;
+            long mask = 0L;
+            for (int local = 0; local < q.length; local++) {
+                if (q[local] > rem + 1e-9) {
+                    mask |= localBit[local];
+                }
+            }
+            return mask;
+        }
+
+        private double transitionArcDual(int fromLocal, int toLocal) {
+            if (constraints == null || constraints.arcDualLocal == null) {
+                return 0.0;
+            }
+            return constraints.arcDualLocal[fromLocal][toLocal];
+        }
+
+        private double returnArcDual(int lastLocal) {
+            if (constraints == null || constraints.returnArcDualLocal == null) {
+                return 0.0;
+            }
+            return constraints.returnArcDualLocal[lastLocal];
+        }
+
+        private int[] reconstructForwardLocals(RelaxForwardLabel label) {
+            int[] locals = new int[label.depth];
+            RelaxForwardLabel cur = label;
+            for (int pos = label.depth - 1; pos >= 0; pos--) {
+                locals[pos] = cur.lastLocal;
+                cur = cur.pred;
+            }
+            return locals;
+        }
+
+        private int[] reconstructBackwardLocals(RelaxBackwardLabel label) {
+            int[] locals = new int[label.depth];
+            RelaxBackwardLabel cur = label;
+            for (int pos = 0; pos < label.depth; pos++) {
+                locals[pos] = cur.firstLocal;
+                cur = cur.pred;
+            }
+            return locals;
+        }
+
+        private int[] combineLocals(int[] left, int[] right) {
+            int[] out = new int[left.length + right.length];
+            System.arraycopy(left, 0, out, 0, left.length);
+            System.arraycopy(right, 0, out, left.length, right.length);
+            return out;
+        }
+
+        private boolean updateNgSetsFromCycles(int[] locals) {
+            boolean changed = false;
+            for (int i = 0; i < locals.length - 1; i++) {
+                for (int j = i + 1; j < locals.length; j++) {
+                    if (locals[j] != locals[i]) {
+                        continue;
+                    }
+                    int start = locals[i];
+                    for (int k = i + 1; k < j; k++) {
+                        int node = locals[k];
+                        long before = ngMaskByLocal[node];
+                        ngMaskByLocal[node] |= localBit[start];
+                        changed |= before != ngMaskByLocal[node];
+                    }
+                    break;
+                }
+            }
+            return changed;
+        }
+
+        private void maybeCollect(CollectedColumn candidate) {
+            if (candidate == null || collectedKeys.contains(candidate.key)) {
+                return;
+            }
+            if (collected.size() >= maxColumns) {
+                CollectedColumn worst = collected.get(collected.size() - 1);
+                if (candidate.reducedCost >= worst.reducedCost - DOM_EPS) {
+                    return;
+                }
+                collectedKeys.remove(worst.key);
+                collected.remove(collected.size() - 1);
+            }
+            int pos = collected.size();
+            while (pos > 0 && candidate.reducedCost < collected.get(pos - 1).reducedCost - DOM_EPS) {
+                pos--;
+            }
+            collected.add(pos, candidate);
+            collectedKeys.add(candidate.key);
+        }
+    }
+
+    private interface RelaxLabelState extends PartialRcState {
+        double load();
+        long memoryMask();
+        long repeatedMask();
+    }
+
+    private static final class RelaxForwardLabel implements RelaxLabelState {
+        final int lastLocal;
+        final int depth;
+        final double load;
+        final double travelCost;
+        final double dualGain;
+        final double arcDualGain;
+        final double partialReducedCost;
+        final long memoryMask;
+        final long allVisitedMask;
+        final long repeatedMask;
+        final RelaxForwardLabel pred;
+
+        RelaxForwardLabel(
+                int lastLocal,
+                int depth,
+                double load,
+                double travelCost,
+                double dualGain,
+                double arcDualGain,
+                long memoryMask,
+                long allVisitedMask,
+                long repeatedMask,
+                RelaxForwardLabel pred
+        ) {
+            this.lastLocal = lastLocal;
+            this.depth = depth;
+            this.load = load;
+            this.travelCost = travelCost;
+            this.dualGain = dualGain;
+            this.arcDualGain = arcDualGain;
+            this.partialReducedCost = travelCost - dualGain - arcDualGain;
+            this.memoryMask = memoryMask;
+            this.allVisitedMask = allVisitedMask;
+            this.repeatedMask = repeatedMask;
+            this.pred = pred;
+        }
+
+        @Override
+        public double partialReducedCost() {
+            return partialReducedCost;
+        }
+
+        @Override
+        public double load() {
+            return load;
+        }
+
+        @Override
+        public long memoryMask() {
+            return memoryMask;
+        }
+
+        @Override
+        public long repeatedMask() {
+            return repeatedMask;
+        }
+    }
+
+    private static final class RelaxBackwardLabel implements RelaxLabelState {
+        final int firstLocal;
+        final int depth;
+        final double load;
+        final double travelCost;
+        final double dualGain;
+        final double arcDualGain;
+        final double partialReducedCost;
+        final long memoryMask;
+        final long allVisitedMask;
+        final long repeatedMask;
+        final RelaxBackwardLabel pred;
+
+        RelaxBackwardLabel(
+                int firstLocal,
+                int depth,
+                double load,
+                double travelCost,
+                double dualGain,
+                double arcDualGain,
+                long memoryMask,
+                long allVisitedMask,
+                long repeatedMask,
+                RelaxBackwardLabel pred
+        ) {
+            this.firstLocal = firstLocal;
+            this.depth = depth;
+            this.load = load;
+            this.travelCost = travelCost;
+            this.dualGain = dualGain;
+            this.arcDualGain = arcDualGain;
+            this.partialReducedCost = travelCost - dualGain - arcDualGain;
+            this.memoryMask = memoryMask;
+            this.allVisitedMask = allVisitedMask;
+            this.repeatedMask = repeatedMask;
+            this.pred = pred;
+        }
+
+        @Override
+        public double partialReducedCost() {
+            return partialReducedCost;
+        }
+
+        @Override
+        public double load() {
+            return load;
+        }
+
+        @Override
+        public long memoryMask() {
+            return memoryMask;
+        }
+
+        @Override
+        public long repeatedMask() {
+            return repeatedMask;
         }
     }
 
