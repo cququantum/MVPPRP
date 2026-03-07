@@ -14,7 +14,6 @@ import model.CplexConfig;
 import model.SolveResult;
 
 import java.util.ArrayList;
-import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
@@ -36,6 +35,8 @@ public final class LbbdReformulationSolver {
     private static final boolean LOG_TO_CONSOLE = false;
     private static final boolean ENABLE_HINT_SHORTCUT = false;
     private static final int MASTER_THREADS = 0;
+    private static final int CUT_POOL_GRACE_ITERS = 3;
+    private static final double CUT_ACTIVITY_TOL = 1e-5;
 
     // Adaptive parameters based on instance size
     private double masterMipGapEarly;
@@ -179,43 +180,113 @@ public final class LbbdReformulationSolver {
         this.incumbentPruneMinExcess = 150.0;
     }
 
-    private static final class ActiveRmpDualCut {
+    private abstract static class ActiveCutBase {
         final String key;
         final IloRange range;
+        final int bornIteration;
+        int lastTouchedIteration;
+        int hitCount;
+        double lastViolation;
+        double maxViolation;
 
-        ActiveRmpDualCut(String key, IloRange range) {
+        ActiveCutBase(String key, IloRange range, int bornIteration, double initialViolation) {
             this.key = key;
             this.range = range;
+            this.bornIteration = bornIteration;
+            this.lastTouchedIteration = bornIteration;
+            this.hitCount = 0;
+            this.lastViolation = 0.0;
+            this.maxViolation = 0.0;
+            noteObservation(bornIteration, initialViolation);
+        }
+
+        void noteObservation(int iteration, double violation) {
+            double positiveViolation = Math.max(0.0, violation);
+            this.lastViolation = positiveViolation;
+            if (positiveViolation > CUT_ACTIVITY_TOL) {
+                this.lastTouchedIteration = iteration;
+                this.hitCount++;
+                if (positiveViolation > this.maxViolation) {
+                    this.maxViolation = positiveViolation;
+                }
+            }
         }
     }
 
-    private static final class ActivePeriodOptCut {
-        final String key;
-        final IloRange range;
+    private static final class ActiveRmpDualCut extends ActiveCutBase {
+        final int period;
+        final PeriodRouteMasterLpSolver.Result cut;
 
-        ActivePeriodOptCut(String key, IloRange range) {
-            this.key = key;
-            this.range = range;
+        ActiveRmpDualCut(String key, IloRange range, int bornIteration, double initialViolation, int period, PeriodRouteMasterLpSolver.Result cut) {
+            super(key, range, bornIteration, initialViolation);
+            this.period = period;
+            this.cut = cut;
         }
     }
 
-    private static final class ActiveGlobalOptCut {
-        final String key;
-        final IloRange range;
+    private static final class ActivePeriodOptCut extends ActiveCutBase {
+        final int period;
+        final double phiT;
+        final int visitedCount;
+        final int[] prevVisitBySupplier;
 
-        ActiveGlobalOptCut(String key, IloRange range) {
-            this.key = key;
-            this.range = range;
+        ActivePeriodOptCut(
+                String key,
+                IloRange range,
+                int bornIteration,
+                double initialViolation,
+                int period,
+                double phiT,
+                int visitedCount,
+                int[] prevVisitBySupplier
+        ) {
+            super(key, range, bornIteration, initialViolation);
+            this.period = period;
+            this.phiT = phiT;
+            this.visitedCount = visitedCount;
+            this.prevVisitBySupplier = prevVisitBySupplier;
         }
     }
 
-    private static final class ActiveIncumbentPruneCut {
-        final String key;
-        final IloRange range;
+    private static final class ActiveGlobalOptCut extends ActiveCutBase {
+        final double slope;
+        final double phi;
+        final int routeLambdaOneCount;
+        final int[][] prevVisit;
 
-        ActiveIncumbentPruneCut(String key, IloRange range) {
-            this.key = key;
-            this.range = range;
+        ActiveGlobalOptCut(
+                String key,
+                IloRange range,
+                int bornIteration,
+                double initialViolation,
+                double slope,
+                double phi,
+                int routeLambdaOneCount,
+                int[][] prevVisit
+        ) {
+            super(key, range, bornIteration, initialViolation);
+            this.slope = slope;
+            this.phi = phi;
+            this.routeLambdaOneCount = routeLambdaOneCount;
+            this.prevVisit = prevVisit;
+        }
+    }
+
+    private static final class ActiveIncumbentPruneCut extends ActiveCutBase {
+        final int routeLambdaOneCount;
+        final int[][] prevVisit;
+
+        ActiveIncumbentPruneCut(
+                String key,
+                IloRange range,
+                int bornIteration,
+                double initialViolation,
+                int routeLambdaOneCount,
+                int[][] prevVisit
+        ) {
+            super(key, range, bornIteration, initialViolation);
+            this.routeLambdaOneCount = routeLambdaOneCount;
+            this.prevVisit = prevVisit;
         }
     }
 
@@ -237,13 +308,13 @@ public final class LbbdReformulationSolver {
         HashMap<String, PeriodRouteMasterLpSolver.Result> rmpCutCache =
                 new HashMap<String, PeriodRouteMasterLpSolver.Result>();
         HashSet<String> addedRmpCutKeys = new HashSet<String>();
-        ArrayDeque<ActiveRmpDualCut> activeRmpDualCuts = new ArrayDeque<ActiveRmpDualCut>();
+        ArrayList<ActiveRmpDualCut> activeRmpDualCuts = new ArrayList<ActiveRmpDualCut>();
         HashSet<String> addedPeriodOptCutKeys = new HashSet<String>();
-        ArrayDeque<ActivePeriodOptCut> activePeriodOptCuts = new ArrayDeque<ActivePeriodOptCut>();
+        ArrayList<ActivePeriodOptCut> activePeriodOptCuts = new ArrayList<ActivePeriodOptCut>();
         HashSet<String> addedGlobalOptCutKeys = new HashSet<String>();
-        ArrayDeque<ActiveGlobalOptCut> activeGlobalOptCuts = new ArrayDeque<ActiveGlobalOptCut>();
+        ArrayList<ActiveGlobalOptCut> activeGlobalOptCuts = new ArrayList<ActiveGlobalOptCut>();
         HashSet<String> activeIncumbentPruneCutKeys = new HashSet<String>();
-        ArrayDeque<ActiveIncumbentPruneCut> activeIncumbentPruneCuts = new ArrayDeque<ActiveIncumbentPruneCut>();
+        ArrayList<ActiveIncumbentPruneCut> activeIncumbentPruneCuts = new ArrayList<ActiveIncumbentPruneCut>();
 
         int subThreads = Math.min(ins.l, Runtime.getRuntime().availableProcessors());
         final PeriodCvrpSubproblemSolver[] subSolvers = new PeriodCvrpSubproblemSolver[ins.l + 1];
@@ -251,11 +322,13 @@ public final class LbbdReformulationSolver {
             subSolvers[tt] = new PeriodCvrpSubproblemSolver();
         }
         ExecutorService subExecutor = subThreads > 1 ? Executors.newFixedThreadPool(subThreads) : null;
+        int rmpThreads = Math.min(ins.l, Math.max(1, Runtime.getRuntime().availableProcessors() / 2));
+        ExecutorService rmpExecutor = rmpThreads > 1 ? Executors.newFixedThreadPool(rmpThreads) : null;
+        PeriodRouteMasterLpSolver rmpLpSolver = new PeriodRouteMasterLpSolver(ins);
 
         try (IloCplex cplex = new IloCplex()) {
             configure(cplex);
             MasterModel master = new MasterModel(cplex, ins);
-            PeriodRouteMasterLpSolver rmpLpSolver = new PeriodRouteMasterLpSolver(ins);
             RoutingLowerBoundSolver lbRSolver = new RoutingLowerBoundSolver(ins);
             RoutingLowerBoundSolver.Result lbRResult = lbRSolver.solve();
             double lbR = (lbRResult.feasible && !Double.isNaN(lbRResult.lbR) && !Double.isInfinite(lbRResult.lbR))
@@ -366,10 +439,6 @@ public final class LbbdReformulationSolver {
 
             while (iteration < MAX_ITERATIONS) {
                 iteration++;
-                trimActiveRmpDualCuts(master, activeRmpDualCuts, addedRmpCutKeys, activeRmpDualCutCap(iteration));
-                trimActivePeriodOptCuts(master, activePeriodOptCuts, addedPeriodOptCutKeys, activePeriodOptCutCap(iteration));
-                trimActiveGlobalOptCuts(master, activeGlobalOptCuts, addedGlobalOptCutKeys, activeGlobalOptCutCap(iteration));
-                trimActiveIncPruneCuts(master, activeIncumbentPruneCuts, activeIncumbentPruneCutKeys, activeIncPruneCutCap(iteration));
 
                 long iterMasterSolveNs = 0L;
                 long iterSubSolveNs = 0L;
@@ -416,10 +485,17 @@ public final class LbbdReformulationSolver {
                 MasterPoint point = master.extractPoint(ins);
                 prevPoint = point;
                 bestLowerBound = Math.max(bestLowerBound, point.bmpBestBound);
+                updateActiveCutActivity(point, iteration, activeRmpDualCuts, activePeriodOptCuts, activeGlobalOptCuts, activeIncumbentPruneCuts);
+                trimActiveRmpDualCuts(master, activeRmpDualCuts, addedRmpCutKeys, activeRmpDualCutCap(iteration), iteration);
+                trimActivePeriodOptCuts(master, activePeriodOptCuts, addedPeriodOptCutKeys, activePeriodOptCutCap(iteration), iteration);
+                trimActiveGlobalOptCuts(master, activeGlobalOptCuts, addedGlobalOptCutKeys, activeGlobalOptCutCap(iteration), iteration);
+                trimActiveIncPruneCuts(master, activeIncumbentPruneCuts, activeIncumbentPruneCutKeys, activeIncPruneCutCap(iteration), iteration);
 
                 double phi = 0.0;
                 double[] phiByPeriod = new double[ins.l + 1];
-                String[] subKeysByPeriod = new String[ins.l + 1];
+                String[] patternKeysByPeriod = new String[ins.l + 1];
+                String[] subCacheKeysByPeriod = new String[ins.l + 1];
+                String[] rmpCacheKeysByPeriod = new String[ins.l + 1];
                 int infeasiblePeriod = -1;
 
                 // Phase 1: check cache and submit parallel tasks for misses
@@ -432,8 +508,11 @@ public final class LbbdReformulationSolver {
                 for (int t = 1; t <= ins.l; t++) {
                     iterSubCalls++;
                     totalSubCalls++;
-                    String key = buildSubproblemCacheKey(point, t, ins.n);
-                    subKeysByPeriod[t] = key;
+                    String patternKey = buildPeriodRoutingPatternKey(point, t, ins.n);
+                    String key = buildSubproblemCacheKey(patternKey);
+                    patternKeysByPeriod[t] = patternKey;
+                    subCacheKeysByPeriod[t] = key;
+                    rmpCacheKeysByPeriod[t] = buildRmpCutCacheKey(patternKey);
                     PeriodCvrpSubproblemSolver.Result cached = subproblemCache.get(key);
                     if (cached != null) {
                         subResults[t] = cached;
@@ -480,11 +559,11 @@ public final class LbbdReformulationSolver {
                     totalSubSolveNs += subElapsed;
 
                     for (int t = 1; t <= ins.l; t++) {
-                        if (subKeysByPeriod[t] != null && subResults[t] != null
-                                && !subproblemCache.containsKey(subKeysByPeriod[t])) {
+                        if (subCacheKeysByPeriod[t] != null && subResults[t] != null
+                                && !subproblemCache.containsKey(subCacheKeysByPeriod[t])) {
                             PeriodCvrpSubproblemSolver.Result sub = subResults[t];
                             if (sub.optimal || sub.provenInfeasible) {
-                                subproblemCache.put(subKeysByPeriod[t], sub);
+                                subproblemCache.put(subCacheKeysByPeriod[t], sub);
                             }
                         }
                     }
@@ -559,50 +638,82 @@ public final class LbbdReformulationSolver {
                 if (violatedOptimality) {
                     periodCoveredByFreshRmpCut = new boolean[ins.l + 1];
                     int periodsToProcess = Math.min(MAX_RMP_PERIODS_PER_ITER, ins.l);
-                    boolean[] picked = new boolean[ins.l + 1];
-                    for (int pick = 0; pick < periodsToProcess; pick++) {
-                        int bestT = -1;
-                        double bestGap = CUT_EPS;
-                        for (int t = 1; t <= ins.l; t++) {
-                            if (picked[t]) {
-                                continue;
-                            }
-                            String key = subKeysByPeriod[t];
-                            if (key == null || addedRmpCutKeys.contains(key)) {
-                                continue;
-                            }
-                            double periodGap = phiByPeriod[t] - point.omega[t];
-                            if (periodGap > bestGap) {
-                                bestGap = periodGap;
-                                bestT = t;
-                            }
-                        }
+                    int[] selectedPeriods = selectBestRmpPeriods(point, phiByPeriod, rmpCacheKeysByPeriod, addedRmpCutKeys, periodsToProcess);
+                    @SuppressWarnings("unchecked")
+                    Future<PeriodRouteMasterLpSolver.Result>[] rmpFutures = (rmpExecutor != null)
+                            ? new Future[ins.l + 1] : null;
+                    int[][] prevVisitArgPeriods = new int[ins.l + 1][];
+
+                    long rmpStartNs = System.nanoTime();
+                    for (int idx = 0; idx < selectedPeriods.length; idx++) {
+                        int bestT = selectedPeriods[idx];
                         if (bestT < 0) {
-                            break;
+                            continue;
                         }
-                        picked[bestT] = true;
-                        String key = subKeysByPeriod[bestT];
-                        PeriodRouteMasterLpSolver.Result rmpCut = rmpCutCache.get(key);
-                        if (rmpCut == null) {
-                            iterRmpCalls++;
-                            totalRmpCalls++;
-                            iterRmpCacheMisses++;
-                            totalRmpCacheMisses++;
-                            long rmpStartNs = System.nanoTime();
-                            rmpCut = rmpLpSolver.solve(
+                        String key = rmpCacheKeysByPeriod[bestT];
+                        if (rmpCutCache.containsKey(key)) {
+                            continue;
+                        }
+                        iterRmpCalls++;
+                        totalRmpCalls++;
+                        iterRmpCacheMisses++;
+                        totalRmpCacheMisses++;
+                        prevVisitArgPeriods[bestT] = buildPrevVisitForPeriod(point, bestT, ins.n);
+                        if (rmpExecutor != null) {
+                            final int period = bestT;
+                            final int[] prevVisitForPeriod = prevVisitArgPeriods[bestT];
+                            rmpFutures[bestT] = rmpExecutor.submit(new Callable<PeriodRouteMasterLpSolver.Result>() {
+                                @Override
+                                public PeriodRouteMasterLpSolver.Result call() {
+                                    return rmpLpSolver.solve(
+                                            ins,
+                                            period,
+                                            point.qBar[period],
+                                            point.zBar[period],
+                                            prevVisitForPeriod
+                                    );
+                                }
+                            });
+                        } else {
+                            PeriodRouteMasterLpSolver.Result solvedCut = rmpLpSolver.solve(
                                     ins,
                                     bestT,
                                     point.qBar[bestT],
                                     point.zBar[bestT],
-                                    buildPrevVisitForPeriod(point, bestT, ins.n)
+                                    prevVisitArgPeriods[bestT]
                             );
-                            long rmpElapsed = System.nanoTime() - rmpStartNs;
-                            iterRmpSolveNs += rmpElapsed;
-                            totalRmpSolveNs += rmpElapsed;
-                            if (rmpCut.feasible && rmpCut.optimal && rmpCut.pricingProvedOptimal) {
-                                rmpCutCache.put(key, rmpCut);
+                            if (solvedCut.feasible && solvedCut.optimal && solvedCut.pricingProvedOptimal) {
+                                rmpCutCache.put(key, solvedCut);
                             }
                         }
+                    }
+                    if (rmpExecutor != null) {
+                        for (int idx = 0; idx < selectedPeriods.length; idx++) {
+                            int bestT = selectedPeriods[idx];
+                            if (bestT < 0 || rmpFutures[bestT] == null) {
+                                continue;
+                            }
+                            try {
+                                PeriodRouteMasterLpSolver.Result solvedCut = rmpFutures[bestT].get();
+                                if (solvedCut.feasible && solvedCut.optimal && solvedCut.pricingProvedOptimal) {
+                                    rmpCutCache.put(rmpCacheKeysByPeriod[bestT], solvedCut);
+                                }
+                            } catch (Exception e) {
+                                throw new RuntimeException("RMP dual-cut solve failed for t=" + bestT, e);
+                            }
+                        }
+                    }
+                    long rmpElapsed = System.nanoTime() - rmpStartNs;
+                    iterRmpSolveNs += rmpElapsed;
+                    totalRmpSolveNs += rmpElapsed;
+
+                    for (int idx = 0; idx < selectedPeriods.length; idx++) {
+                        int bestT = selectedPeriods[idx];
+                        if (bestT < 0) {
+                            continue;
+                        }
+                        String key = rmpCacheKeysByPeriod[bestT];
+                        PeriodRouteMasterLpSolver.Result rmpCut = rmpCutCache.get(key);
                         if (rmpCut == null
                                 || !rmpCut.feasible
                                 || !rmpCut.optimal
@@ -612,19 +723,7 @@ public final class LbbdReformulationSolver {
                             continue;
                         }
 
-                        double cutAtPoint = ins.K * rmpCut.dualU0;
-                        for (int i = 1; i <= ins.n; i++) {
-                            for (int v = ins.pi[i][bestT]; v <= bestT - 1; v++) {
-                                if (!point.lambdaOne[i][v][bestT]) {
-                                    continue;
-                                }
-                                if (rmpCut.dualUiByPrev != null
-                                        && i < rmpCut.dualUiByPrev.length
-                                        && v < rmpCut.dualUiByPrev[i].length) {
-                                    cutAtPoint += rmpCut.dualUiByPrev[i][v];
-                                }
-                            }
-                        }
+                        double cutAtPoint = evaluateRmpDualCutAtPoint(point, bestT, rmpCut, ins);
                         double cutPointTol = 1e-5 * Math.max(1.0, Math.abs(rmpCut.lpObjective));
                         boolean validAtPoint = rmpCut.dualU0 <= 1e-7
                                 && Math.abs(cutAtPoint - rmpCut.lpObjective) <= cutPointTol
@@ -635,8 +734,15 @@ public final class LbbdReformulationSolver {
                         }
                         IloRange addedRange = master.addPeriodRmpDualCut(bestT, point, rmpCut);
                         addedRmpCutKeys.add(key);
-                        activeRmpDualCuts.addLast(new ActiveRmpDualCut(key, addedRange));
-                        trimActiveRmpDualCuts(master, activeRmpDualCuts, addedRmpCutKeys, activeRmpDualCutCap(iteration));
+                        activeRmpDualCuts.add(new ActiveRmpDualCut(
+                                key,
+                                addedRange,
+                                iteration,
+                                Math.max(0.0, cutAtPoint - point.omega[bestT]),
+                                bestT,
+                                rmpCut
+                        ));
+                        trimActiveRmpDualCuts(master, activeRmpDualCuts, addedRmpCutKeys, activeRmpDualCutCap(iteration), iteration);
                         periodCoveredByFreshRmpCut[bestT] = true;
                         freshRmpCutsAddedThisIter++;
                         lpDualCuts++;
@@ -724,7 +830,7 @@ public final class LbbdReformulationSolver {
                                 if (phiByPeriod[t] <= point.omega[t] + CUT_EPS) {
                                     continue;
                                 }
-                                String periodKey = buildPeriodOptCutKey(subKeysByPeriod[t], t);
+                                String periodKey = buildPeriodOptCutKey(patternKeysByPeriod[t]);
                                 if (periodKey == null || addedPeriodOptCutKeys.contains(periodKey)) {
                                     continue;
                                 }
@@ -737,26 +843,45 @@ public final class LbbdReformulationSolver {
                             if (bestT < 0) {
                                 break;
                             }
-                            String periodKey = buildPeriodOptCutKey(subKeysByPeriod[bestT], bestT);
+                            String periodKey = buildPeriodOptCutKey(patternKeysByPeriod[bestT]);
                             IloRange addedRange = master.addSinglePeriodOptimalityCut(point, phiByPeriod[bestT], bestT);
                             if (addedRange == null) {
                                 break;
                             }
                             addedPeriodOptCutKeys.add(periodKey);
-                            activePeriodOptCuts.addLast(new ActivePeriodOptCut(periodKey, addedRange));
-                            trimActivePeriodOptCuts(master, activePeriodOptCuts, addedPeriodOptCutKeys, activePeriodOptCutCap(iteration));
+                            activePeriodOptCuts.add(new ActivePeriodOptCut(
+                                    periodKey,
+                                    addedRange,
+                                    iteration,
+                                    Math.max(0.0, phiByPeriod[bestT] - point.omega[bestT]),
+                                    bestT,
+                                    phiByPeriod[bestT],
+                                    countVisitedForPeriod(point, bestT, ins.n),
+                                    copyPrevVisitForPeriod(point, bestT, ins.n)
+                            ));
+                            trimActivePeriodOptCuts(master, activePeriodOptCuts, addedPeriodOptCutKeys, activePeriodOptCutCap(iteration), iteration);
                             addedPeriodOptThisIter++;
                         }
                     }
                     if (ENABLE_GLOBAL_COMBINATION_OPT_CUT) {
                         if (iteration >= globalOptCutStartIter && delta >= globalOptCutMinDelta) {
-                            String globalOptKey = buildGlobalOptCutKey(point, ins.n, ins.l);
+                            String globalOptKey = buildGlobalOptCutKey(buildGlobalRoutingPatternKey(point, ins.n, ins.l));
                             if (!addedGlobalOptCutKeys.contains(globalOptKey)) {
                                 IloRange range = master.addOptimalityCutRange(point, phi, lbR);
                                 if (range != null) {
                                     addedGlobalOptCutKeys.add(globalOptKey);
-                                    activeGlobalOptCuts.addLast(new ActiveGlobalOptCut(globalOptKey, range));
-                                    trimActiveGlobalOptCuts(master, activeGlobalOptCuts, addedGlobalOptCutKeys, activeGlobalOptCutCap(iteration));
+                                    double slope = phi - lbR;
+                                    activeGlobalOptCuts.add(new ActiveGlobalOptCut(
+                                            globalOptKey,
+                                            range,
+                                            iteration,
+                                            Math.max(0.0, delta),
+                                            slope,
+                                            phi,
+                                            point.routeLambdaOneCount,
+                                            copyPrevVisitMatrix(point, ins.n, ins.l)
+                                    ));
+                                    trimActiveGlobalOptCuts(master, activeGlobalOptCuts, addedGlobalOptCutKeys, activeGlobalOptCutCap(iteration), iteration);
                                     globalOptCuts++;
                                 }
                             }
@@ -769,12 +894,19 @@ public final class LbbdReformulationSolver {
                     if (ENABLE_INCUMBENT_PRUNE_NOGOOD
                             && iteration >= incumbentPruneStartIter
                             && exactObjective >= bestUpperBound + incumbentPruneMinExcess) {
-                            String incPruneKey = buildGlobalRoutingPatternKey(point, ins.n, ins.l);
+                            String incPruneKey = buildIncumbentPruneCutKey(buildGlobalRoutingPatternKey(point, ins.n, ins.l));
                             if (!activeIncumbentPruneCutKeys.contains(incPruneKey)) {
                                 IloRange ng = master.addNoGoodCutRange(point);
                                 activeIncumbentPruneCutKeys.add(incPruneKey);
-                                activeIncumbentPruneCuts.addLast(new ActiveIncumbentPruneCut(incPruneKey, ng));
-                                trimActiveIncPruneCuts(master, activeIncumbentPruneCuts, activeIncumbentPruneCutKeys, activeIncPruneCutCap(iteration));
+                                activeIncumbentPruneCuts.add(new ActiveIncumbentPruneCut(
+                                        incPruneKey,
+                                        ng,
+                                        iteration,
+                                        1.0,
+                                        point.routeLambdaOneCount,
+                                        copyPrevVisitMatrix(point, ins.n, ins.l)
+                                ));
+                                trimActiveIncPruneCuts(master, activeIncumbentPruneCuts, activeIncumbentPruneCutKeys, activeIncPruneCutCap(iteration), iteration);
                                 incumbentPruneCuts++;
                             }
                         }
@@ -848,6 +980,10 @@ public final class LbbdReformulationSolver {
             if (subExecutor != null) {
                 subExecutor.shutdownNow();
             }
+            if (rmpExecutor != null) {
+                rmpExecutor.shutdownNow();
+            }
+            rmpLpSolver.close();
             for (int tt = 1; tt < subSolvers.length; tt++) {
                 if (subSolvers[tt] != null) {
                     subSolvers[tt].close();
@@ -932,7 +1068,7 @@ public final class LbbdReformulationSolver {
         return iteration <= 10 || iteration % 10 == 0;
     }
 
-    private static String buildSubproblemCacheKey(MasterPoint point, int t, int n) {
+    private static String buildPeriodRoutingPatternKey(MasterPoint point, int t, int n) {
         StringBuilder sb = new StringBuilder(n * 3 + 4);
         sb.append(t).append(':');
         for (int i = 1; i <= n; i++) {
@@ -944,6 +1080,14 @@ public final class LbbdReformulationSolver {
         return sb.toString();
     }
 
+    private static String buildSubproblemCacheKey(String periodPatternKey) {
+        return periodPatternKey == null ? null : ("SUB|" + periodPatternKey);
+    }
+
+    private static String buildRmpCutCacheKey(String periodPatternKey) {
+        return periodPatternKey == null ? null : ("RMP|" + periodPatternKey);
+    }
+
     private static int[] buildPrevVisitForPeriod(MasterPoint point, int t, int n) {
         int[] prev = new int[n + 1];
         for (int i = 1; i <= n; i++) {
@@ -952,11 +1096,35 @@ public final class LbbdReformulationSolver {
         return prev;
     }
 
-    private static String buildPeriodOptCutKey(String subKey, int t) {
-        if (subKey == null) {
+    private static int[] copyPrevVisitForPeriod(MasterPoint point, int t, int n) {
+        return buildPrevVisitForPeriod(point, t, n);
+    }
+
+    private static int[][] copyPrevVisitMatrix(MasterPoint point, int n, int l) {
+        int[][] copy = new int[n + 1][l + 1];
+        for (int i = 1; i <= n; i++) {
+            for (int t = 1; t <= l; t++) {
+                copy[i][t] = point.prevVisit[i][t];
+            }
+        }
+        return copy;
+    }
+
+    private static int countVisitedForPeriod(MasterPoint point, int t, int n) {
+        int count = 0;
+        for (int i = 1; i <= n; i++) {
+            if (point.prevVisit[i][t] >= 0) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static String buildPeriodOptCutKey(String periodPatternKey) {
+        if (periodPatternKey == null) {
             return null;
         }
-        return "P|" + t + "|" + subKey;
+        return "POPT|" + periodPatternKey;
     }
 
     private static String buildGlobalRoutingPatternKey(MasterPoint point, int n, int l) {
@@ -976,8 +1144,135 @@ public final class LbbdReformulationSolver {
         return sb.toString();
     }
 
-    private static String buildGlobalOptCutKey(MasterPoint point, int n, int l) {
-        return "GOPT|" + buildGlobalRoutingPatternKey(point, n, l);
+    private static String buildGlobalOptCutKey(String globalPatternKey) {
+        return "GOPT|" + globalPatternKey;
+    }
+
+    private static String buildIncumbentPruneCutKey(String globalPatternKey) {
+        return "NOGOOD|" + globalPatternKey;
+    }
+
+    private static int[] selectBestRmpPeriods(
+            MasterPoint point,
+            double[] phiByPeriod,
+            String[] rmpCacheKeysByPeriod,
+            HashSet<String> addedRmpCutKeys,
+            int limit
+    ) {
+        int[] selected = new int[limit];
+        for (int idx = 0; idx < selected.length; idx++) {
+            selected[idx] = -1;
+        }
+        boolean[] picked = new boolean[phiByPeriod.length];
+        for (int pick = 0; pick < limit; pick++) {
+            int bestT = -1;
+            double bestGap = CUT_EPS;
+            for (int t = 1; t < phiByPeriod.length; t++) {
+                if (picked[t]) {
+                    continue;
+                }
+                String key = rmpCacheKeysByPeriod[t];
+                if (key == null || addedRmpCutKeys.contains(key)) {
+                    continue;
+                }
+                double periodGap = phiByPeriod[t] - point.omega[t];
+                if (periodGap > bestGap) {
+                    bestGap = periodGap;
+                    bestT = t;
+                }
+            }
+            if (bestT < 0) {
+                break;
+            }
+            picked[bestT] = true;
+            selected[pick] = bestT;
+        }
+        return selected;
+    }
+
+    private static double evaluateRmpDualCutAtPoint(
+            MasterPoint point,
+            int t,
+            PeriodRouteMasterLpSolver.Result cut,
+            Instance ins
+    ) {
+        double cutAtPoint = ins.K * cut.dualU0;
+        for (int i = 1; i <= ins.n; i++) {
+            int v = point.prevVisit[i][t];
+            if (v < 0) {
+                continue;
+            }
+            if (cut.dualUiByPrev != null
+                    && i < cut.dualUiByPrev.length
+                    && v < cut.dualUiByPrev[i].length) {
+                cutAtPoint += cut.dualUiByPrev[i][v];
+            }
+        }
+        return cutAtPoint;
+    }
+
+    private void updateActiveCutActivity(
+            MasterPoint point,
+            int iteration,
+            ArrayList<ActiveRmpDualCut> activeRmpDualCuts,
+            ArrayList<ActivePeriodOptCut> activePeriodOptCuts,
+            ArrayList<ActiveGlobalOptCut> activeGlobalOptCuts,
+            ArrayList<ActiveIncumbentPruneCut> activeIncumbentPruneCuts
+    ) {
+        for (int idx = 0; idx < activeRmpDualCuts.size(); idx++) {
+            ActiveRmpDualCut cut = activeRmpDualCuts.get(idx);
+            double violation = evaluateRmpDualCutAtPoint(point, cut.period, cut.cut, ins) - point.omega[cut.period];
+            cut.noteObservation(iteration, violation);
+        }
+        for (int idx = 0; idx < activePeriodOptCuts.size(); idx++) {
+            ActivePeriodOptCut cut = activePeriodOptCuts.get(idx);
+            double lhs = point.omega[cut.period];
+            for (int i = 1; i <= ins.n; i++) {
+                int currentPrev = point.prevVisit[i][cut.period];
+                if (currentPrev < 0) {
+                    continue;
+                }
+                lhs += (currentPrev == cut.prevVisitBySupplier[i]) ? -cut.phiT : cut.phiT;
+            }
+            double rhs = cut.phiT - cut.phiT * cut.visitedCount;
+            cut.noteObservation(iteration, rhs - lhs);
+        }
+        for (int idx = 0; idx < activeGlobalOptCuts.size(); idx++) {
+            ActiveGlobalOptCut cut = activeGlobalOptCuts.get(idx);
+            double lhs = point.omegaSum;
+            for (int t = 1; t <= ins.l; t++) {
+                for (int i = 1; i <= ins.n; i++) {
+                    int currentPrev = point.prevVisit[i][t];
+                    if (currentPrev < 0) {
+                        continue;
+                    }
+                    lhs += (currentPrev == cut.prevVisit[i][t]) ? -cut.slope : cut.slope;
+                }
+            }
+            double rhs = cut.phi - cut.slope * cut.routeLambdaOneCount;
+            cut.noteObservation(iteration, rhs - lhs);
+        }
+        for (int idx = 0; idx < activeIncumbentPruneCuts.size(); idx++) {
+            ActiveIncumbentPruneCut cut = activeIncumbentPruneCuts.get(idx);
+            int matches = 0;
+            int differingActives = 0;
+            for (int t = 1; t <= ins.l; t++) {
+                for (int i = 1; i <= ins.n; i++) {
+                    int currentPrev = point.prevVisit[i][t];
+                    if (currentPrev < 0) {
+                        continue;
+                    }
+                    if (currentPrev == cut.prevVisit[i][t]) {
+                        matches++;
+                    } else {
+                        differingActives++;
+                    }
+                }
+            }
+            double lhs = -matches + differingActives;
+            double rhs = 1.0 - cut.routeLambdaOneCount;
+            cut.noteObservation(iteration, rhs - lhs);
+        }
     }
 
     private static SolveResult buildFailedResult(
@@ -1171,56 +1466,95 @@ public final class LbbdReformulationSolver {
                 : activeIncPruneCutsCapBase;
     }
 
-    private static void trimActiveRmpDualCuts(
+    private static <T extends ActiveCutBase> void trimActiveCuts(
             MasterModel master,
-            ArrayDeque<ActiveRmpDualCut> activeCuts,
+            ArrayList<T> activeCuts,
             HashSet<String> keys,
-            int cap
+            int cap,
+            int iteration
     ) throws IloException {
         while (activeCuts.size() > cap) {
-            ActiveRmpDualCut evicted = activeCuts.removeFirst();
+            int evictIndex = selectEvictionIndex(activeCuts, iteration);
+            T evicted = activeCuts.remove(evictIndex);
             master.deleteCut(evicted.range);
             keys.remove(evicted.key);
         }
+    }
+
+    private static <T extends ActiveCutBase> int selectEvictionIndex(ArrayList<T> activeCuts, int iteration) {
+        int bestIndex = 0;
+        for (int idx = 1; idx < activeCuts.size(); idx++) {
+            if (compareEvictionPriority(activeCuts.get(idx), activeCuts.get(bestIndex), iteration) < 0) {
+                bestIndex = idx;
+            }
+        }
+        return bestIndex;
+    }
+
+    private static int compareEvictionPriority(ActiveCutBase a, ActiveCutBase b, int iteration) {
+        boolean aYoung = (iteration - a.bornIteration) < CUT_POOL_GRACE_ITERS;
+        boolean bYoung = (iteration - b.bornIteration) < CUT_POOL_GRACE_ITERS;
+        if (aYoung != bYoung) {
+            return aYoung ? 1 : -1;
+        }
+        boolean aActive = a.lastViolation > CUT_ACTIVITY_TOL;
+        boolean bActive = b.lastViolation > CUT_ACTIVITY_TOL;
+        if (aActive != bActive) {
+            return aActive ? 1 : -1;
+        }
+        if (a.hitCount != b.hitCount) {
+            return Integer.compare(a.hitCount, b.hitCount);
+        }
+        if (a.lastTouchedIteration != b.lastTouchedIteration) {
+            return Integer.compare(a.lastTouchedIteration, b.lastTouchedIteration);
+        }
+        if (Math.abs(a.maxViolation - b.maxViolation) > 1e-9) {
+            return Double.compare(a.maxViolation, b.maxViolation);
+        }
+        if (a.bornIteration != b.bornIteration) {
+            return Integer.compare(a.bornIteration, b.bornIteration);
+        }
+        return a.key.compareTo(b.key);
+    }
+
+    private static void trimActiveRmpDualCuts(
+            MasterModel master,
+            ArrayList<ActiveRmpDualCut> activeCuts,
+            HashSet<String> keys,
+            int cap,
+            int iteration
+    ) throws IloException {
+        trimActiveCuts(master, activeCuts, keys, cap, iteration);
     }
 
     private static void trimActivePeriodOptCuts(
             MasterModel master,
-            ArrayDeque<ActivePeriodOptCut> activeCuts,
+            ArrayList<ActivePeriodOptCut> activeCuts,
             HashSet<String> keys,
-            int cap
+            int cap,
+            int iteration
     ) throws IloException {
-        while (activeCuts.size() > cap) {
-            ActivePeriodOptCut evicted = activeCuts.removeFirst();
-            master.deleteCut(evicted.range);
-            keys.remove(evicted.key);
-        }
+        trimActiveCuts(master, activeCuts, keys, cap, iteration);
     }
 
     private static void trimActiveGlobalOptCuts(
             MasterModel master,
-            ArrayDeque<ActiveGlobalOptCut> activeCuts,
+            ArrayList<ActiveGlobalOptCut> activeCuts,
             HashSet<String> keys,
-            int cap
+            int cap,
+            int iteration
     ) throws IloException {
-        while (activeCuts.size() > cap) {
-            ActiveGlobalOptCut evicted = activeCuts.removeFirst();
-            master.deleteCut(evicted.range);
-            keys.remove(evicted.key);
-        }
+        trimActiveCuts(master, activeCuts, keys, cap, iteration);
     }
 
     private static void trimActiveIncPruneCuts(
             MasterModel master,
-            ArrayDeque<ActiveIncumbentPruneCut> activeCuts,
+            ArrayList<ActiveIncumbentPruneCut> activeCuts,
             HashSet<String> keys,
-            int cap
+            int cap,
+            int iteration
     ) throws IloException {
-        while (activeCuts.size() > cap) {
-            ActiveIncumbentPruneCut evicted = activeCuts.removeFirst();
-            master.deleteCut(evicted.range);
-            keys.remove(evicted.key);
-        }
+        trimActiveCuts(master, activeCuts, keys, cap, iteration);
     }
 
     private static boolean isPickupNode(int node, int n) {

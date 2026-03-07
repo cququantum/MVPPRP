@@ -17,16 +17,18 @@ import java.util.HashSet;
  * Solve the LP relaxation of the set-partitioning CVRP subproblem via column generation,
  * and return duals used in lbbd.tex Eq. (3-18).
  */
-public final class PeriodRouteMasterLpSolver {
+public final class PeriodRouteMasterLpSolver implements AutoCloseable {
     private static final boolean LOG_TO_CONSOLE = false;
     private static final double RC_EPS = 1e-8;
     private static final double ART_EPS = 1e-7;
     private static final int EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS = 0;
 
     // Adaptive column generation parameters based on instance size
+    private final Instance ins;
     private final int maxColumnsPerPricingSmall;
     private final int maxColumnsPerPricingMedium;
     private final int maxColumnsPerPricingLarge;
+    private final PeriodContext[] periodContexts;
 
     private ExactSubsetRouteCostOracle subsetRouteOracle;
     private Instance subsetRouteOracleInstance;
@@ -72,6 +74,8 @@ public final class PeriodRouteMasterLpSolver {
     }
 
     public PeriodRouteMasterLpSolver(Instance ins) {
+        this.ins = ins;
+        this.periodContexts = new PeriodContext[ins.l + 1];
         // Adaptive column generation parameters based on instance size
         if (ins.n <= 12) {
             // Small scale: preserve original parameters
@@ -95,75 +99,115 @@ public final class PeriodRouteMasterLpSolver {
         if (t < 1 || t > ins.l) {
             throw new IllegalArgumentException("t must be in 1..l");
         }
+        if (ins != this.ins) {
+            throw new IllegalArgumentException("PeriodRouteMasterLpSolver is bound to a single instance");
+        }
         if (prevVisitBySupplier == null || prevVisitBySupplier.length < ins.n + 1) {
             throw new IllegalArgumentException("prevVisitBySupplier must have length n+1");
         }
+        try {
+            return getOrCreatePeriodContext(t).solve(prevVisitBySupplier);
+        } catch (IloException e) {
+            throw new RuntimeException("Failed to solve route-master LP at t=" + t, e);
+        }
+    }
 
-        ArrayList<Integer> supplierList = new ArrayList<Integer>();
-        ArrayList<Integer> prevList = new ArrayList<Integer>();
-        ArrayList<Double> demandList = new ArrayList<Double>();
-        ArrayList<Double> rhsList = new ArrayList<Double>();
-
-        for (int i = 1; i <= ins.n; i++) {
-            int vBar = prevVisitBySupplier[i];
-            for (int v = ins.pi[i][t]; v <= t - 1; v++) {
-                double demand = ins.g(i, v, t);
-                if (demand > ins.Q + 1e-9) {
-                    continue;
+    @Override
+    public void close() {
+        synchronized (periodContexts) {
+            for (int t = 1; t < periodContexts.length; t++) {
+                if (periodContexts[t] != null) {
+                    periodContexts[t].close();
+                    periodContexts[t] = null;
                 }
-                supplierList.add(i);
-                prevList.add(v);
-                demandList.add(demand);
-                rhsList.add((vBar == v) ? 1.0 : 0.0);
             }
         }
+    }
 
-        int scenarioCount = supplierList.size();
-        if (scenarioCount == 0) {
-            return new Result(
-                    true,
-                    true,
-                    true,
-                    true,
-                    "TrivialZeroRmp",
-                    0.0,
-                    new double[ins.n + 1],
-                    new double[ins.n + 1][ins.l + 2],
-                    0.0,
-                    0,
-                    0
-            );
+    private PeriodContext getOrCreatePeriodContext(int t) throws IloException {
+        synchronized (periodContexts) {
+            PeriodContext context = periodContexts[t];
+            if (context == null) {
+                context = new PeriodContext(t);
+                periodContexts[t] = context;
+            }
+            return context;
         }
+    }
 
-        int[] scenarioSupplier = new int[scenarioCount];
-        int[] scenarioPrev = new int[scenarioCount];
-        double[] scenarioDemand = new double[scenarioCount];
-        double[] scenarioRhs = new double[scenarioCount];
-        for (int s = 0; s < scenarioCount; s++) {
-            scenarioSupplier[s] = supplierList.get(s);
-            scenarioPrev[s] = prevList.get(s);
-            scenarioDemand[s] = demandList.get(s);
-            scenarioRhs[s] = rhsList.get(s);
-        }
-        final double artificialPenalty = computeArtificialPenalty(ins, scenarioCount);
-        PricingEspprcSolver pricingSolver = new PricingEspprcSolver();
-        try (IloCplex cplex = new IloCplex()) {
+    private final class PeriodContext implements AutoCloseable {
+        final int t;
+        final int scenarioCount;
+        final int[] scenarioSupplier;
+        final int[] scenarioPrev;
+        final double[] scenarioDemand;
+        final PricingEspprcSolver pricingSolver;
+        final HashSet<String> existingRouteKeys;
+
+        final IloCplex cplex;
+        final IloObjective obj;
+        final IloRange[] coverEq;
+        final IloRange vehLimit;
+        final IloNumVar[] artificial;
+
+        int nextGeneratedColumnId;
+
+        PeriodContext(int t) throws IloException {
+            this.t = t;
+
+            ArrayList<Integer> supplierList = new ArrayList<Integer>();
+            ArrayList<Integer> prevList = new ArrayList<Integer>();
+            ArrayList<Double> demandList = new ArrayList<Double>();
+            for (int i = 1; i <= ins.n; i++) {
+                for (int v = ins.pi[i][t]; v <= t - 1; v++) {
+                    double demand = ins.g(i, v, t);
+                    if (demand > ins.Q + 1e-9) {
+                        continue;
+                    }
+                    supplierList.add(i);
+                    prevList.add(v);
+                    demandList.add(demand);
+                }
+            }
+
+            this.scenarioCount = supplierList.size();
+            this.scenarioSupplier = new int[scenarioCount];
+            this.scenarioPrev = new int[scenarioCount];
+            this.scenarioDemand = new double[scenarioCount];
+            for (int s = 0; s < scenarioCount; s++) {
+                this.scenarioSupplier[s] = supplierList.get(s);
+                this.scenarioPrev[s] = prevList.get(s);
+                this.scenarioDemand[s] = demandList.get(s);
+            }
+            this.pricingSolver = new PricingEspprcSolver();
+            this.existingRouteKeys = new HashSet<String>();
+            this.nextGeneratedColumnId = 0;
+
+            if (scenarioCount == 0) {
+                this.cplex = null;
+                this.obj = null;
+                this.coverEq = null;
+                this.vehLimit = null;
+                this.artificial = null;
+                return;
+            }
+
+            this.cplex = new IloCplex();
             configureLp(cplex);
 
-            IloObjective obj = cplex.addMinimize();
-            IloRange[] coverEq = new IloRange[scenarioCount];
+            this.obj = cplex.addMinimize();
+            this.coverEq = new IloRange[scenarioCount];
             for (int s = 0; s < scenarioCount; s++) {
-                coverEq[s] = cplex.addEq(cplex.linearNumExpr(), scenarioRhs[s], "RMP_Cover_" + t + "_s" + s);
+                coverEq[s] = cplex.addEq(cplex.linearNumExpr(), 0.0, "RMP_Cover_" + t + "_s" + s);
             }
-            IloRange vehLimit = cplex.addLe(cplex.linearNumExpr(), ins.K, "RMP_Vehicle_" + t);
+            this.vehLimit = cplex.addLe(cplex.linearNumExpr(), ins.K, "RMP_Vehicle_" + t);
 
-            IloNumVar[] artificial = new IloNumVar[scenarioCount];
+            double artificialPenalty = computeArtificialPenalty(ins, scenarioCount);
+            this.artificial = new IloNumVar[scenarioCount];
             for (int s = 0; s < scenarioCount; s++) {
                 IloColumn col = cplex.column(obj, artificialPenalty).and(cplex.column(coverEq[s], 1.0));
                 artificial[s] = cplex.numVar(col, 0.0, Double.MAX_VALUE, "a_" + t + "_s" + s);
             }
-
-            HashSet<String> existingRouteKeys = new HashSet<String>();
 
             for (int s = 0; s < scenarioCount; s++) {
                 int supplier = scenarioSupplier[s];
@@ -178,6 +222,29 @@ public final class PeriodRouteMasterLpSolver {
                         existingRouteKeys,
                         "init_" + t + "_s" + s
                 );
+            }
+        }
+
+        synchronized Result solve(int[] prevVisitBySupplier) throws IloException {
+            if (scenarioCount == 0) {
+                return new Result(
+                        true,
+                        true,
+                        true,
+                        true,
+                        "TrivialZeroRmp",
+                        0.0,
+                        new double[ins.n + 1],
+                        new double[ins.n + 1][ins.l + 2],
+                        0.0,
+                        0,
+                        0
+                );
+            }
+
+            for (int s = 0; s < scenarioCount; s++) {
+                double rhs = (prevVisitBySupplier[scenarioSupplier[s]] == scenarioPrev[s]) ? 1.0 : 0.0;
+                coverEq[s].setBounds(rhs, rhs);
             }
 
             int generatedColumns = 0;
@@ -218,16 +285,28 @@ public final class PeriodRouteMasterLpSolver {
                 ArrayList<ScenarioRouteColumn> newRoutes = pricing.routes;
                 if (newRoutes == null || newRoutes.isEmpty()) {
                     addScenarioRouteColumn(
-                            cplex, obj, coverEq, vehLimit, pricing.route, existingRouteKeys,
-                            "cg_" + t + "_" + generatedColumns
+                            cplex,
+                            obj,
+                            coverEq,
+                            vehLimit,
+                            pricing.route,
+                            existingRouteKeys,
+                            "cg_" + t + "_" + nextGeneratedColumnId
                     );
+                    nextGeneratedColumnId++;
                     generatedColumns++;
                 } else {
                     for (int r = 0; r < newRoutes.size(); r++) {
                         addScenarioRouteColumn(
-                                cplex, obj, coverEq, vehLimit, newRoutes.get(r), existingRouteKeys,
-                                "cg_" + t + "_" + generatedColumns
+                                cplex,
+                                obj,
+                                coverEq,
+                                vehLimit,
+                                newRoutes.get(r),
+                                existingRouteKeys,
+                                "cg_" + t + "_" + nextGeneratedColumnId
                         );
+                        nextGeneratedColumnId++;
                         generatedColumns++;
                     }
                 }
@@ -270,8 +349,13 @@ public final class PeriodRouteMasterLpSolver {
                     generatedColumns,
                     scenarioCount
             );
-        } catch (IloException e) {
-            throw new RuntimeException("Failed to solve route-master LP at t=" + t, e);
+        }
+
+        @Override
+        public void close() {
+            if (cplex != null) {
+                cplex.close();
+            }
         }
     }
 
