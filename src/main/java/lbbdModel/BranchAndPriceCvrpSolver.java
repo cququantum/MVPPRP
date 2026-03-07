@@ -38,6 +38,8 @@ public final class BranchAndPriceCvrpSolver {
     private static final double ARC_SUPPORT_EPS = 1e-9;
     private static final int MAX_NEW_CUTS_PER_NODE = 6;
     private static final int MAX_CONNECTED_CUT_SIZE = 10;
+    private static final int MAX_STRONG_BRANCH_CANDIDATES = 8;
+    private static final double MIN_STRONG_BRANCH_REMAINING_SEC = 5.0;
     private static final boolean LOG_TO_CONSOLE = false;
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
 
@@ -743,7 +745,7 @@ public final class BranchAndPriceCvrpSolver {
 
                 DualData duals = master.extractDuals();
                 PricingEspprcSolver.RoutePricingConstraints pricingConstraints = buildPricingConstraints(active, node, duals);
-                PricingEspprcSolver.Result pricing = pricingSolver.findNegativeRoutes(
+                PricingEspprcSolver.Result pricing = pricingSolver.findNegativeRoutesRelaxedThenExact(
                         ins,
                         active.activeCustomers,
                         active.qLocal,
@@ -787,7 +789,18 @@ public final class BranchAndPriceCvrpSolver {
                 }
 
                 boolean integral = master.isIntegralRouteSolution();
-                BranchDecision decision = integral ? BranchDecision.leaf() : chooseBranchDecision(active, positiveRoutes);
+                BranchDecision decision = integral
+                        ? BranchDecision.leaf()
+                        : chooseBranchDecision(
+                                ins,
+                                t,
+                                active,
+                                node,
+                                positiveRoutes,
+                                master.copyRoutePool(),
+                                master.copyCapacityCuts(),
+                                deadlineNs
+                        );
                 return new NodeLpResult(
                         true,
                         true,
@@ -902,7 +915,16 @@ public final class BranchAndPriceCvrpSolver {
         );
     }
 
-    private static BranchDecision chooseBranchDecision(ActiveSet active, ArrayList<ActiveRouteValue> positiveRoutes) {
+    private BranchDecision chooseBranchDecision(
+            Instance ins,
+            int t,
+            ActiveSet active,
+            BranchNode node,
+            ArrayList<ActiveRouteValue> positiveRoutes,
+            ArrayList<RouteColumn> routePool,
+            ArrayList<CapacityCutDef> capacityCuts,
+            long deadlineNs
+    ) {
         double vehicleValue = 0.0;
         for (int idx = 0; idx < positiveRoutes.size(); idx++) {
             vehicleValue += positiveRoutes.get(idx).value;
@@ -911,6 +933,88 @@ public final class BranchAndPriceCvrpSolver {
             return BranchDecision.vehicle(vehicleValue);
         }
 
+        BranchDecision strongArc = chooseArcByStrongBranching(
+                ins,
+                t,
+                active,
+                node,
+                positiveRoutes,
+                routePool,
+                capacityCuts,
+                deadlineNs
+        );
+        if (strongArc != null) {
+            return strongArc;
+        }
+        return chooseArcHeuristically(active, positiveRoutes);
+    }
+
+    private BranchDecision chooseArcByStrongBranching(
+            Instance ins,
+            int t,
+            ActiveSet active,
+            BranchNode node,
+            ArrayList<ActiveRouteValue> positiveRoutes,
+            ArrayList<RouteColumn> routePool,
+            ArrayList<CapacityCutDef> capacityCuts,
+            long deadlineNs
+    ) {
+        if (active.size() > 62) {
+            return null;
+        }
+        if (remainingSeconds(deadlineNs) < MIN_STRONG_BRANCH_REMAINING_SEC) {
+            return null;
+        }
+
+        double[][] arcFlow = buildArcFlow(active.size(), positiveRoutes);
+        ArrayList<ArcBranch> candidates = buildStrongBranchCandidates(arcFlow);
+        if (candidates.isEmpty()) {
+            return null;
+        }
+
+        ArcBranch bestArc = null;
+        double bestScore = Double.NEGATIVE_INFINITY;
+        for (int idx = 0; idx < candidates.size(); idx++) {
+            if (remainingSeconds(deadlineNs) < 1.0) {
+                break;
+            }
+            ArcBranch candidate = candidates.get(idx);
+            double leftObj = evaluateBranchChild(
+                    ins,
+                    t,
+                    active,
+                    node.childForbidArc(
+                            candidate,
+                            filterAllowedRoutesAfterForbid(routePool, node, candidate, false, active.localIndexByGlobal),
+                            capacityCuts
+                    ),
+                    deadlineNs
+            );
+            double rightObj = evaluateBranchChild(
+                    ins,
+                    t,
+                    active,
+                    node.childForceArc(
+                            candidate,
+                            filterAllowedRoutesAfterForbid(routePool, node, candidate, true, active.localIndexByGlobal),
+                            capacityCuts
+                    ),
+                    deadlineNs
+            );
+
+            if (Double.isInfinite(leftObj) || Double.isInfinite(rightObj)) {
+                return BranchDecision.arc(candidate);
+            }
+            double score = leftObj + rightObj;
+            if (score > bestScore + 1e-9) {
+                bestScore = score;
+                bestArc = candidate;
+            }
+        }
+        return bestArc == null ? null : BranchDecision.arc(bestArc);
+    }
+
+    private static BranchDecision chooseArcHeuristically(ActiveSet active, ArrayList<ActiveRouteValue> positiveRoutes) {
         double[][] arcFlow = buildArcFlow(active.size(), positiveRoutes);
         ArcBranch bestArc = null;
         double bestScore = Double.NEGATIVE_INFINITY;
@@ -960,6 +1064,108 @@ public final class BranchAndPriceCvrpSolver {
             }
         }
         return BranchDecision.leaf();
+    }
+
+    private static ArrayList<ArcBranch> buildStrongBranchCandidates(double[][] arcFlow) {
+        ArrayList<ArcBranch> candidates = new ArrayList<ArcBranch>();
+        for (int from = 0; from < arcFlow.length; from++) {
+            for (int to = 0; to < arcFlow.length; to++) {
+                if (from == to || (from == 0 && to == 0)) {
+                    continue;
+                }
+                double value = arcFlow[from][to];
+                if (!isBranchFraction(value)) {
+                    continue;
+                }
+                candidates.add(new ArcBranch(from, to, value));
+            }
+        }
+        candidates.sort((a, b) -> {
+            double sa = Math.abs(0.5 - a.value);
+            double sb = Math.abs(0.5 - b.value);
+            int cmp = Double.compare(sa, sb);
+            if (cmp != 0) {
+                return cmp;
+            }
+            return Double.compare(b.value, a.value);
+        });
+        if (candidates.size() > MAX_STRONG_BRANCH_CANDIDATES) {
+            return new ArrayList<ArcBranch>(candidates.subList(0, MAX_STRONG_BRANCH_CANDIDATES));
+        }
+        return candidates;
+    }
+
+    private double evaluateBranchChild(
+            Instance ins,
+            int t,
+            ActiveSet active,
+            BranchNode node,
+            long deadlineNs
+    ) {
+        if (node.vehicleLowerBound > node.vehicleUpperBound || node.vehicleLowerBound > active.size()) {
+            return Double.POSITIVE_INFINITY;
+        }
+        int minVehiclesByLoad = (int) Math.ceil((active.totalLoad - EPS) / active.vehicleCapacity);
+        if (minVehiclesByLoad > node.vehicleUpperBound) {
+            return Double.POSITIVE_INFINITY;
+        }
+
+        double artificialPenalty = computeArtificialPenalty(ins, active.size());
+        try (NodeMaster master = new NodeMaster(active, node, t, deadlineNs, artificialPenalty)) {
+            for (int idx = 0; idx < node.seedColumns.size(); idx++) {
+                master.addRoute(node.seedColumns.get(idx), "sb_seed_" + t + "_" + idx);
+            }
+            for (int local = 0; local < active.size(); local++) {
+                RouteColumn singleton = new RouteColumn(
+                        new int[]{active.activeCustomers[local]},
+                        ins.c[0][active.activeCustomers[local]] + ins.c[active.activeCustomers[local]][ins.n + 1],
+                        active.qLocal[local]
+                );
+                master.addRoute(singleton, "sb_single_" + t + "_" + local);
+            }
+
+            while (remainingSeconds(deadlineNs) > 1.0) {
+                boolean solved = master.cplex.solve();
+                String status = master.cplex.getStatus().toString();
+                if (!solved || !status.startsWith("Optimal")) {
+                    return Double.POSITIVE_INFINITY;
+                }
+
+                DualData duals = master.extractDuals();
+                PricingEspprcSolver.RoutePricingConstraints pricingConstraints = buildPricingConstraints(active, node, duals);
+                PricingEspprcSolver.Result pricing = pricingSolver.findNegativeRoutesRelaxedOnly(
+                        ins,
+                        active.activeCustomers,
+                        active.qLocal,
+                        duals.coverDuals,
+                        duals.vehicleLowerDual + duals.vehicleUpperDual,
+                        master.existingRouteKeys,
+                        Math.max(4, Math.min(12, maxColumnsPerPricing(active.size()))),
+                        pricingConstraints
+                );
+                boolean addedColumn = false;
+                if (pricing.routes != null && !pricing.routes.isEmpty()) {
+                    for (int idx = 0; idx < pricing.routes.size(); idx++) {
+                        if (master.addRoute(pricing.routes.get(idx), "sb_cg_" + t + "_" + idx)) {
+                            addedColumn = true;
+                        }
+                    }
+                } else if (pricing.foundNegativeColumn && pricing.route != null) {
+                    addedColumn = master.addRoute(pricing.route, "sb_cg_" + t);
+                }
+                if (addedColumn) {
+                    continue;
+                }
+
+                if (master.hasPositiveCoverArtificial() || master.hasPositiveVehicleLowerSlack() || master.hasPositiveCutSlack()) {
+                    return Double.POSITIVE_INFINITY;
+                }
+                return master.cplex.getObjValue();
+            }
+        } catch (IloException e) {
+            return Double.POSITIVE_INFINITY;
+        }
+        return Double.POSITIVE_INFINITY;
     }
 
     private static ArrayList<RouteColumn> filterAllowedRoutes(
