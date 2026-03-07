@@ -14,6 +14,7 @@ import model.CplexConfig;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.PriorityQueue;
@@ -625,7 +626,17 @@ public final class BranchAndPriceCvrpSolver {
         }
 
         PriorityQueue<PendingNode> queue = new PriorityQueue<PendingNode>(
-                Comparator.comparingDouble((PendingNode x) -> x.lpResult.objective).thenComparingInt(x -> x.node.depth)
+                16,
+                new Comparator<PendingNode>() {
+                    @Override
+                    public int compare(PendingNode a, PendingNode b) {
+                        int cmp = Double.compare(a.lpResult.objective, b.lpResult.objective);
+                        if (cmp != 0) {
+                            return cmp;
+                        }
+                        return Integer.compare(a.node.depth, b.node.depth);
+                    }
+                }
         );
         queue.add(new PendingNode(root, rootLp));
 
@@ -716,7 +727,7 @@ public final class BranchAndPriceCvrpSolver {
             }
         }
 
-        if (Double.isFinite(incumbent)) {
+        if (isFinite(incumbent)) {
             return new Result(true, true, false, "OptimalBP", incumbent, exploredNodes, totalGeneratedColumns);
         }
         return new Result(false, false, false, "BranchPriceNoIncumbent", Double.NaN, exploredNodes, totalGeneratedColumns);
@@ -1114,14 +1125,17 @@ public final class BranchAndPriceCvrpSolver {
                 candidates.add(new ArcBranch(from, to, value));
             }
         }
-        candidates.sort((a, b) -> {
-            double sa = Math.abs(0.5 - a.value);
-            double sb = Math.abs(0.5 - b.value);
-            int cmp = Double.compare(sa, sb);
-            if (cmp != 0) {
-                return cmp;
+        Collections.sort(candidates, new Comparator<ArcBranch>() {
+            @Override
+            public int compare(ArcBranch a, ArcBranch b) {
+                double sa = Math.abs(0.5 - a.value);
+                double sb = Math.abs(0.5 - b.value);
+                int cmp = Double.compare(sa, sb);
+                if (cmp != 0) {
+                    return cmp;
+                }
+                return Double.compare(b.value, a.value);
             }
-            return Double.compare(b.value, a.value);
         });
         if (candidates.size() > MAX_STRONG_BRANCH_CANDIDATES) {
             return new ArrayList<ArcBranch>(candidates.subList(0, MAX_STRONG_BRANCH_CANDIDATES));
@@ -1552,10 +1566,14 @@ public final class BranchAndPriceCvrpSolver {
     }
 
     private static Result unresolvedResult(String status, int exploredNodes, int totalGeneratedColumns, double incumbent) {
-        if (Double.isFinite(incumbent)) {
+        if (isFinite(incumbent)) {
             return new Result(true, false, false, status + "WithIncumbent", incumbent, exploredNodes, totalGeneratedColumns);
         }
         return new Result(false, false, false, status, Double.NaN, exploredNodes, totalGeneratedColumns);
+    }
+
+    private static boolean isFinite(double value) {
+        return !Double.isNaN(value) && !Double.isInfinite(value);
     }
 
     private static boolean isPastDeadline(long deadlineNs) {

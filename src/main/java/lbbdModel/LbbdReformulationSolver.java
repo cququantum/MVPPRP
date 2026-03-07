@@ -643,6 +643,8 @@ public final class LbbdReformulationSolver {
                     Future<PeriodRouteMasterLpSolver.Result>[] rmpFutures = (rmpExecutor != null)
                             ? new Future[ins.l + 1] : null;
                     int[][] prevVisitArgPeriods = new int[ins.l + 1][];
+                    final PeriodRouteMasterLpSolver finalRmpLpSolver = rmpLpSolver;
+                    final MasterPoint finalPoint = point;
 
                     long rmpStartNs = System.nanoTime();
                     for (int idx = 0; idx < selectedPeriods.length; idx++) {
@@ -665,11 +667,11 @@ public final class LbbdReformulationSolver {
                             rmpFutures[bestT] = rmpExecutor.submit(new Callable<PeriodRouteMasterLpSolver.Result>() {
                                 @Override
                                 public PeriodRouteMasterLpSolver.Result call() {
-                                    return rmpLpSolver.solve(
+                                    return finalRmpLpSolver.solve(
                                             ins,
                                             period,
-                                            point.qBar[period],
-                                            point.zBar[period],
+                                            finalPoint.qBar[period],
+                                            finalPoint.zBar[period],
                                             prevVisitForPeriod
                                     );
                                 }

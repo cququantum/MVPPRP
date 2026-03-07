@@ -21,6 +21,10 @@ public final class PricingEspprcSolver {
     private static final int SUPERSET_CLEANUP_MAX_EXTRA_BITS = 7;
     private static final long BIDIRECTIONAL_RELAXED_TIME_BUDGET_NS = 300_000_000L;
 
+    private static boolean isFinite(double value) {
+        return !Double.isNaN(value) && !Double.isInfinite(value);
+    }
+
     /**
      * Optional branch-node route restrictions for branch-and-price.
      * For a customer pair (i,j):
@@ -431,7 +435,7 @@ public final class PricingEspprcSolver {
             if (Double.isNaN(completionLb)) {
                 return true;
             }
-            if (!Double.isFinite(completionLb)) {
+            if (!isFinite(completionLb)) {
                 return false;
             }
             double routeLowerBound = label.partialReducedCost + completionLb - dualU0;
@@ -2277,7 +2281,7 @@ public final class PricingEspprcSolver {
             if (Double.isNaN(completionLb)) {
                 return true;
             }
-            if (!Double.isFinite(completionLb)) {
+            if (!isFinite(completionLb)) {
                 return false;
             }
             double routeLowerBound = label.partialReducedCost + completionLb - dualU0;
@@ -2292,7 +2296,7 @@ public final class PricingEspprcSolver {
             if (Double.isNaN(completionLb)) {
                 return true;
             }
-            if (!Double.isFinite(completionLb)) {
+            if (!isFinite(completionLb)) {
                 return false;
             }
             double routeLowerBound = label.partialReducedCost + completionLb - dualU0;
