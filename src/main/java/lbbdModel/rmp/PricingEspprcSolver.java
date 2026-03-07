@@ -33,25 +33,68 @@ public final class PricingEspprcSolver {
         final long[] forbiddenWithLocalLong;
         final BitSet[] requiredWithLocalBits;
         final BitSet[] forbiddenWithLocalBits;
+        final boolean[] forbiddenStartLocal;
+        final boolean[] forbiddenReturnLocal;
+        final boolean[][] forbiddenArcLocal;
+        final double[] returnArcDualLocal;
+        final double[][] arcDualLocal;
+        final boolean hasArcDuals;
 
         private RoutePricingConstraints(
                 long[] requiredWithLocalLong,
                 long[] forbiddenWithLocalLong,
                 BitSet[] requiredWithLocalBits,
-                BitSet[] forbiddenWithLocalBits
+                BitSet[] forbiddenWithLocalBits,
+                boolean[] forbiddenStartLocal,
+                boolean[] forbiddenReturnLocal,
+                boolean[][] forbiddenArcLocal,
+                double[] returnArcDualLocal,
+                double[][] arcDualLocal
         ) {
             this.requiredWithLocalLong = requiredWithLocalLong;
             this.forbiddenWithLocalLong = forbiddenWithLocalLong;
             this.requiredWithLocalBits = requiredWithLocalBits;
             this.forbiddenWithLocalBits = forbiddenWithLocalBits;
+            this.forbiddenStartLocal = forbiddenStartLocal;
+            this.forbiddenReturnLocal = forbiddenReturnLocal;
+            this.forbiddenArcLocal = forbiddenArcLocal;
+            this.returnArcDualLocal = returnArcDualLocal;
+            this.arcDualLocal = arcDualLocal;
+            this.hasArcDuals = returnArcDualLocal != null || arcDualLocal != null;
         }
 
         public static RoutePricingConstraints fromLongMasks(long[] requiredWithLocalLong, long[] forbiddenWithLocalLong) {
-            return new RoutePricingConstraints(requiredWithLocalLong, forbiddenWithLocalLong, null, null);
+            return new RoutePricingConstraints(requiredWithLocalLong, forbiddenWithLocalLong, null, null,
+                    null, null, null, null, null);
         }
 
         public static RoutePricingConstraints fromBitSets(BitSet[] requiredWithLocalBits, BitSet[] forbiddenWithLocalBits) {
-            return new RoutePricingConstraints(null, null, requiredWithLocalBits, forbiddenWithLocalBits);
+            return new RoutePricingConstraints(null, null, requiredWithLocalBits, forbiddenWithLocalBits,
+                    null, null, null, null, null);
+        }
+
+        public static RoutePricingConstraints create(
+                long[] requiredWithLocalLong,
+                long[] forbiddenWithLocalLong,
+                BitSet[] requiredWithLocalBits,
+                BitSet[] forbiddenWithLocalBits,
+                boolean[] forbiddenStartLocal,
+                boolean[] forbiddenReturnLocal,
+                boolean[][] forbiddenArcLocal,
+                double[] returnArcDualLocal,
+                double[][] arcDualLocal
+        ) {
+            return new RoutePricingConstraints(
+                    requiredWithLocalLong,
+                    forbiddenWithLocalLong,
+                    requiredWithLocalBits,
+                    forbiddenWithLocalBits,
+                    forbiddenStartLocal,
+                    forbiddenReturnLocal,
+                    forbiddenArcLocal,
+                    returnArcDualLocal,
+                    arcDualLocal
+            );
         }
     }
 
@@ -227,6 +270,42 @@ public final class PricingEspprcSolver {
         abstract boolean canExtend(AbstractLabel label, int nextLocal);
         abstract boolean isCompleteRouteAllowed(AbstractLabel label);
 
+        final boolean isStartArcAllowed(int startLocal) {
+            return constraints == null
+                    || constraints.forbiddenStartLocal == null
+                    || !constraints.forbiddenStartLocal[startLocal];
+        }
+
+        final boolean isInternalArcAllowed(int fromLocal, int toLocal) {
+            return constraints == null
+                    || constraints.forbiddenArcLocal == null
+                    || !constraints.forbiddenArcLocal[fromLocal][toLocal];
+        }
+
+        final boolean isReturnArcAllowed(int lastLocal) {
+            return constraints == null
+                    || constraints.forbiddenReturnLocal == null
+                    || !constraints.forbiddenReturnLocal[lastLocal];
+        }
+
+        final double transitionArcDual(int fromLocal, int toLocal) {
+            if (constraints == null || constraints.arcDualLocal == null) {
+                return 0.0;
+            }
+            return constraints.arcDualLocal[fromLocal][toLocal];
+        }
+
+        final double returnArcDual(int lastLocal) {
+            if (constraints == null || constraints.returnArcDualLocal == null) {
+                return 0.0;
+            }
+            return constraints.returnArcDualLocal[lastLocal];
+        }
+
+        final boolean hasArcDuals() {
+            return constraints != null && constraints.hasArcDuals;
+        }
+
         final ArrayList<RouteColumn> getCollectedRoutes() {
             ArrayList<RouteColumn> out = new ArrayList<RouteColumn>(collected.size());
             for (int i = 0; i < collected.size(); i++) {
@@ -241,7 +320,7 @@ public final class PricingEspprcSolver {
             }
             int lastGlobalNode = customers[label.lastLocal];
             double fullCost = label.travelCost + ins.c[lastGlobalNode][ins.n + 1];
-            double reducedCost = fullCost - label.dualGain - dualU0;
+            double reducedCost = fullCost - label.dualGain - label.arcDualGain - dualU0 - returnArcDual(label.lastLocal);
             boolean canImproveBest = reducedCost < bestReducedCost - DOM_EPS;
             boolean canCollect = maxColumns > 0 && reducedCost < -RC_EPS
                     && (collected.size() < maxColumns
@@ -321,6 +400,7 @@ public final class PricingEspprcSolver {
         final double load;
         final double travelCost; // depot -> ... -> last (without return arc)
         final double dualGain;   // sum duals for visited customers
+        final double arcDualGain; // sum of cut duals on traversed arcs excluding return arc
         final double partialReducedCost; // travelCost - dualGain
         final AbstractLabel pred;
 
@@ -330,6 +410,7 @@ public final class PricingEspprcSolver {
                 double load,
                 double travelCost,
                 double dualGain,
+                double arcDualGain,
                 AbstractLabel pred
         ) {
             this.lastLocal = lastLocal;
@@ -337,7 +418,8 @@ public final class PricingEspprcSolver {
             this.load = load;
             this.travelCost = travelCost;
             this.dualGain = dualGain;
-            this.partialReducedCost = travelCost - dualGain;
+            this.arcDualGain = arcDualGain;
+            this.partialReducedCost = travelCost - dualGain - arcDualGain;
             this.pred = pred;
         }
     }
@@ -387,7 +469,7 @@ public final class PricingEspprcSolver {
                 long mask = (1L << start);
                 int g = customers[start];
                 LongLabel startLabel = new LongLabel(
-                        start, 1, q[start], ins.c[0][g], dual[start], null, mask
+                        start, 1, q[start], ins.c[0][g], dual[start], 0.0, null, mask
                 );
                 if (register(startLabel)) {
                     queue.addLast(startLabel);
@@ -426,6 +508,7 @@ public final class PricingEspprcSolver {
                             newLoad,
                             cur.travelCost + ins.c[curGlobal][nxtGlobal],
                             cur.dualGain + dual[nxt],
+                            cur.arcDualGain + transitionArcDual(cur.lastLocal, nxt),
                             cur,
                             cur.visitedMask | bit
                     );
@@ -438,11 +521,14 @@ public final class PricingEspprcSolver {
 
         @Override
         boolean isStartAllowed(int startLocal) {
-            return true;
+            return isStartArcAllowed(startLocal);
         }
 
         @Override
         boolean canExtend(AbstractLabel label, int nextLocal) {
+            if (!isInternalArcAllowed(label.lastLocal, nextLocal)) {
+                return false;
+            }
             if (constraints == null || constraints.forbiddenWithLocalLong == null) {
                 return true;
             }
@@ -452,6 +538,9 @@ public final class PricingEspprcSolver {
 
         @Override
         boolean isCompleteRouteAllowed(AbstractLabel label) {
+            if (!isReturnArcAllowed(label.lastLocal)) {
+                return false;
+            }
             if (constraints == null || constraints.requiredWithLocalLong == null) {
                 return true;
             }
@@ -471,7 +560,7 @@ public final class PricingEspprcSolver {
             HashMap<Long, LongLabel> exactMap = bestByMaskAtLast[label.lastLocal];
             LongLabel incumbent = exactMap.get(label.visitedMask);
             if (incumbent != null) {
-                if (incumbent.travelCost <= label.travelCost + DOM_EPS) {
+                if (incumbent.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
                     return false;
                 }
             }
@@ -529,6 +618,9 @@ public final class PricingEspprcSolver {
         }
 
         private boolean cannotBeatBest(LongLabel label) {
+            if (hasArcDuals()) {
+                return false;
+            }
             if (bestReducedCost == Double.POSITIVE_INFINITY) {
                 return false;
             }
@@ -611,10 +703,11 @@ public final class PricingEspprcSolver {
                 double load,
                 double travelCost,
                 double dualGain,
+                double arcDualGain,
                 AbstractLabel pred,
                 long visitedMask
         ) {
-            super(lastLocal, depth, load, travelCost, dualGain, pred);
+            super(lastLocal, depth, load, travelCost, dualGain, arcDualGain, pred);
             this.visitedMask = visitedMask;
         }
     }
@@ -655,7 +748,7 @@ public final class PricingEspprcSolver {
                 visited.set(start);
                 int g = customers[start];
                 BitSetLabel startLabel = new BitSetLabel(
-                        start, 1, q[start], ins.c[0][g], dual[start], null, visited
+                        start, 1, q[start], ins.c[0][g], dual[start], 0.0, null, visited
                 );
                 if (register(startLabel)) {
                     queue.addLast(startLabel);
@@ -687,6 +780,7 @@ public final class PricingEspprcSolver {
                                 newLoad,
                                 cur.travelCost + ins.c[curGlobal][nxtGlobal],
                                 cur.dualGain + dual[nxt],
+                                cur.arcDualGain + transitionArcDual(cur.lastLocal, nxt),
                                 cur,
                                 nextVisited
                         );
@@ -701,11 +795,14 @@ public final class PricingEspprcSolver {
 
         @Override
         boolean isStartAllowed(int startLocal) {
-            return true;
+            return isStartArcAllowed(startLocal);
         }
 
         @Override
         boolean canExtend(AbstractLabel label, int nextLocal) {
+            if (!isInternalArcAllowed(label.lastLocal, nextLocal)) {
+                return false;
+            }
             if (constraints == null || constraints.forbiddenWithLocalBits == null) {
                 return true;
             }
@@ -721,6 +818,9 @@ public final class PricingEspprcSolver {
 
         @Override
         boolean isCompleteRouteAllowed(AbstractLabel label) {
+            if (!isReturnArcAllowed(label.lastLocal)) {
+                return false;
+            }
             if (constraints == null || constraints.requiredWithLocalBits == null) {
                 return true;
             }
@@ -744,7 +844,7 @@ public final class PricingEspprcSolver {
             BitSetStateKey key = new BitSetStateKey(label.lastLocal, label.visited);
             BitSetLabel incumbent = bestByState.get(key);
             if (incumbent != null) {
-                if (incumbent.travelCost <= label.travelCost + DOM_EPS) {
+                if (incumbent.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
                     return false;
                 }
             }
@@ -767,10 +867,11 @@ public final class PricingEspprcSolver {
                 double load,
                 double travelCost,
                 double dualGain,
+                double arcDualGain,
                 AbstractLabel pred,
                 BitSet visited
         ) {
-            super(lastLocal, depth, load, travelCost, dualGain, pred);
+            super(lastLocal, depth, load, travelCost, dualGain, arcDualGain, pred);
             this.visited = visited;
         }
     }

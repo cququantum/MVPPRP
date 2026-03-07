@@ -21,22 +21,23 @@ import java.util.PriorityQueue;
 /**
  * Exact CVRP subproblem solver by branch-and-price.
  *
- * Master problem:
- * - set-partitioning over route columns
- * - cover each active customer exactly once
- * - use at most K vehicles
+ * This implementation follows the LRP BP structure:
+ * - set-partitioning/covering style route master solved by CPLEX LP
+ * - column generation with exact pricing
+ * - vehicle-count branching first
+ * - arc branching second
+ * - node-local capacity-cut separation
  *
- * Pricing:
- * - exact ESPPRC enumeration already implemented in {@link PricingEspprcSolver}
- *
- * Branching:
- * - Ryan-Foster style on customer pairs:
- *   together: customers i and j must belong to the same route
- *   separate: customers i and j cannot belong to the same route
+ * The surrounding LBBD interface remains unchanged.
  */
 public final class BranchAndPriceCvrpSolver {
     private static final double EPS = 1e-7;
     private static final double ART_EPS = 1e-7;
+    private static final double CUT_VIOL_EPS = 5e-2;
+    private static final double FRAC_DISTANCE_LIMIT = 0.4;
+    private static final double ARC_SUPPORT_EPS = 1e-9;
+    private static final int MAX_NEW_CUTS_PER_NODE = 6;
+    private static final int MAX_CONNECTED_CUT_SIZE = 10;
     private static final boolean LOG_TO_CONSOLE = false;
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
 
@@ -68,17 +69,25 @@ public final class BranchAndPriceCvrpSolver {
         }
     }
 
+    private enum BranchType {
+        LEAF,
+        VEHICLE,
+        ARC
+    }
+
     private static final class ActiveSet {
         final int[] activeCustomers;
         final double[] qLocal;
         final int[] localIndexByGlobal;
         final double totalLoad;
+        final double vehicleCapacity;
 
-        ActiveSet(int[] activeCustomers, double[] qLocal, int[] localIndexByGlobal, double totalLoad) {
+        ActiveSet(int[] activeCustomers, double[] qLocal, int[] localIndexByGlobal, double totalLoad, double vehicleCapacity) {
             this.activeCustomers = activeCustomers;
             this.qLocal = qLocal;
             this.localIndexByGlobal = localIndexByGlobal;
             this.totalLoad = totalLoad;
+            this.vehicleCapacity = vehicleCapacity;
         }
 
         int size() {
@@ -86,54 +95,155 @@ public final class BranchAndPriceCvrpSolver {
         }
     }
 
-    private static final class BranchPair {
-        final int customerA;
-        final int customerB;
-        final double sameRouteValue;
+    private static final class ArcBranch {
+        final int fromNode; // 0 = depot, 1..m = local customers
+        final int toNode;   // 0 = depot, 1..m = local customers
+        final double value;
 
-        BranchPair(int customerA, int customerB, double sameRouteValue) {
-            this.customerA = customerA;
-            this.customerB = customerB;
-            this.sameRouteValue = sameRouteValue;
+        ArcBranch(int fromNode, int toNode, double value) {
+            this.fromNode = fromNode;
+            this.toNode = toNode;
+            this.value = value;
+        }
+    }
+
+    private static final class BranchDecision {
+        final BranchType type;
+        final double vehicleValue;
+        final ArcBranch arc;
+
+        private BranchDecision(BranchType type, double vehicleValue, ArcBranch arc) {
+            this.type = type;
+            this.vehicleValue = vehicleValue;
+            this.arc = arc;
+        }
+
+        static BranchDecision leaf() {
+            return new BranchDecision(BranchType.LEAF, Double.NaN, null);
+        }
+
+        static BranchDecision vehicle(double vehicleValue) {
+            return new BranchDecision(BranchType.VEHICLE, vehicleValue, null);
+        }
+
+        static BranchDecision arc(ArcBranch arc) {
+            return new BranchDecision(BranchType.ARC, Double.NaN, arc);
+        }
+    }
+
+    private static final class CapacityCutDef {
+        final BitSet members; // customer locals 0..m-1
+        final int[] locals;
+        final double rhs;
+        final String signature;
+
+        CapacityCutDef(BitSet members, int[] locals, double rhs, String signature) {
+            this.members = members;
+            this.locals = locals;
+            this.rhs = rhs;
+            this.signature = signature;
         }
     }
 
     private static final class BranchNode {
-        final HashSet<Long> togetherPairs;
-        final HashSet<Long> separatePairs;
-        final ArrayList<RouteColumn> seedColumns;
         final int depth;
+        final int vehicleLowerBound;
+        final int vehicleUpperBound;
+        final boolean[][] forbiddenArcs; // local node ids 0..m, 0 = depot
+        final ArrayList<RouteColumn> seedColumns;
+        final ArrayList<CapacityCutDef> capacityCuts;
 
         BranchNode(
-                HashSet<Long> togetherPairs,
-                HashSet<Long> separatePairs,
+                int depth,
+                int vehicleLowerBound,
+                int vehicleUpperBound,
+                boolean[][] forbiddenArcs,
                 ArrayList<RouteColumn> seedColumns,
-                int depth
+                ArrayList<CapacityCutDef> capacityCuts
         ) {
-            this.togetherPairs = togetherPairs;
-            this.separatePairs = separatePairs;
-            this.seedColumns = seedColumns;
             this.depth = depth;
+            this.vehicleLowerBound = vehicleLowerBound;
+            this.vehicleUpperBound = vehicleUpperBound;
+            this.forbiddenArcs = forbiddenArcs;
+            this.seedColumns = seedColumns;
+            this.capacityCuts = capacityCuts;
         }
 
-        BranchNode childTogether(BranchPair pair, ArrayList<RouteColumn> filteredSeedColumns) {
-            long key = pairKey(pair.customerA, pair.customerB);
-            if (separatePairs.contains(key)) {
-                return null;
-            }
-            HashSet<Long> newTogether = new HashSet<Long>(togetherPairs);
-            newTogether.add(key);
-            return new BranchNode(newTogether, new HashSet<Long>(separatePairs), filteredSeedColumns, depth + 1);
+        static BranchNode root(int localNodeCount, int vehicleUpperBound, ArrayList<RouteColumn> seedColumns) {
+            return new BranchNode(
+                    0,
+                    0,
+                    vehicleUpperBound,
+                    new boolean[localNodeCount + 1][localNodeCount + 1],
+                    seedColumns,
+                    new ArrayList<CapacityCutDef>()
+            );
         }
 
-        BranchNode childSeparate(BranchPair pair, ArrayList<RouteColumn> filteredSeedColumns) {
-            long key = pairKey(pair.customerA, pair.customerB);
-            if (togetherPairs.contains(key)) {
-                return null;
+        BranchNode childVehicleUpper(int newUpperBound, ArrayList<RouteColumn> childSeeds, ArrayList<CapacityCutDef> childCuts) {
+            return new BranchNode(
+                    depth + 1,
+                    vehicleLowerBound,
+                    newUpperBound,
+                    copyForbiddenArcs(forbiddenArcs),
+                    childSeeds,
+                    childCuts
+            );
+        }
+
+        BranchNode childVehicleLower(int newLowerBound, ArrayList<RouteColumn> childSeeds, ArrayList<CapacityCutDef> childCuts) {
+            return new BranchNode(
+                    depth + 1,
+                    newLowerBound,
+                    vehicleUpperBound,
+                    copyForbiddenArcs(forbiddenArcs),
+                    childSeeds,
+                    childCuts
+            );
+        }
+
+        BranchNode childForbidArc(ArcBranch arc, ArrayList<RouteColumn> childSeeds, ArrayList<CapacityCutDef> childCuts) {
+            boolean[][] childForbid = copyForbiddenArcs(forbiddenArcs);
+            forbidArc(childForbid, arc.fromNode, arc.toNode);
+            return new BranchNode(depth + 1, vehicleLowerBound, vehicleUpperBound, childForbid, childSeeds, childCuts);
+        }
+
+        BranchNode childForceArc(ArcBranch arc, ArrayList<RouteColumn> childSeeds, ArrayList<CapacityCutDef> childCuts) {
+            boolean[][] childForbid = copyForbiddenArcs(forbiddenArcs);
+            int nodeCount = childForbid.length - 1;
+            if (arc.fromNode != 0) {
+                for (int to = 0; to <= nodeCount; to++) {
+                    if (to != arc.toNode) {
+                        forbidArc(childForbid, arc.fromNode, to);
+                    }
+                }
             }
-            HashSet<Long> newSeparate = new HashSet<Long>(separatePairs);
-            newSeparate.add(key);
-            return new BranchNode(new HashSet<Long>(togetherPairs), newSeparate, filteredSeedColumns, depth + 1);
+            if (arc.toNode != 0) {
+                for (int from = 0; from <= nodeCount; from++) {
+                    if (from != arc.fromNode) {
+                        forbidArc(childForbid, from, arc.toNode);
+                    }
+                }
+            }
+            return new BranchNode(depth + 1, vehicleLowerBound, vehicleUpperBound, childForbid, childSeeds, childCuts);
+        }
+
+        private static boolean[][] copyForbiddenArcs(boolean[][] source) {
+            boolean[][] copy = new boolean[source.length][];
+            for (int i = 0; i < source.length; i++) {
+                copy[i] = Arrays.copyOf(source[i], source[i].length);
+            }
+            return copy;
+        }
+
+        private static void forbidArc(boolean[][] matrix, int fromNode, int toNode) {
+            if (fromNode < 0 || toNode < 0 || fromNode >= matrix.length || toNode >= matrix.length) {
+                return;
+            }
+            if (fromNode == toNode) {
+                return;
+            }
+            matrix[fromNode][toNode] = true;
         }
     }
 
@@ -141,11 +251,13 @@ public final class BranchAndPriceCvrpSolver {
         final RouteColumn route;
         final IloNumVar var;
         final int[] localCustomers;
+        final int[] localNodePath;
 
-        RouteVarData(RouteColumn route, IloNumVar var, int[] localCustomers) {
+        RouteVarData(RouteColumn route, IloNumVar var, int[] localCustomers, int[] localNodePath) {
             this.route = route;
             this.var = var;
             this.localCustomers = localCustomers;
+            this.localNodePath = localNodePath;
         }
     }
 
@@ -153,11 +265,47 @@ public final class BranchAndPriceCvrpSolver {
         final RouteColumn route;
         final double value;
         final int[] localCustomers;
+        final int[] localNodePath;
 
-        ActiveRouteValue(RouteColumn route, double value, int[] localCustomers) {
+        ActiveRouteValue(RouteColumn route, double value, int[] localCustomers, int[] localNodePath) {
             this.route = route;
             this.value = value;
             this.localCustomers = localCustomers;
+            this.localNodePath = localNodePath;
+        }
+    }
+
+    private static final class CutRowData {
+        final CapacityCutDef def;
+        final IloRange range;
+        final IloNumVar slack;
+
+        CutRowData(CapacityCutDef def, IloRange range, IloNumVar slack) {
+            this.def = def;
+            this.range = range;
+            this.slack = slack;
+        }
+    }
+
+    private static final class DualData {
+        final double[] coverDuals;
+        final double vehicleLowerDual;
+        final double vehicleUpperDual;
+        final double[] returnArcDual;
+        final double[][] internalArcDual;
+
+        DualData(
+                double[] coverDuals,
+                double vehicleLowerDual,
+                double vehicleUpperDual,
+                double[] returnArcDual,
+                double[][] internalArcDual
+        ) {
+            this.coverDuals = coverDuals;
+            this.vehicleLowerDual = vehicleLowerDual;
+            this.vehicleUpperDual = vehicleUpperDual;
+            this.returnArcDual = returnArcDual;
+            this.internalArcDual = internalArcDual;
         }
     }
 
@@ -168,8 +316,9 @@ public final class BranchAndPriceCvrpSolver {
         final String status;
         final double objective;
         final boolean integral;
-        final BranchPair branchPair;
-        final ArrayList<RouteColumn> generatedRoutes;
+        final BranchDecision branchDecision;
+        final ArrayList<RouteColumn> routePool;
+        final ArrayList<CapacityCutDef> capacityCuts;
         final int generatedColumns;
 
         NodeLpResult(
@@ -179,8 +328,9 @@ public final class BranchAndPriceCvrpSolver {
                 String status,
                 double objective,
                 boolean integral,
-                BranchPair branchPair,
-                ArrayList<RouteColumn> generatedRoutes,
+                BranchDecision branchDecision,
+                ArrayList<RouteColumn> routePool,
+                ArrayList<CapacityCutDef> capacityCuts,
                 int generatedColumns
         ) {
             this.feasible = feasible;
@@ -189,8 +339,9 @@ public final class BranchAndPriceCvrpSolver {
             this.status = status;
             this.objective = objective;
             this.integral = integral;
-            this.branchPair = branchPair;
-            this.generatedRoutes = generatedRoutes;
+            this.branchDecision = branchDecision;
+            this.routePool = routePool;
+            this.capacityCuts = capacityCuts;
             this.generatedColumns = generatedColumns;
         }
     }
@@ -205,11 +356,209 @@ public final class BranchAndPriceCvrpSolver {
         }
     }
 
+    private static final class NodeMaster implements AutoCloseable {
+        final IloCplex cplex;
+        final IloObjective obj;
+        final ActiveSet active;
+        final boolean[][] forbiddenArcs;
+        final IloRange[] coverEq;
+        final IloRange vehicleLower;
+        final IloRange vehicleUpper;
+        final IloNumVar[] coverArtificial;
+        final IloNumVar vehicleLowerSlack;
+        final ArrayList<CutRowData> cutRows;
+        final ArrayList<RouteVarData> routeVars;
+        final ArrayList<RouteColumn> routePool;
+        final HashSet<String> existingRouteKeys;
+        final int[] localIndexByGlobal;
+        final double artificialPenalty;
+
+        NodeMaster(ActiveSet active, BranchNode node, int t, long deadlineNs, double artificialPenalty) throws IloException {
+            this.active = active;
+            this.forbiddenArcs = node.forbiddenArcs;
+            this.localIndexByGlobal = active.localIndexByGlobal;
+            this.artificialPenalty = artificialPenalty;
+            this.cplex = new IloCplex();
+            configureLp(cplex, remainingSeconds(deadlineNs));
+
+            int customerCount = active.size();
+            this.obj = cplex.addMinimize();
+            this.coverEq = new IloRange[customerCount];
+            for (int local = 0; local < customerCount; local++) {
+                coverEq[local] = cplex.addEq(cplex.linearNumExpr(), 1.0, "BP_Cover_" + t + "_" + local);
+            }
+            this.vehicleLower = cplex.addGe(cplex.linearNumExpr(), node.vehicleLowerBound, "BP_VehLB_" + t);
+            this.vehicleUpper = cplex.addLe(cplex.linearNumExpr(), node.vehicleUpperBound, "BP_VehUB_" + t);
+
+            this.coverArtificial = new IloNumVar[customerCount];
+            for (int local = 0; local < customerCount; local++) {
+                IloColumn col = cplex.column(obj, artificialPenalty).and(cplex.column(coverEq[local], 1.0));
+                coverArtificial[local] = cplex.numVar(col, 0.0, Double.MAX_VALUE, "bp_art_" + t + "_" + local);
+            }
+            IloColumn vlbCol = cplex.column(obj, artificialPenalty).and(cplex.column(vehicleLower, 1.0));
+            this.vehicleLowerSlack = cplex.numVar(vlbCol, 0.0, Double.MAX_VALUE, "bp_vlb_art_" + t);
+
+            this.cutRows = new ArrayList<CutRowData>();
+            this.routeVars = new ArrayList<RouteVarData>();
+            this.routePool = new ArrayList<RouteColumn>();
+            this.existingRouteKeys = new HashSet<String>();
+
+            for (int idx = 0; idx < node.capacityCuts.size(); idx++) {
+                addCapacityCut(node.capacityCuts.get(idx), "bp_cut_" + t + "_" + idx);
+            }
+        }
+
+        boolean addRoute(RouteColumn route, String varName) throws IloException {
+            if (route == null) {
+                return false;
+            }
+            String key = route.key();
+            if (existingRouteKeys.contains(key)) {
+                return false;
+            }
+            int[] localNodePath = toLocalNodePath(route, localIndexByGlobal);
+            if (localNodePath == null || !isRouteAllowed(localNodePath, forbiddenArcs)) {
+                return false;
+            }
+
+            existingRouteKeys.add(key);
+            int[] localCustomers = extractLocalCustomers(localNodePath);
+            routePool.add(route);
+
+            IloColumn col = cplex.column(obj, route.cost)
+                    .and(cplex.column(vehicleLower, 1.0))
+                    .and(cplex.column(vehicleUpper, 1.0));
+            for (int idx = 0; idx < localCustomers.length; idx++) {
+                col = col.and(cplex.column(coverEq[localCustomers[idx]], 1.0));
+            }
+            for (int cutIdx = 0; cutIdx < cutRows.size(); cutIdx++) {
+                CutRowData cut = cutRows.get(cutIdx);
+                int coeff = countOutgoingCrossings(localNodePath, cut.def.members);
+                if (coeff > 0) {
+                    col = col.and(cplex.column(cut.range, coeff));
+                }
+            }
+
+            IloNumVar var = cplex.numVar(col, 0.0, Double.MAX_VALUE, "xi_bp_" + varName);
+            routeVars.add(new RouteVarData(route, var, localCustomers, localNodePath));
+            return true;
+        }
+
+        void addCapacityCut(CapacityCutDef cut, String name) throws IloException {
+            IloRange range = cplex.addGe(cplex.linearNumExpr(), cut.rhs, name);
+            for (int idx = 0; idx < routeVars.size(); idx++) {
+                RouteVarData data = routeVars.get(idx);
+                int coeff = countOutgoingCrossings(data.localNodePath, cut.members);
+                if (coeff > 0) {
+                    cplex.setLinearCoef(range, data.var, coeff);
+                }
+            }
+            IloColumn slackCol = cplex.column(obj, artificialPenalty).and(cplex.column(range, 1.0));
+            IloNumVar slack = cplex.numVar(slackCol, 0.0, Double.MAX_VALUE, name + "_art");
+            cutRows.add(new CutRowData(cut, range, slack));
+        }
+
+        boolean hasPositiveCoverArtificial() throws IloException {
+            for (int local = 0; local < coverArtificial.length; local++) {
+                if (cplex.getValue(coverArtificial[local]) > ART_EPS) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        boolean hasPositiveVehicleLowerSlack() throws IloException {
+            return cplex.getValue(vehicleLowerSlack) > ART_EPS;
+        }
+
+        boolean hasPositiveCutSlack() throws IloException {
+            for (int idx = 0; idx < cutRows.size(); idx++) {
+                if (cplex.getValue(cutRows.get(idx).slack) > ART_EPS) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        DualData extractDuals() throws IloException {
+            int customerCount = active.size();
+            double[] coverDuals = new double[customerCount];
+            for (int local = 0; local < customerCount; local++) {
+                coverDuals[local] = cplex.getDual(coverEq[local]);
+            }
+            double vehicleLowerDual = cplex.getDual(vehicleLower);
+            double vehicleUpperDual = cplex.getDual(vehicleUpper);
+            double[] returnArcDual = new double[customerCount];
+            double[][] internalArcDual = new double[customerCount][customerCount];
+            for (int idx = 0; idx < cutRows.size(); idx++) {
+                CutRowData cut = cutRows.get(idx);
+                double dual = cplex.getDual(cut.range);
+                if (Math.abs(dual) <= 1e-12) {
+                    continue;
+                }
+                for (int a = 0; a < cut.def.locals.length; a++) {
+                    int from = cut.def.locals[a];
+                    returnArcDual[from] += dual;
+                    for (int to = 0; to < customerCount; to++) {
+                        if (!cut.def.members.get(to)) {
+                            internalArcDual[from][to] += dual;
+                        }
+                    }
+                }
+            }
+            return new DualData(coverDuals, vehicleLowerDual, vehicleUpperDual, returnArcDual, internalArcDual);
+        }
+
+        ArrayList<ActiveRouteValue> collectPositiveRoutes() throws IloException {
+            ArrayList<ActiveRouteValue> positiveRoutes = new ArrayList<ActiveRouteValue>();
+            for (int idx = 0; idx < routeVars.size(); idx++) {
+                RouteVarData data = routeVars.get(idx);
+                double value = cplex.getValue(data.var);
+                if (value > EPS) {
+                    positiveRoutes.add(new ActiveRouteValue(data.route, value, data.localCustomers, data.localNodePath));
+                }
+            }
+            return positiveRoutes;
+        }
+
+        boolean isIntegralRouteSolution() throws IloException {
+            for (int idx = 0; idx < routeVars.size(); idx++) {
+                double value = cplex.getValue(routeVars.get(idx).var);
+                if (value > EPS && isFractional(value)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        ArrayList<RouteColumn> copyRoutePool() {
+            return new ArrayList<RouteColumn>(routePool);
+        }
+
+        ArrayList<CapacityCutDef> copyCapacityCuts() {
+            return new ArrayList<CapacityCutDef>(capacityCutsView());
+        }
+
+        ArrayList<CapacityCutDef> capacityCutsView() {
+            ArrayList<CapacityCutDef> cuts = new ArrayList<CapacityCutDef>(cutRows.size());
+            for (int idx = 0; idx < cutRows.size(); idx++) {
+                cuts.add(cutRows.get(idx).def);
+            }
+            return cuts;
+        }
+
+        @Override
+        public void close() {
+            cplex.end();
+        }
+    }
+
     private final PricingEspprcSolver pricingSolver = new PricingEspprcSolver();
 
     public Result solve(Instance ins, int t, double[] qBar, int[] zBar) {
         long startNs = System.nanoTime();
         long deadlineNs = startNs + Math.max(1L, Math.round(CplexConfig.TIME_LIMIT_SEC * NANOS_PER_SECOND));
+
         ActiveSet active = buildActiveSet(ins, qBar, zBar);
         if (active == null) {
             return new Result(false, false, true, "InfeasibleByPositivePickupWithoutVisit", Double.NaN, 0, 0);
@@ -227,233 +576,231 @@ public final class BranchAndPriceCvrpSolver {
         }
 
         ArrayList<RouteColumn> rootSeeds = buildSingletonSeeds(ins, active);
-        BranchNode root = new BranchNode(new HashSet<Long>(), new HashSet<Long>(), rootSeeds, 0);
+        BranchNode root = BranchNode.root(active.size(), ins.K, rootSeeds);
 
         int exploredNodes = 0;
         int totalGeneratedColumns = 0;
+        double incumbent = Double.POSITIVE_INFINITY;
+
         NodeLpResult rootLp = solveNodeLp(ins, t, active, root, deadlineNs);
         exploredNodes++;
         totalGeneratedColumns += rootLp.generatedColumns;
 
         if (!rootLp.optimal) {
-            return new Result(false, false, rootLp.provenInfeasible, rootLp.status, Double.NaN, exploredNodes, totalGeneratedColumns);
+            return unresolvedResult(rootLp.status, exploredNodes, totalGeneratedColumns, incumbent);
         }
         if (!rootLp.feasible) {
-            return new Result(false, false, true, rootLp.status, Double.NaN, exploredNodes, totalGeneratedColumns);
+            return new Result(false, false, rootLp.provenInfeasible, rootLp.status, Double.NaN, exploredNodes, totalGeneratedColumns);
         }
         if (rootLp.integral) {
             return new Result(true, true, false, "OptimalBP(root)", rootLp.objective, exploredNodes, totalGeneratedColumns);
         }
 
-        double incumbent = Double.POSITIVE_INFINITY;
         PriorityQueue<PendingNode> queue = new PriorityQueue<PendingNode>(
                 Comparator.comparingDouble((PendingNode x) -> x.lpResult.objective).thenComparingInt(x -> x.node.depth)
         );
         queue.add(new PendingNode(root, rootLp));
 
         while (!queue.isEmpty()) {
+            if (isPastDeadline(deadlineNs)) {
+                return unresolvedResult("BP_TimeLimit", exploredNodes, totalGeneratedColumns, incumbent);
+            }
+
             PendingNode pending = queue.poll();
             if (pending.lpResult.objective >= incumbent - EPS) {
                 continue;
             }
 
-            BranchPair pair = pending.lpResult.branchPair;
-            if (pair == null) {
+            BranchDecision decision = pending.lpResult.branchDecision;
+            if (decision.type == BranchType.LEAF) {
                 incumbent = Math.min(incumbent, pending.lpResult.objective);
                 continue;
             }
 
-            ArrayList<RouteColumn> togetherSeeds = filterAllowedColumns(pending.lpResult.generatedRoutes, pending.node, pair, true);
-            BranchNode togetherChild = pending.node.childTogether(pair, togetherSeeds);
-            if (togetherChild != null) {
-                if (isPastDeadline(deadlineNs)) {
-                    return timeoutResult(exploredNodes, totalGeneratedColumns, incumbent);
-                }
-                NodeLpResult childLp = solveNodeLp(ins, t, active, togetherChild, deadlineNs);
+            ArrayList<CapacityCutDef> childCuts = pending.lpResult.capacityCuts;
+            ArrayList<RouteColumn> leftSeeds;
+            ArrayList<RouteColumn> rightSeeds;
+            BranchNode leftNode;
+            BranchNode rightNode;
+
+            if (decision.type == BranchType.VEHICLE) {
+                int newUpper = (int) Math.floor(decision.vehicleValue);
+                int newLower = (int) Math.ceil(decision.vehicleValue);
+                leftSeeds = filterAllowedRoutes(pending.lpResult.routePool, pending.node, active.localIndexByGlobal);
+                rightSeeds = filterAllowedRoutes(pending.lpResult.routePool, pending.node, active.localIndexByGlobal);
+                leftNode = pending.node.childVehicleUpper(newUpper, leftSeeds, childCuts);
+                rightNode = pending.node.childVehicleLower(newLower, rightSeeds, childCuts);
+            } else {
+                leftNode = null;
+                rightNode = null;
+                leftSeeds = filterAllowedRoutesAfterForbid(
+                        pending.lpResult.routePool,
+                        pending.node,
+                        decision.arc,
+                        false,
+                        active.localIndexByGlobal
+                );
+                rightSeeds = filterAllowedRoutesAfterForbid(
+                        pending.lpResult.routePool,
+                        pending.node,
+                        decision.arc,
+                        true,
+                        active.localIndexByGlobal
+                );
+                leftNode = pending.node.childForbidArc(decision.arc, leftSeeds, childCuts);
+                rightNode = pending.node.childForceArc(decision.arc, rightSeeds, childCuts);
+            }
+
+            if (leftNode != null) {
+                NodeLpResult leftLp = solveNodeLp(ins, t, active, leftNode, deadlineNs);
                 exploredNodes++;
-                totalGeneratedColumns += childLp.generatedColumns;
-                if (childLp.optimal) {
-                    if (childLp.feasible) {
-                        if (childLp.integral) {
-                            incumbent = Math.min(incumbent, childLp.objective);
-                        } else if (childLp.objective < incumbent - EPS) {
-                            queue.add(new PendingNode(togetherChild, childLp));
-                        }
+                totalGeneratedColumns += leftLp.generatedColumns;
+                if (!leftLp.optimal) {
+                    return unresolvedResult(leftLp.status, exploredNodes, totalGeneratedColumns, incumbent);
+                }
+                if (leftLp.feasible) {
+                    if (leftLp.integral) {
+                        incumbent = Math.min(incumbent, leftLp.objective);
+                    } else if (leftLp.objective < incumbent - EPS) {
+                        queue.add(new PendingNode(leftNode, leftLp));
                     }
-                } else {
-                    return new Result(false, false, childLp.provenInfeasible, childLp.status, Double.NaN, exploredNodes, totalGeneratedColumns);
                 }
             }
 
-            ArrayList<RouteColumn> separateSeeds = filterAllowedColumns(pending.lpResult.generatedRoutes, pending.node, pair, false);
-            BranchNode separateChild = pending.node.childSeparate(pair, separateSeeds);
-            if (separateChild != null) {
-                if (isPastDeadline(deadlineNs)) {
-                    return timeoutResult(exploredNodes, totalGeneratedColumns, incumbent);
-                }
-                NodeLpResult childLp = solveNodeLp(ins, t, active, separateChild, deadlineNs);
+            if (rightNode != null) {
+                NodeLpResult rightLp = solveNodeLp(ins, t, active, rightNode, deadlineNs);
                 exploredNodes++;
-                totalGeneratedColumns += childLp.generatedColumns;
-                if (childLp.optimal) {
-                    if (childLp.feasible) {
-                        if (childLp.integral) {
-                            incumbent = Math.min(incumbent, childLp.objective);
-                        } else if (childLp.objective < incumbent - EPS) {
-                            queue.add(new PendingNode(separateChild, childLp));
-                        }
+                totalGeneratedColumns += rightLp.generatedColumns;
+                if (!rightLp.optimal) {
+                    return unresolvedResult(rightLp.status, exploredNodes, totalGeneratedColumns, incumbent);
+                }
+                if (rightLp.feasible) {
+                    if (rightLp.integral) {
+                        incumbent = Math.min(incumbent, rightLp.objective);
+                    } else if (rightLp.objective < incumbent - EPS) {
+                        queue.add(new PendingNode(rightNode, rightLp));
                     }
-                } else {
-                    return new Result(false, false, childLp.provenInfeasible, childLp.status, Double.NaN, exploredNodes, totalGeneratedColumns);
                 }
             }
         }
 
-        if (Double.isInfinite(incumbent) || Double.isNaN(incumbent)) {
-            return new Result(false, false, false, "BranchPriceNoIncumbent", Double.NaN, exploredNodes, totalGeneratedColumns);
+        if (Double.isFinite(incumbent)) {
+            return new Result(true, true, false, "OptimalBP", incumbent, exploredNodes, totalGeneratedColumns);
         }
-        return new Result(true, true, false, "OptimalBP", incumbent, exploredNodes, totalGeneratedColumns);
+        return new Result(false, false, false, "BranchPriceNoIncumbent", Double.NaN, exploredNodes, totalGeneratedColumns);
     }
 
     private NodeLpResult solveNodeLp(Instance ins, int t, ActiveSet active, BranchNode node, long deadlineNs) {
         if (isPastDeadline(deadlineNs)) {
-            return new NodeLpResult(false, false, false, "BP_TimeLimit", Double.NaN, false, null, node.seedColumns, 0);
+            return new NodeLpResult(false, false, false, "BP_TimeLimit", Double.NaN, false, BranchDecision.leaf(),
+                    node.seedColumns, node.capacityCuts, 0);
         }
-        final int customerCount = active.size();
-        final PricingEspprcSolver.RoutePricingConstraints pricingConstraints = buildPricingConstraints(active, node);
-        final double artificialPenalty = computeArtificialPenalty(ins, customerCount);
+        if (node.vehicleLowerBound > node.vehicleUpperBound) {
+            return new NodeLpResult(false, true, true, "BP_NodeInfeasibleByVehicleBounds", Double.NaN, false, BranchDecision.leaf(),
+                    node.seedColumns, node.capacityCuts, 0);
+        }
+        if (node.vehicleLowerBound > active.size()) {
+            return new NodeLpResult(false, true, true, "BP_NodeInfeasibleByVehicleLowerBound", Double.NaN, false, BranchDecision.leaf(),
+                    node.seedColumns, node.capacityCuts, 0);
+        }
+        int minVehiclesByLoad = (int) Math.ceil((active.totalLoad - EPS) / active.vehicleCapacity);
+        if (minVehiclesByLoad > node.vehicleUpperBound) {
+            return new NodeLpResult(false, true, true, "BP_NodeInfeasibleByVehicleUpperBound", Double.NaN, false, BranchDecision.leaf(),
+                    node.seedColumns, node.capacityCuts, 0);
+        }
 
-        try (IloCplex cplex = new IloCplex()) {
-            double remainingSec = remainingSeconds(deadlineNs);
-            if (remainingSec <= 0.0) {
-                return new NodeLpResult(false, false, false, "BP_TimeLimit", Double.NaN, false, null, node.seedColumns, 0);
-            }
-            configureLp(cplex, remainingSec);
-
-            IloObjective obj = cplex.addMinimize();
-            IloRange[] coverEq = new IloRange[customerCount];
-            for (int local = 0; local < customerCount; local++) {
-                coverEq[local] = cplex.addEq(cplex.linearNumExpr(), 1.0, "BP_Cover_" + t + "_" + local);
-            }
-            IloRange vehicleLimit = cplex.addLe(cplex.linearNumExpr(), ins.K, "BP_Vehicle_" + t);
-
-            IloNumVar[] artificial = new IloNumVar[customerCount];
-            for (int local = 0; local < customerCount; local++) {
-                IloColumn col = cplex.column(obj, artificialPenalty).and(cplex.column(coverEq[local], 1.0));
-                artificial[local] = cplex.numVar(col, 0.0, Double.MAX_VALUE, "bp_art_" + t + "_" + local);
-            }
-
-            HashSet<String> existingRouteKeys = new HashSet<String>();
-            ArrayList<RouteVarData> routeVars = new ArrayList<RouteVarData>();
-            ArrayList<RouteColumn> generatedRoutes = new ArrayList<RouteColumn>();
-            int generatedColumns = 0;
-
+        int generatedColumns = 0;
+        double artificialPenalty = computeArtificialPenalty(ins, active.size());
+        try (NodeMaster master = new NodeMaster(active, node, t, deadlineNs, artificialPenalty)) {
             for (int idx = 0; idx < node.seedColumns.size(); idx++) {
-                RouteColumn route = node.seedColumns.get(idx);
-                if (!isRouteAllowed(route, node)) {
-                    continue;
-                }
-                if (addRouteColumn(cplex, obj, coverEq, vehicleLimit, active.localIndexByGlobal, route, routeVars, existingRouteKeys,
-                        "bp_seed_" + t + "_" + idx)) {
-                    generatedRoutes.add(route);
-                }
+                master.addRoute(node.seedColumns.get(idx), "seed_" + t + "_" + idx);
             }
-
-            for (int local = 0; local < customerCount; local++) {
+            for (int local = 0; local < active.size(); local++) {
                 RouteColumn singleton = new RouteColumn(
                         new int[]{active.activeCustomers[local]},
                         ins.c[0][active.activeCustomers[local]] + ins.c[active.activeCustomers[local]][ins.n + 1],
                         active.qLocal[local]
                 );
-                if (!isRouteAllowed(singleton, node)) {
-                    continue;
-                }
-                if (addRouteColumn(cplex, obj, coverEq, vehicleLimit, active.localIndexByGlobal, singleton, routeVars, existingRouteKeys,
-                        "bp_single_" + t + "_" + local)) {
-                    generatedRoutes.add(singleton);
-                }
+                master.addRoute(singleton, "single_" + t + "_" + local);
             }
 
             while (true) {
                 if (isPastDeadline(deadlineNs)) {
-                    return new NodeLpResult(false, false, false, "BP_TimeLimit", Double.NaN, false, null, generatedRoutes, generatedColumns);
+                    return new NodeLpResult(false, false, false, "BP_TimeLimit", Double.NaN, false, BranchDecision.leaf(),
+                            master.copyRoutePool(), master.copyCapacityCuts(), generatedColumns);
                 }
-                boolean solved = cplex.solve();
-                String status = cplex.getStatus().toString();
+
+                boolean solved = master.cplex.solve();
+                String status = master.cplex.getStatus().toString();
                 if (!solved || !status.startsWith("Optimal")) {
-                    return new NodeLpResult(false, false, false, "BP_LP_" + status, Double.NaN, false, null, generatedRoutes, generatedColumns);
+                    if (status.startsWith("Infeasible")) {
+                        return new NodeLpResult(false, true, true, "BP_NodeInfeasibleLP", Double.NaN, false, BranchDecision.leaf(),
+                                master.copyRoutePool(), master.copyCapacityCuts(), generatedColumns);
+                    }
+                    return new NodeLpResult(false, false, false, "BP_LP_" + status, Double.NaN, false, BranchDecision.leaf(),
+                            master.copyRoutePool(), master.copyCapacityCuts(), generatedColumns);
                 }
 
-                double[] dualCover = new double[customerCount];
-                for (int local = 0; local < customerCount; local++) {
-                    dualCover[local] = cplex.getDual(coverEq[local]);
-                }
-                double dualVehicle = cplex.getDual(vehicleLimit);
-
+                DualData duals = master.extractDuals();
+                PricingEspprcSolver.RoutePricingConstraints pricingConstraints = buildPricingConstraints(active, node, duals);
                 PricingEspprcSolver.Result pricing = pricingSolver.findNegativeRoutes(
                         ins,
                         active.activeCustomers,
                         active.qLocal,
-                        dualCover,
-                        dualVehicle,
-                        existingRouteKeys,
-                        maxColumnsPerPricing(customerCount),
+                        duals.coverDuals,
+                        duals.vehicleLowerDual + duals.vehicleUpperDual,
+                        master.existingRouteKeys,
+                        maxColumnsPerPricing(active.size()),
                         pricingConstraints
                 );
 
-                if (isPastDeadline(deadlineNs)) {
-                    return new NodeLpResult(false, false, false, "BP_TimeLimit", Double.NaN, false, null, generatedRoutes, generatedColumns);
-                }
-                if (!pricing.foundNegativeColumn) {
-                    break;
-                }
-
-                ArrayList<RouteColumn> newRoutes = pricing.routes;
-                if (newRoutes == null || newRoutes.isEmpty()) {
-                    if (addRouteColumn(cplex, obj, coverEq, vehicleLimit, active.localIndexByGlobal, pricing.route, routeVars, existingRouteKeys,
-                            "bp_cg_" + t + "_" + generatedColumns)) {
-                        generatedRoutes.add(pricing.route);
-                        generatedColumns++;
-                    }
-                } else {
-                    for (int idx = 0; idx < newRoutes.size(); idx++) {
-                        RouteColumn route = newRoutes.get(idx);
-                        if (addRouteColumn(cplex, obj, coverEq, vehicleLimit, active.localIndexByGlobal, route, routeVars, existingRouteKeys,
-                                "bp_cg_" + t + "_" + generatedColumns)) {
-                            generatedRoutes.add(route);
+                boolean addedColumn = false;
+                if (pricing.routes != null && !pricing.routes.isEmpty()) {
+                    for (int idx = 0; idx < pricing.routes.size(); idx++) {
+                        if (master.addRoute(pricing.routes.get(idx), "cg_" + t + "_" + generatedColumns)) {
                             generatedColumns++;
+                            addedColumn = true;
                         }
                     }
+                } else if (pricing.foundNegativeColumn && pricing.route != null) {
+                    if (master.addRoute(pricing.route, "cg_" + t + "_" + generatedColumns)) {
+                        generatedColumns++;
+                        addedColumn = true;
+                    }
                 }
-            }
-
-            for (int local = 0; local < customerCount; local++) {
-                if (cplex.getValue(artificial[local]) > ART_EPS) {
-                    return new NodeLpResult(false, true, true, "BP_NodeInfeasible", Double.NaN, false, null, generatedRoutes, generatedColumns);
+                if (addedColumn) {
+                    continue;
                 }
-            }
 
-            ArrayList<ActiveRouteValue> positiveRoutes = new ArrayList<ActiveRouteValue>();
-            for (int idx = 0; idx < routeVars.size(); idx++) {
-                RouteVarData data = routeVars.get(idx);
-                double value = cplex.getValue(data.var);
-                if (value > EPS) {
-                    positiveRoutes.add(new ActiveRouteValue(data.route, value, data.localCustomers));
+                ArrayList<ActiveRouteValue> positiveRoutes = master.collectPositiveRoutes();
+                ArrayList<CapacityCutDef> newCuts = separateCapacityCuts(active, positiveRoutes, master.capacityCutsView());
+                if (!newCuts.isEmpty()) {
+                    for (int idx = 0; idx < newCuts.size(); idx++) {
+                        master.addCapacityCut(newCuts.get(idx), "bp_cut_" + t + "_" + master.cutRows.size() + "_" + idx);
+                    }
+                    continue;
                 }
-            }
 
-            BranchPair branchPair = chooseBranchPair(active, positiveRoutes);
-            boolean integral = branchPair == null;
-            return new NodeLpResult(
-                    true,
-                    true,
-                    false,
-                    "BP_NodeOptimal",
-                    cplex.getObjValue(),
-                    integral,
-                    branchPair,
-                    generatedRoutes,
-                    generatedColumns
-            );
+                if (master.hasPositiveCoverArtificial() || master.hasPositiveVehicleLowerSlack() || master.hasPositiveCutSlack()) {
+                    return new NodeLpResult(false, true, true, "BP_NodeInfeasible", Double.NaN, false, BranchDecision.leaf(),
+                            master.copyRoutePool(), master.copyCapacityCuts(), generatedColumns);
+                }
+
+                boolean integral = master.isIntegralRouteSolution();
+                BranchDecision decision = integral ? BranchDecision.leaf() : chooseBranchDecision(active, positiveRoutes);
+                return new NodeLpResult(
+                        true,
+                        true,
+                        false,
+                        "BP_NodeOptimal",
+                        master.cplex.getObjValue(),
+                        integral,
+                        decision,
+                        master.copyRoutePool(),
+                        master.copyCapacityCuts(),
+                        generatedColumns
+                );
+            }
         } catch (IloException e) {
             throw new RuntimeException("Failed to solve branch-and-price node for CVRP(t=" + t + ")", e);
         }
@@ -483,7 +830,7 @@ public final class BranchAndPriceCvrpSolver {
             activeCustomers[local] = customers.get(local);
             qLocal[local] = qList.get(local);
         }
-        return new ActiveSet(activeCustomers, qLocal, localIndexByGlobal, totalLoad);
+        return new ActiveSet(activeCustomers, qLocal, localIndexByGlobal, totalLoad, ins.Q);
     }
 
     private static ArrayList<RouteColumn> buildSingletonSeeds(Instance ins, ActiveSet active) {
@@ -499,208 +846,436 @@ public final class BranchAndPriceCvrpSolver {
         return seeds;
     }
 
-    private static ArrayList<RouteColumn> filterAllowedColumns(
-            ArrayList<RouteColumn> columns,
-            BranchNode parentNode,
-            BranchPair pair,
-            boolean together
+    private static PricingEspprcSolver.RoutePricingConstraints buildPricingConstraints(
+            ActiveSet active,
+            BranchNode node,
+            DualData duals
+    ) {
+        int m = active.size();
+        boolean anyForbidden = false;
+        boolean[] forbiddenStart = new boolean[m];
+        boolean[] forbiddenReturn = new boolean[m];
+        boolean[][] forbiddenInternal = new boolean[m][m];
+        for (int local = 0; local < m; local++) {
+            forbiddenStart[local] = node.forbiddenArcs[0][local + 1];
+            forbiddenReturn[local] = node.forbiddenArcs[local + 1][0];
+            anyForbidden |= forbiddenStart[local] || forbiddenReturn[local];
+            for (int nxt = 0; nxt < m; nxt++) {
+                forbiddenInternal[local][nxt] = node.forbiddenArcs[local + 1][nxt + 1];
+                anyForbidden |= forbiddenInternal[local][nxt];
+            }
+        }
+
+        boolean anyCutDual = false;
+        if (duals.returnArcDual != null) {
+            for (int local = 0; local < duals.returnArcDual.length; local++) {
+                if (Math.abs(duals.returnArcDual[local]) > 1e-12) {
+                    anyCutDual = true;
+                    break;
+                }
+            }
+        }
+        if (!anyCutDual && duals.internalArcDual != null) {
+            for (int i = 0; i < duals.internalArcDual.length && !anyCutDual; i++) {
+                for (int j = 0; j < duals.internalArcDual[i].length; j++) {
+                    if (Math.abs(duals.internalArcDual[i][j]) > 1e-12) {
+                        anyCutDual = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!anyForbidden && !anyCutDual) {
+            return null;
+        }
+        return PricingEspprcSolver.RoutePricingConstraints.create(
+                null,
+                null,
+                null,
+                null,
+                forbiddenStart,
+                forbiddenReturn,
+                forbiddenInternal,
+                anyCutDual ? duals.returnArcDual : null,
+                anyCutDual ? duals.internalArcDual : null
+        );
+    }
+
+    private static BranchDecision chooseBranchDecision(ActiveSet active, ArrayList<ActiveRouteValue> positiveRoutes) {
+        double vehicleValue = 0.0;
+        for (int idx = 0; idx < positiveRoutes.size(); idx++) {
+            vehicleValue += positiveRoutes.get(idx).value;
+        }
+        if (isBranchFraction(vehicleValue)) {
+            return BranchDecision.vehicle(vehicleValue);
+        }
+
+        double[][] arcFlow = buildArcFlow(active.size(), positiveRoutes);
+        ArcBranch bestArc = null;
+        double bestScore = Double.NEGATIVE_INFINITY;
+        for (int from = 0; from < arcFlow.length; from++) {
+            for (int to = 0; to < arcFlow.length; to++) {
+                if (from == to || (from == 0 && to == 0)) {
+                    continue;
+                }
+                double value = arcFlow[from][to];
+                if (!isBranchFraction(value)) {
+                    continue;
+                }
+                double score = 0.5 - Math.abs(0.5 - value);
+                if (from != 0 && to != 0) {
+                    score += 1e-6;
+                }
+                if (score > bestScore + 1e-12) {
+                    bestScore = score;
+                    bestArc = new ArcBranch(from, to, value);
+                }
+            }
+        }
+        if (bestArc != null) {
+            return BranchDecision.arc(bestArc);
+        }
+
+        ActiveRouteValue fallbackRoute = null;
+        double fallbackScore = Double.POSITIVE_INFINITY;
+        for (int idx = 0; idx < positiveRoutes.size(); idx++) {
+            ActiveRouteValue route = positiveRoutes.get(idx);
+            if (!isFractional(route.value)) {
+                continue;
+            }
+            double score = Math.abs(0.5 - route.value);
+            if (score < fallbackScore - 1e-12) {
+                fallbackScore = score;
+                fallbackRoute = route;
+            }
+        }
+        if (fallbackRoute != null) {
+            for (int p = 0; p < fallbackRoute.localNodePath.length - 1; p++) {
+                int from = fallbackRoute.localNodePath[p];
+                int to = fallbackRoute.localNodePath[p + 1];
+                if (from != to) {
+                    return BranchDecision.arc(new ArcBranch(from, to, arcFlow[from][to]));
+                }
+            }
+        }
+        return BranchDecision.leaf();
+    }
+
+    private static ArrayList<RouteColumn> filterAllowedRoutes(
+            ArrayList<RouteColumn> routes,
+            BranchNode node,
+            int[] localIndexByGlobal
     ) {
         ArrayList<RouteColumn> filtered = new ArrayList<RouteColumn>();
-        HashSet<Long> togetherPairs = new HashSet<Long>(parentNode.togetherPairs);
-        HashSet<Long> separatePairs = new HashSet<Long>(parentNode.separatePairs);
-        long key = pairKey(pair.customerA, pair.customerB);
-        if (together) {
-            togetherPairs.add(key);
-        } else {
-            separatePairs.add(key);
-        }
-        BranchNode childView = new BranchNode(togetherPairs, separatePairs, new ArrayList<RouteColumn>(), parentNode.depth + 1);
-        for (int idx = 0; idx < columns.size(); idx++) {
-            RouteColumn route = columns.get(idx);
-            if (isRouteAllowed(route, childView)) {
+        HashSet<String> seen = new HashSet<String>();
+        for (int idx = 0; idx < routes.size(); idx++) {
+            RouteColumn route = routes.get(idx);
+            int[] path = toLocalNodePath(route, localIndexByGlobal);
+            if (path != null && isRouteAllowed(path, node.forbiddenArcs) && seen.add(route.key())) {
                 filtered.add(route);
             }
         }
         return filtered;
     }
 
-    private static BranchPair chooseBranchPair(ActiveSet active, ArrayList<ActiveRouteValue> positiveRoutes) {
-        int m = active.size();
-        if (m <= 1) {
+    private static ArrayList<RouteColumn> filterAllowedRoutesAfterForbid(
+            ArrayList<RouteColumn> routes,
+            BranchNode node,
+            ArcBranch arc,
+            boolean forceArc,
+            int[] localIndexByGlobal
+    ) {
+        BranchNode view = forceArc
+                ? node.childForceArc(arc, new ArrayList<RouteColumn>(), node.capacityCuts)
+                : node.childForbidArc(arc, new ArrayList<RouteColumn>(), node.capacityCuts);
+        return filterAllowedRoutes(routes, view, localIndexByGlobal);
+    }
+
+    private static int[] toLocalNodePath(RouteColumn route, int[] localIndexByGlobal) {
+        if (route == null) {
             return null;
         }
-        double[][] sameRoute = new double[m][m];
-        for (int idx = 0; idx < positiveRoutes.size(); idx++) {
-            ActiveRouteValue route = positiveRoutes.get(idx);
-            int[] locals = route.localCustomers;
-            for (int a = 0; a < locals.length; a++) {
-                for (int b = a + 1; b < locals.length; b++) {
-                    int i = locals[a];
-                    int j = locals[b];
-                    sameRoute[i][j] += route.value;
-                }
+        int len = route.globalCustomersInOrder.length;
+        int[] path = new int[len + 2];
+        path[0] = 0;
+        for (int pos = 0; pos < len; pos++) {
+            int global = route.globalCustomersInOrder[pos];
+            if (global < 0 || global >= localIndexByGlobal.length || localIndexByGlobal[global] < 0) {
+                return null;
+            }
+            path[pos + 1] = localIndexByGlobal[global] + 1;
+        }
+        path[len + 1] = 0;
+        return path;
+    }
+
+    private static int[] extractLocalCustomers(int[] localNodePath) {
+        int[] locals = new int[localNodePath.length - 2];
+        for (int pos = 1; pos < localNodePath.length - 1; pos++) {
+            locals[pos - 1] = localNodePath[pos] - 1;
+        }
+        return locals;
+    }
+
+    private static boolean isRouteAllowed(int[] localNodePath, boolean[][] forbiddenArcs) {
+        for (int pos = 0; pos < localNodePath.length - 1; pos++) {
+            if (forbiddenArcs[localNodePath[pos]][localNodePath[pos + 1]]) {
+                return false;
             }
         }
+        return true;
+    }
 
-        BranchPair best = null;
-        double bestScore = Double.POSITIVE_INFINITY;
-        for (int i = 0; i < m; i++) {
-            for (int j = i + 1; j < m; j++) {
-                double val = sameRoute[i][j];
-                if (val > EPS && val < 1.0 - EPS) {
-                    double score = Math.abs(0.5 - val);
-                    if (score < bestScore - 1e-12) {
-                        bestScore = score;
-                        best = new BranchPair(active.activeCustomers[i], active.activeCustomers[j], val);
+    private static int countOutgoingCrossings(int[] localNodePath, BitSet members) {
+        int count = 0;
+        for (int pos = 0; pos < localNodePath.length - 1; pos++) {
+            int fromNode = localNodePath[pos];
+            if (fromNode == 0) {
+                continue;
+            }
+            int fromLocal = fromNode - 1;
+            if (!members.get(fromLocal)) {
+                continue;
+            }
+            int toNode = localNodePath[pos + 1];
+            if (toNode == 0) {
+                count++;
+            } else if (!members.get(toNode - 1)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static double[][] buildArcFlow(int customerCount, ArrayList<ActiveRouteValue> positiveRoutes) {
+        double[][] arcFlow = new double[customerCount + 1][customerCount + 1];
+        for (int idx = 0; idx < positiveRoutes.size(); idx++) {
+            ActiveRouteValue route = positiveRoutes.get(idx);
+            for (int pos = 0; pos < route.localNodePath.length - 1; pos++) {
+                arcFlow[route.localNodePath[pos]][route.localNodePath[pos + 1]] += route.value;
+            }
+        }
+        return arcFlow;
+    }
+
+    private static ArrayList<CapacityCutDef> separateCapacityCuts(
+            ActiveSet active,
+            ArrayList<ActiveRouteValue> positiveRoutes,
+            ArrayList<CapacityCutDef> existingCuts
+    ) {
+        ArrayList<CapacityCutDef> cuts = new ArrayList<CapacityCutDef>();
+        if (active.size() <= 2 || positiveRoutes.isEmpty()) {
+            return cuts;
+        }
+
+        double[][] arcFlow = buildArcFlow(active.size(), positiveRoutes);
+        HashSet<String> seen = new HashSet<String>();
+        for (int idx = 0; idx < existingCuts.size(); idx++) {
+            seen.add(existingCuts.get(idx).signature);
+        }
+
+        shrinkSeparate(active, arcFlow, seen, cuts);
+        if (cuts.isEmpty()) {
+            connectedSeparate(active, arcFlow, seen, cuts);
+        }
+        return cuts;
+    }
+
+    private static void shrinkSeparate(
+            ActiveSet active,
+            double[][] arcFlow,
+            HashSet<String> seen,
+            ArrayList<CapacityCutDef> out
+    ) {
+        ArrayList<BitSet> clusters = new ArrayList<BitSet>();
+        for (int local = 0; local < active.size(); local++) {
+            BitSet cluster = new BitSet(active.size());
+            cluster.set(local);
+            clusters.add(cluster);
+        }
+
+        while (clusters.size() > 1 && out.size() < MAX_NEW_CUTS_PER_NODE) {
+            double bestWeight = 0.0;
+            int bestI = -1;
+            int bestJ = -1;
+            for (int i = 0; i < clusters.size(); i++) {
+                for (int j = i + 1; j < clusters.size(); j++) {
+                    double weight = symmetricFlowBetween(clusters.get(i), clusters.get(j), arcFlow);
+                    if (weight > bestWeight + 1e-12) {
+                        bestWeight = weight;
+                        bestI = i;
+                        bestJ = j;
                     }
                 }
             }
+            if (bestI < 0 || bestWeight <= 0.5 + 1e-12) {
+                break;
+            }
+
+            BitSet merged = (BitSet) clusters.get(bestI).clone();
+            merged.or(clusters.get(bestJ));
+            if (merged.cardinality() >= 2 && merged.cardinality() < active.size()) {
+                maybeAddCapacityCut(active, merged, arcFlow, seen, out);
+            }
+            clusters.remove(bestJ);
+            clusters.set(bestI, merged);
         }
-        return best;
     }
 
-    private static PricingEspprcSolver.RoutePricingConstraints buildPricingConstraints(ActiveSet active, BranchNode node) {
-        if (node.togetherPairs.isEmpty() && node.separatePairs.isEmpty()) {
-            return null;
-        }
-
-        int m = active.size();
-        if (m <= 62) {
-            long[] required = new long[m];
-            long[] forbidden = new long[m];
-            populateLongConstraints(required, forbidden, active, node.togetherPairs, true);
-            populateLongConstraints(required, forbidden, active, node.separatePairs, false);
-            return PricingEspprcSolver.RoutePricingConstraints.fromLongMasks(required, forbidden);
-        }
-
-        BitSet[] required = new BitSet[m];
-        BitSet[] forbidden = new BitSet[m];
-        for (int local = 0; local < m; local++) {
-            required[local] = new BitSet(m);
-            forbidden[local] = new BitSet(m);
-        }
-        populateBitSetConstraints(required, forbidden, active, node.togetherPairs, true);
-        populateBitSetConstraints(required, forbidden, active, node.separatePairs, false);
-        return PricingEspprcSolver.RoutePricingConstraints.fromBitSets(required, forbidden);
-    }
-
-    private static void populateLongConstraints(
-            long[] required,
-            long[] forbidden,
+    private static void connectedSeparate(
             ActiveSet active,
-            HashSet<Long> pairs,
-            boolean together
+            double[][] arcFlow,
+            HashSet<String> seen,
+            ArrayList<CapacityCutDef> out
     ) {
-        for (Long keyObj : pairs) {
-            long key = keyObj.longValue();
-            int a = (int) (key >>> 32);
-            int b = (int) key;
-            int localA = (a >= 0 && a < active.localIndexByGlobal.length) ? active.localIndexByGlobal[a] : -1;
-            int localB = (b >= 0 && b < active.localIndexByGlobal.length) ? active.localIndexByGlobal[b] : -1;
-            if (localA < 0 || localB < 0) {
-                continue;
+        BitSet[] neighbors = new BitSet[active.size()];
+        for (int i = 0; i < active.size(); i++) {
+            neighbors[i] = new BitSet(active.size());
+            for (int j = 0; j < active.size(); j++) {
+                if (i == j) {
+                    continue;
+                }
+                double support = arcFlow[i + 1][j + 1] + arcFlow[j + 1][i + 1];
+                if (support > ARC_SUPPORT_EPS) {
+                    neighbors[i].set(j);
+                }
             }
-            if (together) {
-                required[localA] |= (1L << localB);
-                required[localB] |= (1L << localA);
-            } else {
-                forbidden[localA] |= (1L << localB);
-                forbidden[localB] |= (1L << localA);
-            }
+        }
+
+        HashSet<String> visitedStates = new HashSet<String>();
+        for (int root = 0; root < active.size() && out.size() < MAX_NEW_CUTS_PER_NODE; root++) {
+            BitSet current = new BitSet(active.size());
+            current.set(root);
+            BitSet frontier = (BitSet) neighbors[root].clone();
+            dfsConnectedCuts(active, arcFlow, neighbors, current, frontier, seen, visitedStates, out);
         }
     }
 
-    private static void populateBitSetConstraints(
-            BitSet[] required,
-            BitSet[] forbidden,
+    private static void dfsConnectedCuts(
             ActiveSet active,
-            HashSet<Long> pairs,
-            boolean together
+            double[][] arcFlow,
+            BitSet[] neighbors,
+            BitSet current,
+            BitSet frontier,
+            HashSet<String> seenCuts,
+            HashSet<String> visitedStates,
+            ArrayList<CapacityCutDef> out
     ) {
-        for (Long keyObj : pairs) {
-            long key = keyObj.longValue();
-            int a = (int) (key >>> 32);
-            int b = (int) key;
-            int localA = (a >= 0 && a < active.localIndexByGlobal.length) ? active.localIndexByGlobal[a] : -1;
-            int localB = (b >= 0 && b < active.localIndexByGlobal.length) ? active.localIndexByGlobal[b] : -1;
-            if (localA < 0 || localB < 0) {
-                continue;
+        if (out.size() >= MAX_NEW_CUTS_PER_NODE || current.cardinality() > MAX_CONNECTED_CUT_SIZE) {
+            return;
+        }
+        String stateKey = bitSetSignature(current);
+        if (!visitedStates.add(stateKey)) {
+            return;
+        }
+
+        if (current.cardinality() >= 2 && current.cardinality() < active.size()) {
+            double lhs = outgoingFlow(current, arcFlow, active.size());
+            double rhs = cutRhs(current, active.qLocal, active.vehicleCapacity);
+            if (lhs + CUT_VIOL_EPS < rhs) {
+                maybeAddCapacityCut(active, current, arcFlow, seenCuts, out);
+                if (out.size() >= MAX_NEW_CUTS_PER_NODE) {
+                    return;
+                }
             }
-            if (together) {
-                required[localA].set(localB);
-                required[localB].set(localA);
-            } else {
-                forbidden[localA].set(localB);
-                forbidden[localB].set(localA);
+            if (lhs - rhs > 1.2) {
+                return;
             }
+        }
+
+        int next = frontier.nextSetBit(0);
+        while (next >= 0 && out.size() < MAX_NEW_CUTS_PER_NODE) {
+            BitSet nextCurrent = (BitSet) current.clone();
+            nextCurrent.set(next);
+            BitSet nextFrontier = (BitSet) frontier.clone();
+            nextFrontier.or(neighbors[next]);
+            nextFrontier.andNot(nextCurrent);
+            dfsConnectedCuts(active, arcFlow, neighbors, nextCurrent, nextFrontier, seenCuts, visitedStates, out);
+            next = frontier.nextSetBit(next + 1);
         }
     }
 
-    private static boolean isRouteAllowed(RouteColumn route, BranchNode node) {
-        if (node.togetherPairs.isEmpty() && node.separatePairs.isEmpty()) {
-            return true;
+    private static void maybeAddCapacityCut(
+            ActiveSet active,
+            BitSet members,
+            double[][] arcFlow,
+            HashSet<String> seen,
+            ArrayList<CapacityCutDef> out
+    ) {
+        String signature = bitSetSignature(members);
+        if (seen.contains(signature)) {
+            return;
         }
-        BitSet routeCustomers = new BitSet();
-        for (int idx = 0; idx < route.globalCustomersInOrder.length; idx++) {
-            routeCustomers.set(route.globalCustomersInOrder[idx]);
+        double lhs = outgoingFlow(members, arcFlow, active.size());
+        double rhs = cutRhs(members, active.qLocal, active.vehicleCapacity);
+        if (lhs + CUT_VIOL_EPS >= rhs) {
+            return;
         }
-        for (Long keyObj : node.separatePairs) {
-            long key = keyObj.longValue();
-            int a = (int) (key >>> 32);
-            int b = (int) key;
-            if (routeCustomers.get(a) && routeCustomers.get(b)) {
-                return false;
-            }
+
+        int[] locals = new int[members.cardinality()];
+        int idx = 0;
+        int bit = members.nextSetBit(0);
+        while (bit >= 0) {
+            locals[idx++] = bit;
+            bit = members.nextSetBit(bit + 1);
         }
-        for (Long keyObj : node.togetherPairs) {
-            long key = keyObj.longValue();
-            int a = (int) (key >>> 32);
-            int b = (int) key;
-            if (routeCustomers.get(a) != routeCustomers.get(b)) {
-                return false;
-            }
-        }
-        return true;
+        out.add(new CapacityCutDef((BitSet) members.clone(), locals, rhs, signature));
+        seen.add(signature);
     }
 
-    private static boolean addRouteColumn(
-            IloCplex cplex,
-            IloObjective obj,
-            IloRange[] coverEq,
-            IloRange vehicleLimit,
-            int[] localIndexByGlobal,
-            RouteColumn route,
-            ArrayList<RouteVarData> routeVars,
-            HashSet<String> existingRouteKeys,
-            String varName
-    ) throws IloException {
-        if (route == null) {
-            return false;
-        }
-        String key = route.key();
-        if (existingRouteKeys.contains(key)) {
-            return false;
-        }
-        existingRouteKeys.add(key);
-
-        IloColumn col = cplex.column(obj, route.cost).and(cplex.column(vehicleLimit, 1.0));
-        boolean[] covered = new boolean[coverEq.length];
-        int[] tmp = new int[route.globalCustomersInOrder.length];
-        int count = 0;
-        for (int pos = 0; pos < route.globalCustomersInOrder.length; pos++) {
-            int global = route.globalCustomersInOrder[pos];
-            int local = (global >= 0 && global < localIndexByGlobal.length) ? localIndexByGlobal[global] : -1;
-            if (local >= 0 && !covered[local]) {
-                col = col.and(cplex.column(coverEq[local], 1.0));
-                covered[local] = true;
-                tmp[count++] = local;
+    private static double symmetricFlowBetween(BitSet a, BitSet b, double[][] arcFlow) {
+        double weight = 0.0;
+        int i = a.nextSetBit(0);
+        while (i >= 0) {
+            int j = b.nextSetBit(0);
+            while (j >= 0) {
+                weight += arcFlow[i + 1][j + 1] + arcFlow[j + 1][i + 1];
+                j = b.nextSetBit(j + 1);
             }
+            i = a.nextSetBit(i + 1);
         }
-        int[] locals = new int[count];
-        System.arraycopy(tmp, 0, locals, 0, count);
-        IloNumVar var = cplex.numVar(col, 0.0, Double.MAX_VALUE, "xi_bp_" + varName);
-        routeVars.add(new RouteVarData(route, var, locals));
-        return true;
+        return weight;
+    }
+
+    private static double outgoingFlow(BitSet members, double[][] arcFlow, int customerCount) {
+        double lhs = 0.0;
+        int from = members.nextSetBit(0);
+        while (from >= 0) {
+            lhs += arcFlow[from + 1][0];
+            for (int to = 0; to < customerCount; to++) {
+                if (!members.get(to)) {
+                    lhs += arcFlow[from + 1][to + 1];
+                }
+            }
+            from = members.nextSetBit(from + 1);
+        }
+        return lhs;
+    }
+
+    private static double cutRhs(BitSet members, double[] qLocal, double capacity) {
+        double demand = 0.0;
+        int bit = members.nextSetBit(0);
+        while (bit >= 0) {
+            demand += qLocal[bit];
+            bit = members.nextSetBit(bit + 1);
+        }
+        return Math.ceil((demand - 1e-9) / capacity);
+    }
+
+    private static String bitSetSignature(BitSet set) {
+        StringBuilder sb = new StringBuilder();
+        int bit = set.nextSetBit(0);
+        boolean first = true;
+        while (bit >= 0) {
+            if (!first) {
+                sb.append(',');
+            }
+            sb.append(bit);
+            first = false;
+            bit = set.nextSetBit(bit + 1);
+        }
+        return sb.toString();
     }
 
     private static int maxColumnsPerPricing(int customerCount) {
@@ -716,12 +1291,6 @@ public final class BranchAndPriceCvrpSolver {
         return 8;
     }
 
-    private static long pairKey(int a, int b) {
-        int x = Math.min(a, b);
-        int y = Math.max(a, b);
-        return (((long) x) << 32) | (y & 0xffffffffL);
-    }
-
     private static double computeArtificialPenalty(Instance ins, int customerCount) {
         double maxArc = 0.0;
         for (int i = 0; i < ins.nodeCount; i++) {
@@ -734,11 +1303,28 @@ public final class BranchAndPriceCvrpSolver {
         return 1_000_000.0 + maxArc * (customerCount + 2);
     }
 
-    private static Result timeoutResult(int exploredNodes, int totalGeneratedColumns, double incumbent) {
-        if (Double.isFinite(incumbent)) {
-            return new Result(true, false, false, "BP_TimeLimitWithIncumbent", incumbent, exploredNodes, totalGeneratedColumns);
+    private static boolean isFractional(double value) {
+        double floor = Math.floor(value);
+        return value > floor + EPS && value < floor + 1.0 - EPS;
+    }
+
+    private static boolean isBranchFraction(double value) {
+        if (!isFractional(value)) {
+            return false;
         }
-        return new Result(false, false, false, "BP_TimeLimit", Double.NaN, exploredNodes, totalGeneratedColumns);
+        return fracCost(value) <= FRAC_DISTANCE_LIMIT + 1e-12;
+    }
+
+    private static double fracCost(double value) {
+        double line = Math.floor(value) + 0.5;
+        return Math.abs(value - line);
+    }
+
+    private static Result unresolvedResult(String status, int exploredNodes, int totalGeneratedColumns, double incumbent) {
+        if (Double.isFinite(incumbent)) {
+            return new Result(true, false, false, status + "WithIncumbent", incumbent, exploredNodes, totalGeneratedColumns);
+        }
+        return new Result(false, false, false, status, Double.NaN, exploredNodes, totalGeneratedColumns);
     }
 
     private static boolean isPastDeadline(long deadlineNs) {
