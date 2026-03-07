@@ -2070,7 +2070,7 @@ public final class PricingEspprcSolver {
                 if (label == null) {
                     return;
                 }
-                forwardExtended[label.lastLocal].add(label);
+                insertSortedByPartialReducedCost(forwardExtended[label.lastLocal], label);
                 considerForwardCompleteRoute(label);
                 if (maxColumns > 0 && collected.size() >= maxColumns) {
                     return;
@@ -2129,7 +2129,7 @@ public final class PricingEspprcSolver {
                 if (label == null) {
                     return;
                 }
-                backwardExtended[label.firstLocal].add(label);
+                insertSortedByPartialReducedCost(backwardExtended[label.firstLocal], label);
                 considerBackwardCompleteRoute(label);
                 if (maxColumns > 0 && collected.size() >= maxColumns) {
                     return;
@@ -2200,10 +2200,22 @@ public final class PricingEspprcSolver {
                     if (bLabels.isEmpty()) {
                         continue;
                     }
+                    double bridgeReducedCost = ins.c[customers[forwardLast]][customers[backwardFirst]]
+                            - transitionArcDual(forwardLast, backwardFirst)
+                            - dualU0;
+                    double bestBackwardPartial = bLabels.get(0).partialReducedCost;
                     for (int fi = 0; fi < fLabels.size(); fi++) {
                         RelaxForwardLabel fLabel = fLabels.get(fi);
+                        if (fLabel.partialReducedCost + bestBackwardPartial + bridgeReducedCost
+                                >= lowerBoundThreshold() - DOM_EPS) {
+                            break;
+                        }
                         for (int bi = 0; bi < bLabels.size(); bi++) {
                             RelaxBackwardLabel bLabel = bLabels.get(bi);
+                            if (fLabel.partialReducedCost + bLabel.partialReducedCost + bridgeReducedCost
+                                    >= lowerBoundThreshold() - DOM_EPS) {
+                                break;
+                            }
                             if ((fLabel.memoryMask & bLabel.allVisitedMask) != 0L
                                     || (bLabel.memoryMask & fLabel.allVisitedMask) != 0L) {
                                 continue;
@@ -2220,13 +2232,9 @@ public final class PricingEspprcSolver {
                             double fullCost = fLabel.travelCost
                                     + ins.c[customers[fLabel.lastLocal]][customers[bLabel.firstLocal]]
                                     + bLabel.travelCost;
-                            double reducedCost = fullCost
-                                    - fLabel.dualGain
-                                    - bLabel.dualGain
-                                    - fLabel.arcDualGain
-                                    - bLabel.arcDualGain
-                                    - transitionArcDual(fLabel.lastLocal, bLabel.firstLocal)
-                                    - dualU0;
+                            double reducedCost = fLabel.partialReducedCost
+                                    + bLabel.partialReducedCost
+                                    + bridgeReducedCost;
                             int[] locals = combineLocals(reconstructForwardLocals(fLabel), reconstructBackwardLocals(bLabel));
                             considerAnyCandidate(reducedCost, locals);
                             if (repeated != 0L || reducedCost >= -RC_EPS) {
@@ -2240,6 +2248,21 @@ public final class PricingEspprcSolver {
                     }
                 }
             }
+        }
+
+        private <T extends PartialRcState> void insertSortedByPartialReducedCost(ArrayList<T> labels, T label) {
+            int lo = 0;
+            int hi = labels.size();
+            double key = label.partialReducedCost();
+            while (lo < hi) {
+                int mid = (lo + hi) >>> 1;
+                if (labels.get(mid).partialReducedCost() <= key + DOM_EPS) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            labels.add(lo, label);
         }
 
         private boolean isOverBudget(long startNs) {
