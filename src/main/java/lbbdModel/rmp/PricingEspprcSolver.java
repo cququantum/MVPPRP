@@ -523,10 +523,16 @@ public final class PricingEspprcSolver {
 
         final int capacityUnits;
         final double[][] suffixLowerBoundByUsedLoad;
+        final double[][] prefixLowerBoundByUsedLoad;
 
-        private CompletionBound(int capacityUnits, double[][] suffixLowerBoundByUsedLoad) {
+        private CompletionBound(
+                int capacityUnits,
+                double[][] suffixLowerBoundByUsedLoad,
+                double[][] prefixLowerBoundByUsedLoad
+        ) {
             this.capacityUnits = capacityUnits;
             this.suffixLowerBoundByUsedLoad = suffixLowerBoundByUsedLoad;
+            this.prefixLowerBoundByUsedLoad = prefixLowerBoundByUsedLoad;
         }
 
         static CompletionBound tryBuild(
@@ -550,10 +556,12 @@ public final class PricingEspprcSolver {
             }
 
             int m = customers.length;
-            double[][] bound = new double[m][qCapacity + 1];
+            double[][] suffixBound = new double[m][qCapacity + 1];
+            double[][] prefixBound = new double[m][qCapacity + 1];
             for (int last = 0; last < m; last++) {
                 for (int used = 0; used <= qCapacity; used++) {
-                    bound[last][used] = INF;
+                    suffixBound[last][used] = INF;
+                    prefixBound[last][used] = INF;
                 }
             }
 
@@ -573,7 +581,7 @@ public final class PricingEspprcSolver {
                         if (nextUsed > qCapacity) {
                             continue;
                         }
-                        double tail = bound[next][nextUsed];
+                        double tail = suffixBound[next][nextUsed];
                         if (tail >= INF / 2.0) {
                             continue;
                         }
@@ -585,11 +593,43 @@ public final class PricingEspprcSolver {
                             best = cand;
                         }
                     }
-                    bound[last][used] = best;
+                    suffixBound[last][used] = best;
                 }
             }
 
-            return new CompletionBound(qCapacity, bound);
+            for (int used = qCapacity; used >= 0; used--) {
+                for (int first = 0; first < m; first++) {
+                    double best = startCost(ins, customers, first, constraints);
+                    for (int prev = 0; prev < m; prev++) {
+                        if (prev == first) {
+                            continue;
+                        }
+                        if (constraints != null
+                                && constraints.forbiddenArcLocal != null
+                                && constraints.forbiddenArcLocal[prev][first]) {
+                            continue;
+                        }
+                        int nextUsed = used + qUnits[prev];
+                        if (nextUsed > qCapacity) {
+                            continue;
+                        }
+                        double head = prefixBound[prev][nextUsed];
+                        if (head >= INF / 2.0) {
+                            continue;
+                        }
+                        double cand = head
+                                + ins.c[customers[prev]][customers[first]]
+                                - dual[prev]
+                                - internalArcDual(prev, first, constraints);
+                        if (cand < best) {
+                            best = cand;
+                        }
+                    }
+                    prefixBound[first][used] = best;
+                }
+            }
+
+            return new CompletionBound(qCapacity, suffixBound, prefixBound);
         }
 
         double lowerBound(int lastLocal, double usedLoad) {
@@ -598,6 +638,14 @@ public final class PricingEspprcSolver {
                 return Double.NaN;
             }
             return suffixLowerBoundByUsedLoad[lastLocal][usedUnits];
+        }
+
+        double backwardLowerBound(int firstLocal, double usedLoad) {
+            Integer usedUnits = toIntegralUnits(usedLoad);
+            if (usedUnits == null || usedUnits < 0 || usedUnits > capacityUnits) {
+                return Double.NaN;
+            }
+            return prefixLowerBoundByUsedLoad[firstLocal][usedUnits];
         }
 
         private static double returnCost(
@@ -616,6 +664,20 @@ public final class PricingEspprcSolver {
                 dual = constraints.returnArcDualLocal[lastLocal];
             }
             return ins.c[customers[lastLocal]][ins.n + 1] - dual;
+        }
+
+        private static double startCost(
+                Instance ins,
+                int[] customers,
+                int firstLocal,
+                RoutePricingConstraints constraints
+        ) {
+            if (constraints != null
+                    && constraints.forbiddenStartLocal != null
+                    && constraints.forbiddenStartLocal[firstLocal]) {
+                return INF;
+            }
+            return ins.c[0][customers[firstLocal]];
         }
 
         private static double internalArcDual(int fromLocal, int toLocal, RoutePricingConstraints constraints) {
@@ -1820,6 +1882,7 @@ public final class PricingEspprcSolver {
         final long[] ngMaskByLocal;
         final int maxDepth;
         final double stepSize;
+        final CompletionBound completionBound;
         boolean aborted = false;
 
         double bestReducedCost = Double.POSITIVE_INFINITY;
@@ -1855,6 +1918,7 @@ public final class PricingEspprcSolver {
             this.ngMaskByLocal = buildInitialNgMasks();
             this.maxDepth = Math.max(customers.length + 2, Math.min(customers.length * 2, customers.length + 10));
             this.stepSize = Math.max(1.0, ins.Q / 4.0);
+            this.completionBound = CompletionBound.tryBuild(ins, customers, q, dual, constraints);
         }
 
         ArrayList<RouteColumn> getCollectedRoutes() {
@@ -1867,7 +1931,7 @@ public final class PricingEspprcSolver {
 
         void run() {
             long startNs = System.nanoTime();
-            int rounds = Math.max(1, Math.min(customers.length, 3));
+            int rounds = 1;
             for (int round = 0; round < rounds; round++) {
                 bestAnyReducedCost = Double.POSITIVE_INFINITY;
                 bestAnyLocals = null;
@@ -2008,6 +2072,12 @@ public final class PricingEspprcSolver {
                 }
                 forwardExtended[label.lastLocal].add(label);
                 considerForwardCompleteRoute(label);
+                if (maxColumns > 0 && collected.size() >= maxColumns) {
+                    return;
+                }
+                if (!canStillReachUsefulForward(label)) {
+                    continue;
+                }
                 if (label.depth >= maxDepth) {
                     continue;
                 }
@@ -2061,6 +2131,12 @@ public final class PricingEspprcSolver {
                 }
                 backwardExtended[label.firstLocal].add(label);
                 considerBackwardCompleteRoute(label);
+                if (maxColumns > 0 && collected.size() >= maxColumns) {
+                    return;
+                }
+                if (!canStillReachUsefulBackward(label)) {
+                    continue;
+                }
                 if (label.depth >= maxDepth) {
                     continue;
                 }
@@ -2168,6 +2244,46 @@ public final class PricingEspprcSolver {
 
         private boolean isOverBudget(long startNs) {
             return System.nanoTime() - startNs > BIDIRECTIONAL_RELAXED_TIME_BUDGET_NS;
+        }
+
+        private boolean canStillReachUsefulForward(RelaxForwardLabel label) {
+            if (completionBound == null) {
+                return true;
+            }
+            double completionLb = completionBound.lowerBound(label.lastLocal, label.load);
+            if (Double.isNaN(completionLb)) {
+                return true;
+            }
+            if (!Double.isFinite(completionLb)) {
+                return false;
+            }
+            double routeLowerBound = label.partialReducedCost + completionLb - dualU0;
+            return routeLowerBound < lowerBoundThreshold() - DOM_EPS;
+        }
+
+        private boolean canStillReachUsefulBackward(RelaxBackwardLabel label) {
+            if (completionBound == null) {
+                return true;
+            }
+            double completionLb = completionBound.backwardLowerBound(label.firstLocal, label.load);
+            if (Double.isNaN(completionLb)) {
+                return true;
+            }
+            if (!Double.isFinite(completionLb)) {
+                return false;
+            }
+            double routeLowerBound = label.partialReducedCost + completionLb - dualU0;
+            return routeLowerBound < lowerBoundThreshold() - DOM_EPS;
+        }
+
+        private double lowerBoundThreshold() {
+            if (maxColumns > 0 && collected.size() >= maxColumns) {
+                return collected.get(collected.size() - 1).reducedCost;
+            }
+            if (bestReducedCost < -RC_EPS) {
+                return bestReducedCost;
+            }
+            return -RC_EPS;
         }
 
         private void considerForwardCompleteRoute(RelaxForwardLabel label) {
