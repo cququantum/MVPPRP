@@ -308,6 +308,7 @@ public final class PricingEspprcSolver {
         final ArrayList<CollectedColumn> collected;
         final HashSet<String> collectedKeys;
         final RoutePricingConstraints constraints;
+        final CompletionBound completionBound;
 
         double bestReducedCost = Double.POSITIVE_INFINITY;
         RouteColumn bestRoute = null;
@@ -332,6 +333,7 @@ public final class PricingEspprcSolver {
             this.collected = new ArrayList<CollectedColumn>();
             this.collectedKeys = new HashSet<String>();
             this.constraints = constraints;
+            this.completionBound = CompletionBound.tryBuild(ins, customers, q, dual, constraints);
         }
 
         abstract void run();
@@ -381,6 +383,31 @@ public final class PricingEspprcSolver {
                 out.add(collected.get(i).route);
             }
             return out;
+        }
+
+        final boolean canStillReachUsefulRoute(AbstractLabel label) {
+            if (completionBound == null) {
+                return true;
+            }
+            double completionLb = completionBound.lowerBound(label.lastLocal, label.load);
+            if (Double.isNaN(completionLb)) {
+                return true;
+            }
+            if (!Double.isFinite(completionLb)) {
+                return false;
+            }
+            double routeLowerBound = label.partialReducedCost + completionLb - dualU0;
+            return routeLowerBound < lowerBoundThreshold() - DOM_EPS;
+        }
+
+        private double lowerBoundThreshold() {
+            if (maxColumns > 0 && collected.size() >= maxColumns) {
+                return collected.get(collected.size() - 1).reducedCost;
+            }
+            if (bestReducedCost < -RC_EPS) {
+                return bestReducedCost;
+            }
+            return -RC_EPS;
         }
 
         final void considerCompleteRoute(AbstractLabel label) {
@@ -448,6 +475,134 @@ public final class PricingEspprcSolver {
             }
             collected.add(pos, candidate);
             collectedKeys.add(candidate.key);
+        }
+    }
+
+    /**
+     * Capacity-state completion bound in the same role as LRP's {@code CapTwoCycleFree}:
+     * from a current last customer and used load, estimate the best possible reduced-cost
+     * suffix back to the depot under the node's forbidden arcs and cut duals.
+     *
+     * The bound is only activated when vehicle capacity and customer demands are integral.
+     * Otherwise pricing falls back to its existing exact/relaxed logic without this pruning.
+     */
+    private static final class CompletionBound {
+        private static final double INF = 1e30;
+        private static final double INTEGRAL_EPS = 1e-9;
+
+        final int capacityUnits;
+        final double[][] suffixLowerBoundByUsedLoad;
+
+        private CompletionBound(int capacityUnits, double[][] suffixLowerBoundByUsedLoad) {
+            this.capacityUnits = capacityUnits;
+            this.suffixLowerBoundByUsedLoad = suffixLowerBoundByUsedLoad;
+        }
+
+        static CompletionBound tryBuild(
+                Instance ins,
+                int[] customers,
+                double[] q,
+                double[] dual,
+                RoutePricingConstraints constraints
+        ) {
+            Integer qCapacity = toIntegralUnits(ins.Q);
+            if (qCapacity == null || qCapacity < 0) {
+                return null;
+            }
+            int[] qUnits = new int[q.length];
+            for (int local = 0; local < q.length; local++) {
+                Integer units = toIntegralUnits(q[local]);
+                if (units == null || units <= 0 || units > qCapacity) {
+                    return null;
+                }
+                qUnits[local] = units;
+            }
+
+            int m = customers.length;
+            double[][] bound = new double[m][qCapacity + 1];
+            for (int last = 0; last < m; last++) {
+                for (int used = 0; used <= qCapacity; used++) {
+                    bound[last][used] = INF;
+                }
+            }
+
+            for (int used = qCapacity; used >= 0; used--) {
+                for (int last = 0; last < m; last++) {
+                    double best = returnCost(ins, customers, last, constraints);
+                    for (int next = 0; next < m; next++) {
+                        if (next == last) {
+                            continue;
+                        }
+                        if (constraints != null
+                                && constraints.forbiddenArcLocal != null
+                                && constraints.forbiddenArcLocal[last][next]) {
+                            continue;
+                        }
+                        int nextUsed = used + qUnits[next];
+                        if (nextUsed > qCapacity) {
+                            continue;
+                        }
+                        double tail = bound[next][nextUsed];
+                        if (tail >= INF / 2.0) {
+                            continue;
+                        }
+                        double cand = ins.c[customers[last]][customers[next]]
+                                - dual[next]
+                                - internalArcDual(last, next, constraints)
+                                + tail;
+                        if (cand < best) {
+                            best = cand;
+                        }
+                    }
+                    bound[last][used] = best;
+                }
+            }
+
+            return new CompletionBound(qCapacity, bound);
+        }
+
+        double lowerBound(int lastLocal, double usedLoad) {
+            Integer usedUnits = toIntegralUnits(usedLoad);
+            if (usedUnits == null || usedUnits < 0 || usedUnits > capacityUnits) {
+                return Double.NaN;
+            }
+            return suffixLowerBoundByUsedLoad[lastLocal][usedUnits];
+        }
+
+        private static double returnCost(
+                Instance ins,
+                int[] customers,
+                int lastLocal,
+                RoutePricingConstraints constraints
+        ) {
+            if (constraints != null
+                    && constraints.forbiddenReturnLocal != null
+                    && constraints.forbiddenReturnLocal[lastLocal]) {
+                return INF;
+            }
+            double dual = 0.0;
+            if (constraints != null && constraints.returnArcDualLocal != null) {
+                dual = constraints.returnArcDualLocal[lastLocal];
+            }
+            return ins.c[customers[lastLocal]][ins.n + 1] - dual;
+        }
+
+        private static double internalArcDual(int fromLocal, int toLocal, RoutePricingConstraints constraints) {
+            if (constraints == null || constraints.arcDualLocal == null) {
+                return 0.0;
+            }
+            return constraints.arcDualLocal[fromLocal][toLocal];
+        }
+
+        private static Integer toIntegralUnits(double value) {
+            long rounded = Math.round(value);
+            if (Math.abs(value - rounded) > INTEGRAL_EPS) {
+                return null;
+            }
+            if (rounded < Integer.MIN_VALUE || rounded > Integer.MAX_VALUE) {
+                return null;
+            }
+            return (int) rounded;
         }
     }
 
@@ -551,6 +706,9 @@ public final class PricingEspprcSolver {
                     continue;
                 }
                 considerCompleteRoute(cur);
+                if (!canStillReachUsefulRoute(cur)) {
+                    continue;
+                }
                 if (cannotBeatBest(cur)) {
                     continue;
                 }
@@ -830,6 +988,9 @@ public final class PricingEspprcSolver {
                     continue;
                 }
                 considerCompleteRoute(cur);
+                if (!canStillReachUsefulRoute(cur)) {
+                    continue;
+                }
 
                 int nxt = cur.visited.nextClearBit(0);
                 while (nxt >= 0 && nxt < customerCount) {
@@ -991,6 +1152,7 @@ public final class PricingEspprcSolver {
         final HashSet<String> collectedKeys;
         final long[] ngMaskByLocal;
         final int maxDepth;
+        final CompletionBound completionBound;
 
         double bestReducedCost = Double.POSITIVE_INFINITY;
         RouteColumn bestRoute = null;
@@ -1026,6 +1188,7 @@ public final class PricingEspprcSolver {
             this.collectedKeys = new HashSet<String>();
             this.ngMaskByLocal = buildInitialNgMasks();
             this.maxDepth = Math.max(customers.length + 2, Math.min(customers.length * 2, customers.length + 10));
+            this.completionBound = CompletionBound.tryBuild(ins, customers, q, dual, constraints);
         }
 
         ArrayList<RouteColumn> getCollectedRoutes() {
@@ -1088,6 +1251,9 @@ public final class PricingEspprcSolver {
             while (!queue.isEmpty()) {
                 NgLabel cur = queue.pollFirst();
                 considerCompleteRoute(cur);
+                if (!canStillReachUsefulRoute(cur)) {
+                    continue;
+                }
                 if (cur.depth >= maxDepth) {
                     continue;
                 }
@@ -1148,6 +1314,29 @@ public final class PricingEspprcSolver {
                 return false;
             }
             return true;
+        }
+
+        private boolean canStillReachUsefulRoute(NgLabel label) {
+            if (completionBound == null) {
+                return true;
+            }
+            double completionLb = completionBound.lowerBound(label.lastLocal, label.load);
+            if (Double.isNaN(completionLb)) {
+                return true;
+            }
+            if (!Double.isFinite(completionLb)) {
+                return false;
+            }
+            double routeLowerBound = label.partialReducedCost + completionLb - dualU0;
+            double threshold;
+            if (collected.size() >= maxColumns && maxColumns > 0) {
+                threshold = collected.get(collected.size() - 1).reducedCost;
+            } else if (bestReducedCost < -RC_EPS) {
+                threshold = bestReducedCost;
+            } else {
+                threshold = -RC_EPS;
+            }
+            return routeLowerBound < threshold - DOM_EPS;
         }
 
         private void considerCompleteRoute(NgLabel label) {

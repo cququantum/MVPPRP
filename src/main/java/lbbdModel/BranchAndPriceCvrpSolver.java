@@ -113,23 +113,37 @@ public final class BranchAndPriceCvrpSolver {
         final BranchType type;
         final double vehicleValue;
         final ArcBranch arc;
+        final ArrayList<RouteColumn> leftSeedColumns;
+        final ArrayList<RouteColumn> rightSeedColumns;
 
-        private BranchDecision(BranchType type, double vehicleValue, ArcBranch arc) {
+        private BranchDecision(
+                BranchType type,
+                double vehicleValue,
+                ArcBranch arc,
+                ArrayList<RouteColumn> leftSeedColumns,
+                ArrayList<RouteColumn> rightSeedColumns
+        ) {
             this.type = type;
             this.vehicleValue = vehicleValue;
             this.arc = arc;
+            this.leftSeedColumns = leftSeedColumns;
+            this.rightSeedColumns = rightSeedColumns;
         }
 
         static BranchDecision leaf() {
-            return new BranchDecision(BranchType.LEAF, Double.NaN, null);
+            return new BranchDecision(BranchType.LEAF, Double.NaN, null, null, null);
         }
 
         static BranchDecision vehicle(double vehicleValue) {
-            return new BranchDecision(BranchType.VEHICLE, vehicleValue, null);
+            return new BranchDecision(BranchType.VEHICLE, vehicleValue, null, null, null);
         }
 
         static BranchDecision arc(ArcBranch arc) {
-            return new BranchDecision(BranchType.ARC, Double.NaN, arc);
+            return new BranchDecision(BranchType.ARC, Double.NaN, arc, null, null);
+        }
+
+        static BranchDecision arc(ArcBranch arc, ArrayList<RouteColumn> leftSeedColumns, ArrayList<RouteColumn> rightSeedColumns) {
+            return new BranchDecision(BranchType.ARC, Double.NaN, arc, leftSeedColumns, rightSeedColumns);
         }
     }
 
@@ -355,6 +369,18 @@ public final class BranchAndPriceCvrpSolver {
         PendingNode(BranchNode node, NodeLpResult lpResult) {
             this.node = node;
             this.lpResult = lpResult;
+        }
+    }
+
+    private static final class StrongBranchEval {
+        final boolean infeasible;
+        final double objective;
+        final ArrayList<RouteColumn> routePool;
+
+        StrongBranchEval(boolean infeasible, double objective, ArrayList<RouteColumn> routePool) {
+            this.infeasible = infeasible;
+            this.objective = objective;
+            this.routePool = routePool;
         }
     }
 
@@ -635,20 +661,24 @@ public final class BranchAndPriceCvrpSolver {
             } else {
                 leftNode = null;
                 rightNode = null;
-                leftSeeds = filterAllowedRoutesAfterForbid(
-                        pending.lpResult.routePool,
-                        pending.node,
-                        decision.arc,
-                        false,
-                        active.localIndexByGlobal
-                );
-                rightSeeds = filterAllowedRoutesAfterForbid(
-                        pending.lpResult.routePool,
-                        pending.node,
-                        decision.arc,
-                        true,
-                        active.localIndexByGlobal
-                );
+                leftSeeds = decision.leftSeedColumns != null
+                        ? decision.leftSeedColumns
+                        : filterAllowedRoutesAfterForbid(
+                                pending.lpResult.routePool,
+                                pending.node,
+                                decision.arc,
+                                false,
+                                active.localIndexByGlobal
+                        );
+                rightSeeds = decision.rightSeedColumns != null
+                        ? decision.rightSeedColumns
+                        : filterAllowedRoutesAfterForbid(
+                                pending.lpResult.routePool,
+                                pending.node,
+                                decision.arc,
+                                true,
+                                active.localIndexByGlobal
+                        );
                 leftNode = pending.node.childForbidArc(decision.arc, leftSeeds, childCuts);
                 rightNode = pending.node.childForceArc(decision.arc, rightSeeds, childCuts);
             }
@@ -974,12 +1004,14 @@ public final class BranchAndPriceCvrpSolver {
 
         ArcBranch bestArc = null;
         double bestScore = Double.NEGATIVE_INFINITY;
+        ArrayList<RouteColumn> bestLeftSeeds = null;
+        ArrayList<RouteColumn> bestRightSeeds = null;
         for (int idx = 0; idx < candidates.size(); idx++) {
             if (remainingSeconds(deadlineNs) < 1.0) {
                 break;
             }
             ArcBranch candidate = candidates.get(idx);
-            double leftObj = evaluateBranchChild(
+            StrongBranchEval leftEval = evaluateBranchChild(
                     ins,
                     t,
                     active,
@@ -990,7 +1022,7 @@ public final class BranchAndPriceCvrpSolver {
                     ),
                     deadlineNs
             );
-            double rightObj = evaluateBranchChild(
+            StrongBranchEval rightEval = evaluateBranchChild(
                     ins,
                     t,
                     active,
@@ -1002,16 +1034,18 @@ public final class BranchAndPriceCvrpSolver {
                     deadlineNs
             );
 
-            if (Double.isInfinite(leftObj) || Double.isInfinite(rightObj)) {
-                return BranchDecision.arc(candidate);
+            if (leftEval.infeasible || rightEval.infeasible) {
+                return BranchDecision.arc(candidate, leftEval.routePool, rightEval.routePool);
             }
-            double score = leftObj + rightObj;
+            double score = leftEval.objective + rightEval.objective;
             if (score > bestScore + 1e-9) {
                 bestScore = score;
                 bestArc = candidate;
+                bestLeftSeeds = leftEval.routePool;
+                bestRightSeeds = rightEval.routePool;
             }
         }
-        return bestArc == null ? null : BranchDecision.arc(bestArc);
+        return bestArc == null ? null : BranchDecision.arc(bestArc, bestLeftSeeds, bestRightSeeds);
     }
 
     private static BranchDecision chooseArcHeuristically(ActiveSet active, ArrayList<ActiveRouteValue> positiveRoutes) {
@@ -1095,7 +1129,7 @@ public final class BranchAndPriceCvrpSolver {
         return candidates;
     }
 
-    private double evaluateBranchChild(
+    private StrongBranchEval evaluateBranchChild(
             Instance ins,
             int t,
             ActiveSet active,
@@ -1103,11 +1137,11 @@ public final class BranchAndPriceCvrpSolver {
             long deadlineNs
     ) {
         if (node.vehicleLowerBound > node.vehicleUpperBound || node.vehicleLowerBound > active.size()) {
-            return Double.POSITIVE_INFINITY;
+            return new StrongBranchEval(true, Double.POSITIVE_INFINITY, node.seedColumns);
         }
         int minVehiclesByLoad = (int) Math.ceil((active.totalLoad - EPS) / active.vehicleCapacity);
         if (minVehiclesByLoad > node.vehicleUpperBound) {
-            return Double.POSITIVE_INFINITY;
+            return new StrongBranchEval(true, Double.POSITIVE_INFINITY, node.seedColumns);
         }
 
         double artificialPenalty = computeArtificialPenalty(ins, active.size());
@@ -1128,7 +1162,7 @@ public final class BranchAndPriceCvrpSolver {
                 boolean solved = master.cplex.solve();
                 String status = master.cplex.getStatus().toString();
                 if (!solved || !status.startsWith("Optimal")) {
-                    return Double.POSITIVE_INFINITY;
+                    return new StrongBranchEval(true, Double.POSITIVE_INFINITY, master.copyRoutePool());
                 }
 
                 DualData duals = master.extractDuals();
@@ -1158,14 +1192,14 @@ public final class BranchAndPriceCvrpSolver {
                 }
 
                 if (master.hasPositiveCoverArtificial() || master.hasPositiveVehicleLowerSlack() || master.hasPositiveCutSlack()) {
-                    return Double.POSITIVE_INFINITY;
+                    return new StrongBranchEval(true, Double.POSITIVE_INFINITY, master.copyRoutePool());
                 }
-                return master.cplex.getObjValue();
+                return new StrongBranchEval(false, master.cplex.getObjValue(), master.copyRoutePool());
             }
         } catch (IloException e) {
-            return Double.POSITIVE_INFINITY;
+            return new StrongBranchEval(true, Double.POSITIVE_INFINITY, node.seedColumns);
         }
-        return Double.POSITIVE_INFINITY;
+        return new StrongBranchEval(true, Double.POSITIVE_INFINITY, node.seedColumns);
     }
 
     private static ArrayList<RouteColumn> filterAllowedRoutes(
@@ -1485,16 +1519,7 @@ public final class BranchAndPriceCvrpSolver {
     }
 
     private static int maxColumnsPerPricing(int customerCount) {
-        if (customerCount >= 25) {
-            return 24;
-        }
-        if (customerCount >= 15) {
-            return 18;
-        }
-        if (customerCount >= 8) {
-            return 12;
-        }
-        return 8;
+        return 120;
     }
 
     private static double computeArtificialPenalty(Instance ins, int customerCount) {
