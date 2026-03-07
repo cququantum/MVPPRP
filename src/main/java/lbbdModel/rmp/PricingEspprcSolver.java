@@ -20,6 +20,41 @@ public final class PricingEspprcSolver {
     private static final double DOM_EPS = 1e-12;
     private static final int SUPERSET_CLEANUP_MAX_EXTRA_BITS = 7;
 
+    /**
+     * Optional branch-node route restrictions for branch-and-price.
+     * For a customer pair (i,j):
+     * - "separate" is modeled by forbidding routes that contain both.
+     * - "together" is modeled by allowing only routes that contain both or neither.
+     *
+     * The arrays are indexed by the local customer index used in the current pricing call.
+     */
+    public static final class RoutePricingConstraints {
+        final long[] requiredWithLocalLong;
+        final long[] forbiddenWithLocalLong;
+        final BitSet[] requiredWithLocalBits;
+        final BitSet[] forbiddenWithLocalBits;
+
+        private RoutePricingConstraints(
+                long[] requiredWithLocalLong,
+                long[] forbiddenWithLocalLong,
+                BitSet[] requiredWithLocalBits,
+                BitSet[] forbiddenWithLocalBits
+        ) {
+            this.requiredWithLocalLong = requiredWithLocalLong;
+            this.forbiddenWithLocalLong = forbiddenWithLocalLong;
+            this.requiredWithLocalBits = requiredWithLocalBits;
+            this.forbiddenWithLocalBits = forbiddenWithLocalBits;
+        }
+
+        public static RoutePricingConstraints fromLongMasks(long[] requiredWithLocalLong, long[] forbiddenWithLocalLong) {
+            return new RoutePricingConstraints(requiredWithLocalLong, forbiddenWithLocalLong, null, null);
+        }
+
+        public static RoutePricingConstraints fromBitSets(BitSet[] requiredWithLocalBits, BitSet[] forbiddenWithLocalBits) {
+            return new RoutePricingConstraints(null, null, requiredWithLocalBits, forbiddenWithLocalBits);
+        }
+    }
+
     public static final class Result {
         public final boolean foundNegativeColumn;
         public final double bestReducedCost;
@@ -73,14 +108,27 @@ public final class PricingEspprcSolver {
             HashSet<String> existingRouteKeys,
             int maxColumns
     ) {
+        return findNegativeRoutes(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns, null);
+    }
+
+    public Result findNegativeRoutes(
+            Instance ins,
+            int[] activeGlobalCustomers,
+            double[] qLocal,
+            double[] dualUiLocal,
+            double dualU0,
+            HashSet<String> existingRouteKeys,
+            int maxColumns,
+            RoutePricingConstraints constraints
+    ) {
         if (activeGlobalCustomers.length == 0) {
             return new Result(false, 0.0, null, new ArrayList<RouteColumn>());
         }
         Search search;
         if (activeGlobalCustomers.length <= 62) {
-            search = new LongMaskSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns);
+            search = new LongMaskSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns, constraints);
         } else {
-            search = new BitSetSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns);
+            search = new BitSetSearch(ins, activeGlobalCustomers, qLocal, dualUiLocal, dualU0, existingRouteKeys, maxColumns, constraints);
         }
         search.run();
         ArrayList<RouteColumn> routes = search.getCollectedRoutes();
@@ -147,6 +195,7 @@ public final class PricingEspprcSolver {
         final int maxColumns;
         final ArrayList<CollectedColumn> collected;
         final HashSet<String> collectedKeys;
+        final RoutePricingConstraints constraints;
 
         double bestReducedCost = Double.POSITIVE_INFINITY;
         RouteColumn bestRoute = null;
@@ -158,7 +207,8 @@ public final class PricingEspprcSolver {
                 double[] dual,
                 double dualU0,
                 HashSet<String> existingKeys,
-                int maxColumns
+                int maxColumns,
+                RoutePricingConstraints constraints
         ) {
             this.ins = ins;
             this.customers = customers;
@@ -169,9 +219,13 @@ public final class PricingEspprcSolver {
             this.maxColumns = Math.max(0, maxColumns);
             this.collected = new ArrayList<CollectedColumn>();
             this.collectedKeys = new HashSet<String>();
+            this.constraints = constraints;
         }
 
         abstract void run();
+        abstract boolean isStartAllowed(int startLocal);
+        abstract boolean canExtend(AbstractLabel label, int nextLocal);
+        abstract boolean isCompleteRouteAllowed(AbstractLabel label);
 
         final ArrayList<RouteColumn> getCollectedRoutes() {
             ArrayList<RouteColumn> out = new ArrayList<RouteColumn>(collected.size());
@@ -182,6 +236,9 @@ public final class PricingEspprcSolver {
         }
 
         final void considerCompleteRoute(AbstractLabel label) {
+            if (!isCompleteRouteAllowed(label)) {
+                return;
+            }
             int lastGlobalNode = customers[label.lastLocal];
             double fullCost = label.travelCost + ins.c[lastGlobalNode][ins.n + 1];
             double reducedCost = fullCost - label.dualGain - dualU0;
@@ -300,9 +357,10 @@ public final class PricingEspprcSolver {
                 double[] dual,
                 double dualU0,
                 HashSet<String> existingKeys,
-                int maxColumns
+                int maxColumns,
+                RoutePricingConstraints constraints
         ) {
-            super(ins, customers, q, dual, dualU0, existingKeys, maxColumns);
+            super(ins, customers, q, dual, dualU0, existingKeys, maxColumns, constraints);
             this.fullMask = (1L << customers.length) - 1L;
             this.localBit = new long[customers.length];
             this.returnToDepot = new double[customers.length];
@@ -323,7 +381,7 @@ public final class PricingEspprcSolver {
         @Override
         void run() {
             for (int start = 0; start < customers.length; start++) {
-                if (q[start] > ins.Q + 1e-9) {
+                if (q[start] > ins.Q + 1e-9 || !isStartAllowed(start)) {
                     continue;
                 }
                 long mask = (1L << start);
@@ -352,6 +410,9 @@ public final class PricingEspprcSolver {
                     int nxt = Long.numberOfTrailingZeros(bit);
                     remaining ^= bit;
 
+                    if (!canExtend(cur, nxt)) {
+                        continue;
+                    }
                     double newLoad = cur.load + q[nxt];
                     if (newLoad > ins.Q + 1e-9) {
                         continue;
@@ -373,6 +434,37 @@ public final class PricingEspprcSolver {
                     }
                 }
             }
+        }
+
+        @Override
+        boolean isStartAllowed(int startLocal) {
+            return true;
+        }
+
+        @Override
+        boolean canExtend(AbstractLabel label, int nextLocal) {
+            if (constraints == null || constraints.forbiddenWithLocalLong == null) {
+                return true;
+            }
+            LongLabel longLabel = (LongLabel) label;
+            return (longLabel.visitedMask & constraints.forbiddenWithLocalLong[nextLocal]) == 0L;
+        }
+
+        @Override
+        boolean isCompleteRouteAllowed(AbstractLabel label) {
+            if (constraints == null || constraints.requiredWithLocalLong == null) {
+                return true;
+            }
+            long visited = ((LongLabel) label).visitedMask;
+            long bits = visited;
+            while (bits != 0L) {
+                int local = Long.numberOfTrailingZeros(bits);
+                if ((visited & constraints.requiredWithLocalLong[local]) != constraints.requiredWithLocalLong[local]) {
+                    return false;
+                }
+                bits ^= (bits & -bits);
+            }
+            return true;
         }
 
         private boolean register(LongLabel label) {
@@ -540,9 +632,10 @@ public final class PricingEspprcSolver {
                 double[] dual,
                 double dualU0,
                 HashSet<String> existingKeys,
-                int maxColumns
+                int maxColumns,
+                RoutePricingConstraints constraints
         ) {
-            super(ins, customers, q, dual, dualU0, existingKeys, maxColumns);
+            super(ins, customers, q, dual, dualU0, existingKeys, maxColumns, constraints);
             this.customerCount = customers.length;
             this.returnToDepot = new double[customerCount];
             for (int k = 0; k < customerCount; k++) {
@@ -555,7 +648,7 @@ public final class PricingEspprcSolver {
         @Override
         void run() {
             for (int start = 0; start < customerCount; start++) {
-                if (q[start] > ins.Q + 1e-9) {
+                if (q[start] > ins.Q + 1e-9 || !isStartAllowed(start)) {
                     continue;
                 }
                 BitSet visited = new BitSet(customerCount);
@@ -578,6 +671,10 @@ public final class PricingEspprcSolver {
 
                 int nxt = cur.visited.nextClearBit(0);
                 while (nxt >= 0 && nxt < customerCount) {
+                    if (!canExtend(cur, nxt)) {
+                        nxt = cur.visited.nextClearBit(nxt + 1);
+                        continue;
+                    }
                     double newLoad = cur.load + q[nxt];
                     if (newLoad <= ins.Q + 1e-9) {
                         int curGlobal = customers[cur.lastLocal];
@@ -600,6 +697,47 @@ public final class PricingEspprcSolver {
                     nxt = cur.visited.nextClearBit(nxt + 1);
                 }
             }
+        }
+
+        @Override
+        boolean isStartAllowed(int startLocal) {
+            return true;
+        }
+
+        @Override
+        boolean canExtend(AbstractLabel label, int nextLocal) {
+            if (constraints == null || constraints.forbiddenWithLocalBits == null) {
+                return true;
+            }
+            BitSetLabel bitSetLabel = (BitSetLabel) label;
+            BitSet forbidden = constraints.forbiddenWithLocalBits[nextLocal];
+            if (forbidden == null || forbidden.isEmpty()) {
+                return true;
+            }
+            BitSet overlap = (BitSet) bitSetLabel.visited.clone();
+            overlap.and(forbidden);
+            return overlap.isEmpty();
+        }
+
+        @Override
+        boolean isCompleteRouteAllowed(AbstractLabel label) {
+            if (constraints == null || constraints.requiredWithLocalBits == null) {
+                return true;
+            }
+            BitSet visited = ((BitSetLabel) label).visited;
+            int bit = visited.nextSetBit(0);
+            while (bit >= 0) {
+                BitSet required = constraints.requiredWithLocalBits[bit];
+                if (required != null && !required.isEmpty()) {
+                    BitSet missing = (BitSet) required.clone();
+                    missing.andNot(visited);
+                    if (!missing.isEmpty()) {
+                        return false;
+                    }
+                }
+                bit = visited.nextSetBit(bit + 1);
+            }
+            return true;
         }
 
         private boolean register(BitSetLabel label) {

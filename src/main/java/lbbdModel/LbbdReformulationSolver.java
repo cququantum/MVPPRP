@@ -483,7 +483,7 @@ public final class LbbdReformulationSolver {
                         if (subKeysByPeriod[t] != null && subResults[t] != null
                                 && !subproblemCache.containsKey(subKeysByPeriod[t])) {
                             PeriodCvrpSubproblemSolver.Result sub = subResults[t];
-                            if (sub.optimal || !sub.feasible) {
+                            if (sub.optimal || sub.provenInfeasible) {
                                 subproblemCache.put(subKeysByPeriod[t], sub);
                             }
                         }
@@ -491,14 +491,19 @@ public final class LbbdReformulationSolver {
                 }
 
                 // Phase 3: process results
+                int unresolvedPeriod = -1;
+                String unresolvedSubproblemStatus = null;
                 for (int t = 1; t <= ins.l; t++) {
                     PeriodCvrpSubproblemSolver.Result sub = subResults[t];
-                    if (!sub.feasible) {
+                    if (sub.provenInfeasible) {
                         infeasiblePeriod = t;
                         break;
                     }
-                    if (!sub.optimal) {
+                    if (!sub.feasible || !sub.optimal || Double.isNaN(sub.objective) || Double.isInfinite(sub.objective)) {
+                        unresolvedPeriod = t;
+                        unresolvedSubproblemStatus = sub.status;
                         allSubproblemsOptimal = false;
+                        break;
                     }
                     phiByPeriod[t] = sub.objective;
                     phi += sub.objective;
@@ -526,6 +531,17 @@ public final class LbbdReformulationSolver {
                     feasibilityCuts++;
                     forceStrictMasterGap = false;
                     continue;
+                }
+                if (unresolvedPeriod >= 0) {
+                    return buildSubproblemUnresolvedResult(
+                            startNs,
+                            iteration,
+                            unresolvedPeriod,
+                            unresolvedSubproblemStatus,
+                            feasibilityCuts,
+                            optimalityCuts,
+                            lpDualCuts
+                    );
                 }
 
                 double exactObjective = point.nonRouteCost + phi;
@@ -890,7 +906,7 @@ public final class LbbdReformulationSolver {
                     qBar[i] = ins.g(i, v, t);
                 }
                 PeriodCvrpSubproblemSolver.Result sub = subproblemSolver.solve(ins, t, qBar, zBar);
-                if (!sub.feasible) {
+                if (!sub.feasible || !sub.optimal) {
                     return null;
                 }
                 phi += sub.objective;
@@ -978,6 +994,25 @@ public final class LbbdReformulationSolver {
                 + ",optCuts=" + optimalityCuts
                 + ",lpDualCuts=" + lpDualCuts
                 + ",masterStatus=" + masterStatus + ")";
+        return new SolveResult("LBBDReformulation", false, false, status, Double.NaN, Double.NaN, Double.NaN, sec);
+    }
+
+    private static SolveResult buildSubproblemUnresolvedResult(
+            long startNs,
+            int iteration,
+            int period,
+            String subStatus,
+            int feasibilityCuts,
+            int optimalityCuts,
+            int lpDualCuts
+    ) {
+        double sec = elapsedSec(startNs);
+        String status = "LBBD_SubproblemUnresolved(iter=" + iteration
+                + ",period=" + period
+                + ",feasCuts=" + feasibilityCuts
+                + ",optCuts=" + optimalityCuts
+                + ",lpDualCuts=" + lpDualCuts
+                + ",subStatus=" + subStatus + ")";
         return new SolveResult("LBBDReformulation", false, false, status, Double.NaN, Double.NaN, Double.NaN, sec);
     }
 

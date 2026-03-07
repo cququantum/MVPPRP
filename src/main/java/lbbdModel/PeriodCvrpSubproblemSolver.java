@@ -16,6 +16,8 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
     private static final double EPS = 1e-9;
     private static final int EXACT_DP_MAX_N = 15;
 
+    private final BranchAndPriceCvrpSolver branchAndPriceSolver = new BranchAndPriceCvrpSolver();
+    // Legacy exact solvers are kept only as internal validation or fallback building blocks.
     private final HashMap<Integer, ExactPeriodModel> exactModels = new HashMap<Integer, ExactPeriodModel>();
     private Instance subsetDpInstance = null;
     private ExactSubsetDpOracle subsetDpOracle = null;
@@ -23,12 +25,14 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
     public static final class Result {
         public final boolean feasible;
         public final boolean optimal;
+        public final boolean provenInfeasible;
         public final String status;
         public final double objective;
 
-        public Result(boolean feasible, boolean optimal, String status, double objective) {
+        public Result(boolean feasible, boolean optimal, boolean provenInfeasible, String status, double objective) {
             this.feasible = feasible;
             this.optimal = optimal;
+            this.provenInfeasible = provenInfeasible;
             this.status = status;
             this.objective = objective;
         }
@@ -40,28 +44,13 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
         double totalPickup = totalPickup(ins, qBar);
         int visitCount = visitCount(ins, zBar);
         if (visitCount == 0 && totalPickup <= EPS) {
-            return new Result(true, true, "TrivialZero", 0.0);
+            return new Result(true, true, false, "TrivialZero", 0.0);
         }
         if (totalPickup > ins.Q * ins.K + EPS) {
-            return new Result(false, false, "InfeasibleByTotalCapacity", Double.NaN);
+            return new Result(false, false, true, "InfeasibleByTotalCapacity", Double.NaN);
         }
-
-        Result dpResult = trySolveBySubsetDp(ins, qBar, zBar);
-        if (dpResult != null) {
-            return dpResult;
-        }
-
-        try {
-            ExactPeriodModel model = exactModels.get(t);
-            if (model == null) {
-                model = new ExactPeriodModel(ins, t);
-                exactModels.put(t, model);
-            }
-            model.setSolveThreads(recommendedExactThreads(visitCount));
-            return model.solve(qBar, zBar, totalPickup);
-        } catch (IloException e) {
-            throw new RuntimeException("Failed to solve CVRP subproblem at t=" + t, e);
-        }
+        BranchAndPriceCvrpSolver.Result bp = branchAndPriceSolver.solve(ins, t, qBar, zBar);
+        return new Result(bp.feasible, bp.optimal, bp.provenInfeasible, bp.status, bp.objective);
     }
 
     @Override
@@ -176,11 +165,11 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
                 if (zBar[i] != 0) {
                     activeMask |= (1 << (i - 1));
                 } else if (qBar[i] > EPS) {
-                    return new Result(false, false, "InfeasibleByPositivePickupWithoutVisit", Double.NaN);
+                    return new Result(false, false, true, "InfeasibleByPositivePickupWithoutVisit", Double.NaN);
                 }
             }
             if (activeMask == 0) {
-                return new Result(true, true, "TrivialZeroDP", 0.0);
+                return new Result(true, true, false, "TrivialZeroDP", 0.0);
             }
 
             buildSubsetLoads(qBar);
@@ -191,7 +180,7 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
                 int bit = bits & -bits;
                 int idx = Integer.numberOfTrailingZeros(bit);
                 if (qBar[idx + 1] > ins.Q + EPS) {
-                    return new Result(false, false, "InfeasibleBySingleCustomerCapacity", Double.NaN);
+                    return new Result(false, false, true, "InfeasibleBySingleCustomerCapacity", Double.NaN);
                 }
                 bits ^= bit;
             }
@@ -199,9 +188,9 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
             clearMemo();
             double best = solvePartition(activeMask, ins.K);
             if (best >= INF / 2) {
-                return new Result(false, false, "InfeasibleByRoutePartitionDP", Double.NaN);
+                return new Result(false, false, true, "InfeasibleByRoutePartitionDP", Double.NaN);
             }
-            return new Result(true, true, "OptimalDP", best);
+            return new Result(true, true, false, "OptimalDP", best);
         }
 
         private void buildSubsetLoads(double[] qBar) {
@@ -446,9 +435,9 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
             String status = cplex.getStatus().toString();
             boolean optimal = status.startsWith("Optimal");
             if (!solved) {
-                return new Result(false, false, status, Double.NaN);
+                return new Result(false, false, false, status, Double.NaN);
             }
-            return new Result(true, optimal, status, cplex.getObjValue());
+            return new Result(true, optimal, false, status, cplex.getObjValue());
         }
 
         void setSolveThreads(int threads) throws IloException {
