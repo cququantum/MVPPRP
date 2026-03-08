@@ -20,6 +20,21 @@ import java.util.Map;
  *    - For each pickup node i, set s_{it} := Demand_i for all t in T (1..l)
  *    - And set s_{i,l+1} := 0 to support dummy period in T' = T ∪ {l+1}
  *
+ * 2) Initial pickup inventory mapping for borrowed delivery benchmarks:
+ *    - The source instances come from Zhang et al. (2021), where InitLevel is the
+ *      customer's initial on-hand inventory in a delivery MVPRP under the OU policy.
+ *    - In this project, pickup occurs at the end of period t and g_{i0t} includes s_{it},
+ *      so directly reusing InitLevel as pickup stock makes many 6/9-period instances
+ *      artificially urgent and infeasible.
+ *    - To preserve the original "first visit urgency" while keeping the raw txt unchanged,
+ *      map the source InitLevel to pickup initial inventory via
+ *          Ii0_pickup := Li - InitLevel_delivery - Demand_i.
+ *      Then the feasibility condition for a first pickup in period t,
+ *          Ii0_pickup + sum_{r=1..t} s_{ir} <= Li,
+ *      becomes
+ *          sum_{r=1..t-1} Demand_i <= InitLevel_delivery,
+ *      which matches the original delivery benchmark semantics.
+ *
  * 2) External finished-goods demand d_t:
  *    - Default: d_t := (sum_i s_{it}) / k
  *
@@ -157,10 +172,10 @@ public final class Instance {
             }
             this.x[i] = nd.x;
             this.y[i] = nd.y;
-            this.Ii0[i] = nd.init;
             this.Li[i]  = nd.max;
             this.hi[i]  = nd.hold;
             this.demand[i] = nd.demand;
+            this.Ii0[i] = mapDeliveryInitToPickupInit(nd.init, this.Li[i], this.demand[i]);
         }
 
         // Options
@@ -349,6 +364,11 @@ public final class Instance {
         if (mode == Options.DistanceMode.EUCLIDEAN_FLOOR) return Math.floor(dist);
         // EUCLIDEAN_ROUND (use Math.rint for nearest int in double)
         return Math.rint(dist);
+    }
+
+    private static double mapDeliveryInitToPickupInit(double deliveryInit, double capacity, double periodDemand) {
+        double mapped = capacity - deliveryInit - periodDemand;
+        return Math.max(0.0, mapped);
     }
 
     // -----------------------

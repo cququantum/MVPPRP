@@ -18,11 +18,16 @@ import java.util.HashSet;
 public final class PricingEspprcSolver {
     private static final double RC_EPS = 1e-8;
     private static final double DOM_EPS = 1e-12;
+    private static final int SUBSET_DOMINANCE_MAX_EXTRA_BITS = 8;
     private static final int SUPERSET_CLEANUP_MAX_EXTRA_BITS = 7;
     private static final long BIDIRECTIONAL_RELAXED_TIME_BUDGET_NS = 300_000_000L;
 
     private static boolean isFinite(double value) {
         return !Double.isNaN(value) && !Double.isInfinite(value);
+    }
+
+    private static boolean shouldEnumerateSubsetDominance(long optionalBits) {
+        return Long.bitCount(optionalBits) <= SUBSET_DOMINANCE_MAX_EXTRA_BITS;
     }
 
     /**
@@ -442,6 +447,21 @@ public final class PricingEspprcSolver {
             return routeLowerBound < lowerBoundThreshold() - DOM_EPS;
         }
 
+        final boolean canStillReachUsefulBackward(int firstLocal, double usedLoad, double partialReducedCost) {
+            if (completionBound == null) {
+                return true;
+            }
+            double completionLb = completionBound.backwardLowerBound(firstLocal, usedLoad);
+            if (Double.isNaN(completionLb)) {
+                return true;
+            }
+            if (!isFinite(completionLb)) {
+                return false;
+            }
+            double routeLowerBound = partialReducedCost + completionLb - dualU0;
+            return routeLowerBound < lowerBoundThreshold() - DOM_EPS;
+        }
+
         private double lowerBoundThreshold() {
             if (maxColumns > 0 && collected.size() >= maxColumns) {
                 return collected.get(collected.size() - 1).reducedCost;
@@ -755,6 +775,8 @@ public final class PricingEspprcSolver {
         private final ArrayList<BackwardLabel>[] backwardExtended;
         private final HashMap<Long, ForwardLabel>[] bestForwardByMaskAtLast;
         private final HashMap<Long, BackwardLabel>[] bestBackwardByMaskAtFirst;
+        private final int[] joinedForwardCountByLast;
+        private final int[] joinedBackwardCountByFirst;
         private final double stepSize;
 
         BidirectionalLongSearch(
@@ -800,6 +822,8 @@ public final class PricingEspprcSolver {
             this.backwardExtended = bEx;
             this.bestForwardByMaskAtLast = fBest;
             this.bestBackwardByMaskAtFirst = bBest;
+            this.joinedForwardCountByLast = new int[customerCount];
+            this.joinedBackwardCountByFirst = new int[customerCount];
             this.stepSize = Math.max(1.0, ins.Q / 15.0);
         }
 
@@ -960,6 +984,9 @@ public final class PricingEspprcSolver {
                 }
                 backwardExtended[label.firstLocal].add(label);
                 considerCompleteBackwardRoute(label);
+                if (!canStillReachUsefulBackward(label.firstLocal, label.load, label.partialReducedCost)) {
+                    continue;
+                }
 
                 long remaining = fullMask & ~label.visitedMask;
                 while (remaining != 0L) {
@@ -999,6 +1026,7 @@ public final class PricingEspprcSolver {
                 if (fLabels.isEmpty()) {
                     continue;
                 }
+                int newForwardStart = joinedForwardCountByLast[forwardLast];
                 for (int backwardFirst = 0; backwardFirst < customerCount; backwardFirst++) {
                     if (!isInternalArcAllowed(forwardLast, backwardFirst)) {
                         continue;
@@ -1007,35 +1035,56 @@ public final class PricingEspprcSolver {
                     if (bLabels.isEmpty()) {
                         continue;
                     }
-                    for (int fi = 0; fi < fLabels.size(); fi++) {
-                        ForwardLabel fLabel = fLabels.get(fi);
-                        for (int bi = 0; bi < bLabels.size(); bi++) {
-                            BackwardLabel bLabel = bLabels.get(bi);
-                            if ((fLabel.visitedMask & bLabel.visitedMask) != 0L) {
-                                continue;
-                            }
-                            double combinedLoad = fLabel.load + bLabel.load;
-                            if (combinedLoad > ins.Q + 1e-9) {
-                                continue;
-                            }
-                            long routeMask = fLabel.visitedMask | bLabel.visitedMask;
-                            if (!isRouteMaskAllowed(routeMask)) {
-                                continue;
-                            }
-                            double fullCost = fLabel.travelCost
-                                    + ins.c[customers[fLabel.lastLocal]][customers[bLabel.firstLocal]]
-                                    + bLabel.travelCost;
-                            double reducedCost = fullCost
-                                    - fLabel.dualGain
-                                    - bLabel.dualGain
-                                    - fLabel.arcDualGain
-                                    - bLabel.arcDualGain
-                                    - transitionArcDual(fLabel.lastLocal, bLabel.firstLocal)
-                                    - dualU0;
-                            int[] globals = combine(reconstructForwardGlobals(fLabel), reconstructBackwardGlobals(bLabel));
-                            considerCandidateRoute(globals, fullCost, combinedLoad, reducedCost);
-                        }
+                    int newBackwardStart = joinedBackwardCountByFirst[backwardFirst];
+                    if (newForwardStart < fLabels.size()) {
+                        joinLabelRanges(fLabels, newForwardStart, fLabels.size(), bLabels, 0, bLabels.size());
                     }
+                    if (newBackwardStart < bLabels.size() && newForwardStart > 0) {
+                        joinLabelRanges(fLabels, 0, newForwardStart, bLabels, newBackwardStart, bLabels.size());
+                    }
+                }
+            }
+            for (int local = 0; local < customerCount; local++) {
+                joinedForwardCountByLast[local] = forwardExtended[local].size();
+                joinedBackwardCountByFirst[local] = backwardExtended[local].size();
+            }
+        }
+
+        private void joinLabelRanges(
+                ArrayList<ForwardLabel> fLabels,
+                int fFrom,
+                int fTo,
+                ArrayList<BackwardLabel> bLabels,
+                int bFrom,
+                int bTo
+        ) {
+            for (int fi = fFrom; fi < fTo; fi++) {
+                ForwardLabel fLabel = fLabels.get(fi);
+                for (int bi = bFrom; bi < bTo; bi++) {
+                    BackwardLabel bLabel = bLabels.get(bi);
+                    if ((fLabel.visitedMask & bLabel.visitedMask) != 0L) {
+                        continue;
+                    }
+                    double combinedLoad = fLabel.load + bLabel.load;
+                    if (combinedLoad > ins.Q + 1e-9) {
+                        continue;
+                    }
+                    long routeMask = fLabel.visitedMask | bLabel.visitedMask;
+                    if (!isRouteMaskAllowed(routeMask)) {
+                        continue;
+                    }
+                    double fullCost = fLabel.travelCost
+                            + ins.c[customers[fLabel.lastLocal]][customers[bLabel.firstLocal]]
+                            + bLabel.travelCost;
+                    double reducedCost = fullCost
+                            - fLabel.dualGain
+                            - bLabel.dualGain
+                            - fLabel.arcDualGain
+                            - bLabel.arcDualGain
+                            - transitionArcDual(fLabel.lastLocal, bLabel.firstLocal)
+                            - dualU0;
+                    int[] globals = combine(reconstructForwardGlobals(fLabel), reconstructBackwardGlobals(bLabel));
+                    considerCandidateRoute(globals, fullCost, combinedLoad, reducedCost);
                 }
             }
         }
@@ -1226,6 +1275,9 @@ public final class PricingEspprcSolver {
             }
             long lastBit = localBit[label.lastLocal];
             long free = label.visitedMask ^ lastBit;
+            if (!shouldEnumerateSubsetDominance(free)) {
+                return false;
+            }
             long subFree = free;
             while (subFree != 0L) {
                 long subsetMask = subFree | lastBit;
@@ -1244,6 +1296,9 @@ public final class PricingEspprcSolver {
             }
             long firstBit = localBit[label.firstLocal];
             long free = label.visitedMask ^ firstBit;
+            if (!shouldEnumerateSubsetDominance(free)) {
+                return false;
+            }
             long subFree = free;
             while (subFree != 0L) {
                 long subsetMask = subFree | firstBit;
@@ -1545,6 +1600,9 @@ public final class PricingEspprcSolver {
             }
             long lastBit = localBit[label.lastLocal];
             long free = label.visitedMask ^ lastBit;
+            if (!shouldEnumerateSubsetDominance(free)) {
+                return false;
+            }
             long subFree = free;
             while (subFree != 0L) {
                 long subsetMask = subFree | lastBit;
@@ -2510,7 +2568,7 @@ public final class PricingEspprcSolver {
 
         private long[] buildInitialNgMasks() {
             int m = customers.length;
-            int ngSize = Math.max(1, Math.min(DEFAULT_NG_SIZE, m));
+            int ngSize = Math.max(1, Math.min(recommendedNgSize(m), m));
             long[] masks = new long[m];
             for (int i = 0; i < m; i++) {
                 masks[i] = localBit[i];
@@ -2539,6 +2597,10 @@ public final class PricingEspprcSolver {
                 }
             }
             return masks;
+        }
+
+        private int recommendedNgSize(int customerCount) {
+            return Math.max(DEFAULT_NG_SIZE, Math.min(customerCount / 3, 12));
         }
 
         private long capacityForbiddenMask(double load) {
@@ -2885,6 +2947,7 @@ public final class PricingEspprcSolver {
         final double load;
         final double travelCost;
         final double dualGain;
+        final double partialReducedCost;
         final AbstractScenarioLabel pred;
 
         AbstractScenarioLabel(
@@ -2900,6 +2963,7 @@ public final class PricingEspprcSolver {
             this.load = load;
             this.travelCost = travelCost;
             this.dualGain = dualGain;
+            this.partialReducedCost = travelCost - dualGain;
             this.pred = pred;
         }
     }
@@ -3011,15 +3075,57 @@ public final class PricingEspprcSolver {
         private boolean register(ScenarioLongLabel label) {
             HashMap<Long, ScenarioLongLabel> map = bestByMaskAtLast[label.lastScenario];
             ScenarioLongLabel incumbent = map.get(label.visitedMask);
-            if (incumbent != null && incumbent.travelCost <= label.travelCost + DOM_EPS) {
+            if (incumbent != null && incumbent.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
+                return false;
+            }
+            if (isDominatedByProperSubset(label, map)) {
                 return false;
             }
             map.put(label.visitedMask, label);
+            removeDominatedSupersets(label, map);
             return true;
         }
 
         private boolean isCurrentBest(ScenarioLongLabel label) {
             return bestByMaskAtLast[label.lastScenario].get(label.visitedMask) == label;
+        }
+
+        private boolean isDominatedByProperSubset(ScenarioLongLabel label, HashMap<Long, ScenarioLongLabel> map) {
+            if (label.depth <= 1) {
+                return false;
+            }
+            long lastBit = scenarioBit[label.lastScenario];
+            long free = label.visitedMask ^ lastBit;
+            if (!shouldEnumerateSubsetDominance(free)) {
+                return false;
+            }
+            long subFree = free;
+            while (subFree != 0L) {
+                long subsetMask = subFree | lastBit;
+                ScenarioLongLabel subset = map.get(subsetMask);
+                if (subset != null && subset.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
+                    return true;
+                }
+                subFree = (subFree - 1L) & free;
+            }
+            return false;
+        }
+
+        private void removeDominatedSupersets(ScenarioLongLabel label, HashMap<Long, ScenarioLongLabel> map) {
+            long extraPool = fullMask & ~label.visitedMask;
+            int extraCount = Long.bitCount(extraPool);
+            if (extraCount == 0 || extraCount > SUPERSET_CLEANUP_MAX_EXTRA_BITS) {
+                return;
+            }
+            long add = extraPool;
+            while (add != 0L) {
+                long supersetMask = label.visitedMask | add;
+                ScenarioLongLabel other = map.get(supersetMask);
+                if (other != null && label.partialReducedCost <= other.partialReducedCost + DOM_EPS) {
+                    map.remove(supersetMask);
+                }
+                add = (add - 1L) & extraPool;
+            }
         }
     }
 

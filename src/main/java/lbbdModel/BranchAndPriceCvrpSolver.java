@@ -38,7 +38,7 @@ public final class BranchAndPriceCvrpSolver {
     private static final double FRAC_DISTANCE_LIMIT = 0.4;
     private static final double ARC_SUPPORT_EPS = 1e-9;
     private static final int MAX_NEW_CUTS_PER_NODE = 6;
-    private static final int MAX_CONNECTED_CUT_SIZE = 10;
+    private static final int MIN_CONNECTED_CUT_SIZE = 10;
     private static final int MAX_STRONG_BRANCH_CANDIDATES = 8;
     private static final double MIN_STRONG_BRANCH_REMAINING_SEC = 5.0;
     private static final boolean LOG_TO_CONSOLE = false;
@@ -1330,7 +1330,7 @@ public final class BranchAndPriceCvrpSolver {
         }
 
         shrinkSeparate(active, arcFlow, seen, cuts);
-        if (cuts.isEmpty()) {
+        if (cuts.size() < MAX_NEW_CUTS_PER_NODE) {
             connectedSeparate(active, arcFlow, seen, cuts);
         }
         return cuts;
@@ -1383,6 +1383,10 @@ public final class BranchAndPriceCvrpSolver {
             HashSet<String> seen,
             ArrayList<CapacityCutDef> out
     ) {
+        int maxCutSize = Math.min(active.size() - 1, Math.max(MIN_CONNECTED_CUT_SIZE, active.size() / 2));
+        if (maxCutSize < 2) {
+            return;
+        }
         BitSet[] neighbors = new BitSet[active.size()];
         for (int i = 0; i < active.size(); i++) {
             neighbors[i] = new BitSet(active.size());
@@ -1402,7 +1406,7 @@ public final class BranchAndPriceCvrpSolver {
             BitSet current = new BitSet(active.size());
             current.set(root);
             BitSet frontier = (BitSet) neighbors[root].clone();
-            dfsConnectedCuts(active, arcFlow, neighbors, current, frontier, seen, visitedStates, out);
+            dfsConnectedCuts(active, arcFlow, neighbors, current, frontier, seen, visitedStates, out, maxCutSize);
         }
     }
 
@@ -1414,9 +1418,10 @@ public final class BranchAndPriceCvrpSolver {
             BitSet frontier,
             HashSet<String> seenCuts,
             HashSet<String> visitedStates,
-            ArrayList<CapacityCutDef> out
+            ArrayList<CapacityCutDef> out,
+            int maxCutSize
     ) {
-        if (out.size() >= MAX_NEW_CUTS_PER_NODE || current.cardinality() > MAX_CONNECTED_CUT_SIZE) {
+        if (out.size() >= MAX_NEW_CUTS_PER_NODE || current.cardinality() > maxCutSize) {
             return;
         }
         String stateKey = bitSetSignature(current);
@@ -1445,7 +1450,7 @@ public final class BranchAndPriceCvrpSolver {
             BitSet nextFrontier = (BitSet) frontier.clone();
             nextFrontier.or(neighbors[next]);
             nextFrontier.andNot(nextCurrent);
-            dfsConnectedCuts(active, arcFlow, neighbors, nextCurrent, nextFrontier, seenCuts, visitedStates, out);
+            dfsConnectedCuts(active, arcFlow, neighbors, nextCurrent, nextFrontier, seenCuts, visitedStates, out, maxCutSize);
             next = frontier.nextSetBit(next + 1);
         }
     }
@@ -1533,6 +1538,12 @@ public final class BranchAndPriceCvrpSolver {
     }
 
     private static int maxColumnsPerPricing(int customerCount) {
+        if (customerCount <= 8) {
+            return 40;
+        }
+        if (customerCount <= 15) {
+            return 80;
+        }
         return 120;
     }
 

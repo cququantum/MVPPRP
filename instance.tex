@@ -1,0 +1,100 @@
+% Standalone note for instance-source and mapping explanation.
+\documentclass{article}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\usepackage{ctex}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\geometry{a4paper, margin=1in}
+
+\begin{document}
+
+\section{算例来源与导入语义}
+
+本文使用的 $10\_6\_2$、$10\_6\_3$、$10\_9\_2$、$10\_9\_3$ 共 16 个小规模算例，
+原始文本文件来自 Zhang 等人在 2021 年发表于 \emph{Transportation Science}
+的 MVPRP 基准数据。该论文研究的是 \textbf{delivery} 语义下的 multivehicle production routing problem，
+并采用 order-up-to (OU) policy：每期先生产，再在期初向客户配送。
+
+\subsection{原始文本字段的含义}
+
+以零售商（论文中的 customer）行为例，文本中的主要字段含义如下：
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+字段 & 含义 \\
+\midrule
+`InitLevel` & 客户在规划期开始时的初始在手库存 \\
+`MaxLevel` & 客户库存容量上限 $L_i$ \\
+`Demand` & 客户每期需求量（本文数据中为常数需求） \\
+`HoldCost` & 客户单位库存持有成本 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+供应商（论文中的 plant / depot）行中的 `InitLevel`、`MaxLevel`、`ProdCapacity` 分别对应初始库存、
+库存容量与单期生产能力。
+
+\subsection{为什么这些算例直接导入后会出现 infeasible}
+
+Zhang 等（2021）的 delivery 模型中，客户首次在第 $t$ 期被配送、且上次访问期为 $v=0$ 时，
+论文定义的首次配送量为
+\begin{equation}
+g^{\text{delivery}}_{i0t}=\sum_{r=1}^{t-1} d_{ir} + (L_i - I_{i0}).
+\end{equation}
+这意味着：客户 \texttt{InitLevel} 越大，首次访问越可以被推迟。
+
+但本项目中的实现是 \textbf{pickup + production} 语义。
+对收集点 $i$，若首次在第 $t$ 期访问，则当前实现采用
+\begin{equation}
+g^{\text{pickup}}_{i0t}=I_{i0} + \sum_{r=1}^{t} s_{ir},
+\end{equation}
+其中 $I_{i0}$ 被解释为“期初待回收库存”，$s_{ir}$ 是每期新增可回收量。
+如果直接把原始 delivery 数据中的 `InitLevel` 塞进这里的 $I_{i0}$，
+就会把“客户期初库存高”误读成“待回收量高”，从而把原本可行的数据压成过早必须访问，
+在 $l=6,9$ 的算例上尤其容易导致 infeasible。
+
+\subsection{在不改原始输入文件的前提下的映射方法}
+
+为保持原 benchmark 的“首次访问紧迫度”不变，本文在导入阶段做如下映射：
+\begin{align}
+s_{it} &:= \texttt{Demand}_i, \qquad t=1,\dots,l,\\
+I^{\text{pickup}}_{i0} &:= L_i - \texttt{InitLevel}^{\text{delivery}}_i - \texttt{Demand}_i.
+\end{align}
+实现中再取
+\begin{equation}
+I^{\text{pickup}}_{i0} := \max\{0,\; L_i - \texttt{InitLevel}^{\text{delivery}}_i - \texttt{Demand}_i\},
+\end{equation}
+以避免数值上出现负的初始待回收库存。
+
+此时，pickup 模型中“首次在第 $t$ 期访问不超容量”的条件为
+\begin{equation}
+I^{\text{pickup}}_{i0} + \sum_{r=1}^{t} s_{ir} \le L_i,
+\end{equation}
+代入上述映射后可化为
+\begin{equation}
+\sum_{r=1}^{t-1} \texttt{Demand}_i \le \texttt{InitLevel}^{\text{delivery}}_i.
+\end{equation}
+也就是说，delivery benchmark 中“客户凭借期初库存最多能撑到哪一期”的信息，
+被等价地转写成了 pickup 模型中“收集点最晚何时必须首次访问”的信息。
+
+\subsection{与代码的对应关系}
+
+上述映射已写入
+\href{/Users/tangshenghao/IdeaProjects/MVPPRP/src/main/java/instance/Instance.java}{`src/main/java/instance/Instance.java`}：
+\begin{itemize}
+\item 说明性注释位于文件开头；
+\item 零售商初始库存赋值从 `this.Ii0[i] = nd.init;` 改为映射函数；
+\item 映射函数定义为 `mapDeliveryInitToPickupInit(...)`。
+\end{itemize}
+
+\subsection{关于类型 1/2/3/4 的补充说明}
+
+对本次重算涉及的四组实例 `10\_6\_2`、`10\_6\_3`、`10\_9\_2`、`10\_9\_3`，
+`MVPRP1/2/3/4` 在可行性相关参数
+（`PeriodNumber`、`VechileNumber`、`VehicleCapacity`、供应商 `InitLevel/MaxLevel/ProdCapacity`、
+零售商 `InitLevel/MaxLevel/Demand`）上完全一致。
+不同类型主要体现在成本参数或坐标尺度上，因此本次 `Instance.java` 的修正
+会一致地影响这 16 个实例的可行性。
+
+\end{document}
