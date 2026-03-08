@@ -38,7 +38,7 @@ public final class BranchAndPriceCvrpSolver {
     private static final double FRAC_DISTANCE_LIMIT = 0.4;
     private static final double ARC_SUPPORT_EPS = 1e-9;
     private static final int MAX_NEW_CUTS_PER_NODE = 6;
-    private static final int MIN_CONNECTED_CUT_SIZE = 10;
+    private static final int CONNECTED_CUT_SIZE_FLOOR = 10;
     private static final int MAX_STRONG_BRANCH_CANDIDATES = 8;
     private static final double MIN_STRONG_BRANCH_REMAINING_SEC = 5.0;
     private static final boolean LOG_TO_CONSOLE = false;
@@ -1383,7 +1383,7 @@ public final class BranchAndPriceCvrpSolver {
             HashSet<String> seen,
             ArrayList<CapacityCutDef> out
     ) {
-        int maxCutSize = Math.min(active.size() - 1, Math.max(MIN_CONNECTED_CUT_SIZE, active.size() / 2));
+        int maxCutSize = Math.min(active.size() - 1, Math.max(CONNECTED_CUT_SIZE_FLOOR, active.size() / 2));
         if (maxCutSize < 2) {
             return;
         }

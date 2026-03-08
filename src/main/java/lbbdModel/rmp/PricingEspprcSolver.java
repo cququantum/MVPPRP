@@ -30,6 +30,10 @@ public final class PricingEspprcSolver {
         return Long.bitCount(optionalBits) <= SUBSET_DOMINANCE_MAX_EXTRA_BITS;
     }
 
+    private static boolean shouldEnumerateSubsetDominance(int optionalCount) {
+        return optionalCount <= SUBSET_DOMINANCE_MAX_EXTRA_BITS;
+    }
+
     /**
      * Optional branch-node route restrictions for branch-and-price.
      * For a customer pair (i,j):
@@ -3248,16 +3252,83 @@ public final class PricingEspprcSolver {
         private boolean register(ScenarioBitSetLabel label) {
             ScenarioBitSetStateKey key = new ScenarioBitSetStateKey(label.lastScenario, label.visitedScenarios);
             ScenarioBitSetLabel incumbent = bestByState.get(key);
-            if (incumbent != null && incumbent.travelCost <= label.travelCost + DOM_EPS) {
+            if (incumbent != null && incumbent.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
+                return false;
+            }
+            if (isDominatedByProperSubset(label)) {
                 return false;
             }
             bestByState.put(key, label);
+            removeDominatedSupersets(label);
             return true;
         }
 
         private boolean isCurrentBest(ScenarioBitSetLabel label) {
             ScenarioBitSetStateKey key = new ScenarioBitSetStateKey(label.lastScenario, label.visitedScenarios);
             return bestByState.get(key) == label;
+        }
+
+        private boolean isDominatedByProperSubset(ScenarioBitSetLabel label) {
+            if (label.depth <= 1) {
+                return false;
+            }
+            BitSet free = (BitSet) label.visitedScenarios.clone();
+            free.clear(label.lastScenario);
+            if (!shouldEnumerateSubsetDominance(free.cardinality())) {
+                return false;
+            }
+            int[] optional = collectBitIndices(free);
+            int subsetCount = 1 << optional.length;
+            for (int subsetId = 1; subsetId < subsetCount; subsetId++) {
+                BitSet subsetVisited = new BitSet(scenarioCount);
+                subsetVisited.set(label.lastScenario);
+                for (int bit = 0; bit < optional.length; bit++) {
+                    if ((subsetId & (1 << bit)) != 0) {
+                        subsetVisited.set(optional[bit]);
+                    }
+                }
+                ScenarioBitSetLabel subset = bestByState.get(new ScenarioBitSetStateKey(label.lastScenario, subsetVisited));
+                if (subset != null && subset.partialReducedCost <= label.partialReducedCost + DOM_EPS) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void removeDominatedSupersets(ScenarioBitSetLabel label) {
+            BitSet extraPool = new BitSet(scenarioCount);
+            extraPool.set(0, scenarioCount);
+            extraPool.andNot(label.visitedScenarios);
+            int extraCount = extraPool.cardinality();
+            if (extraCount == 0 || extraCount > SUPERSET_CLEANUP_MAX_EXTRA_BITS) {
+                return;
+            }
+            int[] optional = collectBitIndices(extraPool);
+            int subsetCount = 1 << optional.length;
+            for (int subsetId = 1; subsetId < subsetCount; subsetId++) {
+                BitSet supersetVisited = (BitSet) label.visitedScenarios.clone();
+                for (int bit = 0; bit < optional.length; bit++) {
+                    if ((subsetId & (1 << bit)) != 0) {
+                        supersetVisited.set(optional[bit]);
+                    }
+                }
+                ScenarioBitSetStateKey key = new ScenarioBitSetStateKey(label.lastScenario, supersetVisited);
+                ScenarioBitSetLabel other = bestByState.get(key);
+                if (other != null && label.partialReducedCost <= other.partialReducedCost + DOM_EPS) {
+                    bestByState.remove(key);
+                }
+            }
+        }
+
+        private int[] collectBitIndices(BitSet bits) {
+            int[] indices = new int[bits.cardinality()];
+            int idx = 0;
+            int bit = bits.nextSetBit(0);
+            while (bit >= 0) {
+                indices[idx++] = bit;
+                bit = bits.nextSetBit(bit + 1);
+            }
+            return indices;
         }
     }
 
