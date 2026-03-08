@@ -1,3 +1,0 @@
-instance,method,status,feasible,optimal,objective,best_bound,gap,time_sec
-"MVPRP1_10_6_2","origin","Optimal",true,true,44203.266062,44199.551438,0.000084,11.863107
-"MVPRP1_10_6_2","reform","Optimal",true,true,44203.266068,44198.854528,0.000100,3.358234
