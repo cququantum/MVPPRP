@@ -2370,6 +2370,10 @@ public final class LbbdReformulationSolver {
             for (int idx = 0; idx < vals.size(); idx++) {
                 valArr[idx] = vals.get(idx);
             }
+            int mipStartCount = cplex.getNMIPStarts();
+            if (mipStartCount > 0) {
+                cplex.deleteMIPStarts(0, mipStartCount);
+            }
             cplex.addMIPStart(varArr, valArr);
         }
 
