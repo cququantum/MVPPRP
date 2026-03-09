@@ -22,6 +22,7 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
     private static final double RC_EPS = 1e-8;
     private static final double ART_EPS = 1e-7;
     private static final int EXACT_SUBSET_LP_MAX_ACTIVE_CUSTOMERS = 0;
+    private static final long NANOS_PER_SECOND = 1_000_000_000L;
 
     // Adaptive column generation parameters based on instance size
     private final Instance ins;
@@ -96,6 +97,10 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
     }
 
     public Result solve(Instance ins, int t, double[] qBar, int[] zBar, int[] prevVisitBySupplier) {
+        return solve(ins, t, qBar, zBar, prevVisitBySupplier, CplexConfig.TIME_LIMIT_SEC);
+    }
+
+    public Result solve(Instance ins, int t, double[] qBar, int[] zBar, int[] prevVisitBySupplier, double timeLimitSec) {
         if (t < 1 || t > ins.l) {
             throw new IllegalArgumentException("t must be in 1..l");
         }
@@ -106,7 +111,7 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
             throw new IllegalArgumentException("prevVisitBySupplier must have length n+1");
         }
         try {
-            return getOrCreatePeriodContext(t).solve(prevVisitBySupplier);
+            return getOrCreatePeriodContext(t).solve(prevVisitBySupplier, timeLimitSec);
         } catch (IloException e) {
             throw new RuntimeException("Failed to solve route-master LP at t=" + t, e);
         }
@@ -193,7 +198,7 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
             }
 
             this.cplex = new IloCplex();
-            configureLp(cplex);
+            configureLp(cplex, CplexConfig.TIME_LIMIT_SEC);
 
             this.obj = cplex.addMinimize();
             this.coverEq = new IloRange[scenarioCount];
@@ -225,7 +230,7 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
             }
         }
 
-        synchronized Result solve(int[] prevVisitBySupplier) throws IloException {
+        synchronized Result solve(int[] prevVisitBySupplier, double timeLimitSec) throws IloException {
             if (scenarioCount == 0) {
                 return new Result(
                         true,
@@ -241,6 +246,11 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
                         0
                 );
             }
+            if (timeLimitSec <= 0.0) {
+                return new Result(false, false, false, false, "RMP_TimeLimit", Double.NaN,
+                        null, null, Double.NaN, 0, scenarioCount);
+            }
+            long deadlineNs = System.nanoTime() + Math.max(1L, Math.round(timeLimitSec * NANOS_PER_SECOND));
 
             for (int s = 0; s < scenarioCount; s++) {
                 double rhs = (prevVisitBySupplier[scenarioSupplier[s]] == scenarioPrev[s]) ? 1.0 : 0.0;
@@ -254,6 +264,11 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
             boolean optimal = false;
 
             while (true) {
+                if (isPastDeadline(deadlineNs)) {
+                    return new Result(false, false, false, false, "RMP_TimeLimit", Double.NaN,
+                            null, null, Double.NaN, generatedColumns, scenarioCount);
+                }
+                cplex.setParam(IloCplex.Param.TimeLimit, normalizedTimeLimitSec(remainingSeconds(deadlineNs)));
                 boolean solved = cplex.solve();
                 status = cplex.getStatus().toString();
                 optimal = solved && status.startsWith("Optimal");
@@ -382,7 +397,7 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
         }
 
         try (IloCplex cplex = new IloCplex()) {
-            configureLp(cplex);
+            configureLp(cplex, CplexConfig.TIME_LIMIT_SEC);
 
             IloObjective obj = cplex.addMinimize();
             IloRange[] coverEq = new IloRange[m];
@@ -685,8 +700,24 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
         cplex.numVar(col, 0.0, Double.MAX_VALUE, "xi_s_" + varName);
     }
 
-    private static void configureLp(IloCplex cplex) throws IloException {
-        cplex.setParam(IloCplex.Param.TimeLimit, CplexConfig.TIME_LIMIT_SEC);
+    private static boolean isPastDeadline(long deadlineNs) {
+        return System.nanoTime() >= deadlineNs;
+    }
+
+    private static double remainingSeconds(long deadlineNs) {
+        long remainingNs = deadlineNs - System.nanoTime();
+        if (remainingNs <= 0L) {
+            return 0.0;
+        }
+        return remainingNs / (double) NANOS_PER_SECOND;
+    }
+
+    private static double normalizedTimeLimitSec(double timeLimitSec) {
+        return Math.max(1e-3, timeLimitSec);
+    }
+
+    private static void configureLp(IloCplex cplex, double timeLimitSec) throws IloException {
+        cplex.setParam(IloCplex.Param.TimeLimit, normalizedTimeLimitSec(timeLimitSec));
         cplex.setParam(IloCplex.Param.RootAlgorithm, IloCplex.Algorithm.Dual);
         cplex.setParam(IloCplex.Param.Threads, 1);
         if (!LOG_TO_CONSOLE) {

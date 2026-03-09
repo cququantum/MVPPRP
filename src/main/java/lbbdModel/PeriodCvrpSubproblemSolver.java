@@ -39,7 +39,14 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
     }
 
     public Result solve(Instance ins, int t, double[] qBar, int[] zBar) {
+        return solve(ins, t, qBar, zBar, CplexConfig.TIME_LIMIT_SEC);
+    }
+
+    public Result solve(Instance ins, int t, double[] qBar, int[] zBar, double timeLimitSec) {
         validateInput(ins, t, qBar, zBar);
+        if (timeLimitSec <= 0.0) {
+            return new Result(false, false, false, "Subproblem_TimeLimit", Double.NaN);
+        }
 
         double totalPickup = totalPickup(ins, qBar);
         int visitCount = visitCount(ins, zBar);
@@ -49,7 +56,7 @@ public final class PeriodCvrpSubproblemSolver implements AutoCloseable {
         if (totalPickup > ins.Q * ins.K + EPS) {
             return new Result(false, false, true, "InfeasibleByTotalCapacity", Double.NaN);
         }
-        BranchAndPriceCvrpSolver.Result bp = branchAndPriceSolver.solve(ins, t, qBar, zBar);
+        BranchAndPriceCvrpSolver.Result bp = branchAndPriceSolver.solve(ins, t, qBar, zBar, timeLimitSec);
         return new Result(bp.feasible, bp.optimal, bp.provenInfeasible, bp.status, bp.objective);
     }
 

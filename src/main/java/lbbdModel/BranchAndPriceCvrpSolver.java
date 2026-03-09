@@ -585,8 +585,15 @@ public final class BranchAndPriceCvrpSolver {
     private final PricingEspprcSolver pricingSolver = new PricingEspprcSolver();
 
     public Result solve(Instance ins, int t, double[] qBar, int[] zBar) {
+        return solve(ins, t, qBar, zBar, CplexConfig.TIME_LIMIT_SEC);
+    }
+
+    public Result solve(Instance ins, int t, double[] qBar, int[] zBar, double timeLimitSec) {
+        if (timeLimitSec <= 0.0) {
+            return unresolvedResult("BP_TimeLimit", 0, 0, Double.POSITIVE_INFINITY);
+        }
         long startNs = System.nanoTime();
-        long deadlineNs = startNs + Math.max(1L, Math.round(CplexConfig.TIME_LIMIT_SEC * NANOS_PER_SECOND));
+        long deadlineNs = startNs + Math.max(1L, Math.round(timeLimitSec * NANOS_PER_SECOND));
 
         ActiveSet active = buildActiveSet(ins, qBar, zBar);
         if (active == null) {
@@ -773,6 +780,7 @@ public final class BranchAndPriceCvrpSolver {
                             master.copyRoutePool(), master.copyCapacityCuts(), generatedColumns);
                 }
 
+                master.cplex.setParam(IloCplex.Param.TimeLimit, normalizedTimeLimitSec(remainingSeconds(deadlineNs)));
                 boolean solved = master.cplex.solve();
                 String status = master.cplex.getStatus().toString();
                 if (!solved || !status.startsWith("Optimal")) {
@@ -1599,8 +1607,12 @@ public final class BranchAndPriceCvrpSolver {
         return remainingNs / (double) NANOS_PER_SECOND;
     }
 
+    private static double normalizedTimeLimitSec(double timeLimitSec) {
+        return Math.max(1e-3, timeLimitSec);
+    }
+
     private static void configureLp(IloCplex cplex, double timeLimitSec) throws IloException {
-        cplex.setParam(IloCplex.Param.TimeLimit, Math.max(1.0, timeLimitSec));
+        cplex.setParam(IloCplex.Param.TimeLimit, normalizedTimeLimitSec(timeLimitSec));
         cplex.setParam(IloCplex.Param.RootAlgorithm, IloCplex.Algorithm.Dual);
         cplex.setParam(IloCplex.Param.Threads, 1);
         if (!LOG_TO_CONSOLE) {

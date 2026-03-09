@@ -37,6 +37,7 @@ public final class LbbdReformulationSolver {
     private static final int MASTER_THREADS = 0;
     private static final int CUT_POOL_GRACE_ITERS = 3;
     private static final double CUT_ACTIVITY_TOL = 1e-5;
+    private static final long NANOS_PER_SECOND = 1_000_000_000L;
 
     // Adaptive parameters based on instance size
     private double masterMipGapEarly;
@@ -296,8 +297,20 @@ public final class LbbdReformulationSolver {
 
     public SolveResult solve(double targetObjective, double targetTol, int[][] prevVisitHint) {
         long startNs = System.nanoTime();
+        long deadlineNs = startNs + Math.max(1L, Math.round(CplexConfig.TIME_LIMIT_SEC * NANOS_PER_SECOND));
+        int iteration = 0;
+        int feasibilityCuts = 0;
+        int optimalityCuts = 0;
+        int lpDualCuts = 0;
+        int lpDualCutSkips = 0;
+        int targetPruneCuts = 0;
+        int incumbentPruneCuts = 0;
+        int globalOptCuts = 0;
+        double bestUpperBound = Double.POSITIVE_INFINITY;
+        double bestLowerBound = Double.NEGATIVE_INFINITY;
+        boolean allSubproblemsOptimal = true;
         if (ENABLE_HINT_SHORTCUT && !Double.isNaN(targetObjective) && prevVisitHint != null) {
-            SolveResult fast = tryValidateByHint(ins, targetObjective, targetTol, prevVisitHint, startNs);
+            SolveResult fast = tryValidateByHint(ins, targetObjective, targetTol, prevVisitHint, startNs, deadlineNs);
             if (fast != null) {
                 return fast;
             }
@@ -329,8 +342,20 @@ public final class LbbdReformulationSolver {
         try (IloCplex cplex = new IloCplex()) {
             configure(cplex);
             MasterModel master = new MasterModel(cplex, ins);
+            if (isPastDeadline(deadlineNs)) {
+                return buildGlobalTimeLimitResult(
+                        startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                        incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                );
+            }
             RoutingLowerBoundSolver lbRSolver = new RoutingLowerBoundSolver(ins);
-            RoutingLowerBoundSolver.Result lbRResult = lbRSolver.solve();
+            RoutingLowerBoundSolver.Result lbRResult = lbRSolver.solve(remainingSeconds(deadlineNs));
+            if (isPastDeadline(deadlineNs)) {
+                return buildGlobalTimeLimitResult(
+                        startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                        incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                );
+            }
             double lbR = (lbRResult.feasible && !Double.isNaN(lbRResult.lbR) && !Double.isInfinite(lbRResult.lbR))
                     ? Math.max(0.0, lbRResult.lbR)
                     : 0.0;
@@ -348,14 +373,21 @@ public final class LbbdReformulationSolver {
             @SuppressWarnings("unchecked")
             Future<T1InitialCutSolver.T1Result>[] t1Futures =
                     (t1Executor != null) ? new Future[ins.l + 1] : null;
+            if (isPastDeadline(deadlineNs)) {
+                return buildGlobalTimeLimitResult(
+                        startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                        incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                );
+            }
             if (t1Executor != null) {
                 try {
+                    final double t1TimeLimitSec = remainingSeconds(deadlineNs);
                     for (int t = 1; t <= ins.l; t++) {
                         final int period = t;
                         t1Futures[t] = t1Executor.submit(new Callable<T1InitialCutSolver.T1Result>() {
                             @Override
                             public T1InitialCutSolver.T1Result call() {
-                                return new T1InitialCutSolver(ins).solve(period);
+                                return new T1InitialCutSolver(ins).solve(period, t1TimeLimitSec);
                             }
                         });
                     }
@@ -369,16 +401,28 @@ public final class LbbdReformulationSolver {
                 } finally {
                     t1Executor.shutdownNow();
                 }
+                if (isPastDeadline(deadlineNs)) {
+                    return buildGlobalTimeLimitResult(
+                            startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                            incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                    );
+                }
                 T1InitialCutSolver fallbackSolver = new T1InitialCutSolver(ins);
                 for (int t = 1; t <= ins.l; t++) {
                     if (t1Results[t] == null) {
-                        t1Results[t] = fallbackSolver.solve(t);
+                        t1Results[t] = fallbackSolver.solve(t, remainingSeconds(deadlineNs));
                     }
                 }
             } else {
                 T1InitialCutSolver t1Solver = new T1InitialCutSolver(ins);
                 for (int t = 1; t <= ins.l; t++) {
-                    t1Results[t] = t1Solver.solve(t);
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                        );
+                    }
+                    t1Results[t] = t1Solver.solve(t, remainingSeconds(deadlineNs));
                 }
             }
             for (int t = 1; t <= ins.l; t++) {
@@ -397,8 +441,20 @@ public final class LbbdReformulationSolver {
             System.out.println("[LBBD] T1 initial cuts added: " + t1CutsAdded + "/" + ins.l);
 
             // === T2 Initial Cuts (speed.tex Section B.3, eq 4-12 in per-period form) ===
+            if (isPastDeadline(deadlineNs)) {
+                return buildGlobalTimeLimitResult(
+                        startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                        incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                );
+            }
             T2InitialCutSolver t2Solver = new T2InitialCutSolver(ins);
-            T2InitialCutSolver.T2Result t2 = t2Solver.solve();
+            T2InitialCutSolver.T2Result t2 = t2Solver.solve(remainingSeconds(deadlineNs));
+            if (isPastDeadline(deadlineNs)) {
+                return buildGlobalTimeLimitResult(
+                        startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                        incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                );
+            }
             int t2CutsAdded = 0;
             if (t2.feasible && t2.optimal && t2.pricingProvedOptimal && t2.artificialClean
                     && t2.dualWByPeriod != null && t2.dualU0ByPeriod != null) {
@@ -412,14 +468,6 @@ public final class LbbdReformulationSolver {
             }
             System.out.println("[LBBD] T2 initial cuts added: " + t2CutsAdded + "/" + ins.l);
 
-            int iteration = 0;
-            int feasibilityCuts = 0;
-            int optimalityCuts = 0;
-            int lpDualCuts = 0;
-            int lpDualCutSkips = 0;
-            int targetPruneCuts = 0;
-            int incumbentPruneCuts = 0;
-            int globalOptCuts = 0;
             long totalMasterSolveNs = 0L;
             long totalSubSolveNs = 0L;
             long totalRmpSolveNs = 0L;
@@ -428,16 +476,19 @@ public final class LbbdReformulationSolver {
             long totalRmpCalls = 0L;
             long totalRmpCacheMisses = 0L;
 
-            double bestUpperBound = Double.POSITIVE_INFINITY;
             double bestUpperBoundGapRef = Double.NaN;
-            double bestLowerBound = Double.NEGATIVE_INFINITY;
 
             boolean allMasterOptimal = true;
-            boolean allSubproblemsOptimal = true;
             boolean forceStrictMasterGap = false;
             MasterPoint prevPoint = null;
 
             while (iteration < MAX_ITERATIONS) {
+                if (isPastDeadline(deadlineNs)) {
+                    return buildGlobalTimeLimitResult(
+                            startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                            incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                    );
+                }
                 iteration++;
 
                 long iterMasterSolveNs = 0L;
@@ -459,9 +510,16 @@ public final class LbbdReformulationSolver {
                 }
 
                 long masterStartNs = System.nanoTime();
+                cplex.setParam(IloCplex.Param.TimeLimit, normalizedTimeLimitSec(remainingSeconds(deadlineNs)));
                 boolean solved = cplex.solve();
                 iterMasterSolveNs = System.nanoTime() - masterStartNs;
                 totalMasterSolveNs += iterMasterSolveNs;
+                if (isPastDeadline(deadlineNs)) {
+                    return buildGlobalTimeLimitResult(
+                            startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                            incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                    );
+                }
                 String masterStatus = safeStatus(cplex);
                 if (!solved) {
                     if (isFinite(bestUpperBound) && isInfeasibleLikeStatus(masterStatus)) {
@@ -505,6 +563,12 @@ public final class LbbdReformulationSolver {
                         ? new Future[ins.l + 1] : null;
                 int cacheMissCount = 0;
 
+                if (isPastDeadline(deadlineNs)) {
+                    return buildGlobalTimeLimitResult(
+                            startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                            incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                    );
+                }
                 for (int t = 1; t <= ins.l; t++) {
                     iterSubCalls++;
                     totalSubCalls++;
@@ -524,10 +588,11 @@ public final class LbbdReformulationSolver {
                             final int period = t;
                             final double[] qBarT = point.qBar[t];
                             final int[] zBarT = point.zBar[t];
+                            final double subTimeLimitSec = remainingSeconds(deadlineNs);
                             subFutures[t] = subExecutor.submit(new Callable<PeriodCvrpSubproblemSolver.Result>() {
                                 @Override
                                 public PeriodCvrpSubproblemSolver.Result call() {
-                                    return subSolvers[period].solve(ins, period, qBarT, zBarT);
+                                    return subSolvers[period].solve(ins, period, qBarT, zBarT, subTimeLimitSec);
                                 }
                             });
                         }
@@ -550,13 +615,21 @@ public final class LbbdReformulationSolver {
                     } else {
                         for (int t = 1; t <= ins.l; t++) {
                             if (subResults[t] == null) {
-                                subResults[t] = subSolvers[t].solve(ins, t, point.qBar[t], point.zBar[t]);
+                                subResults[t] = subSolvers[t].solve(
+                                        ins, t, point.qBar[t], point.zBar[t], remainingSeconds(deadlineNs)
+                                );
                             }
                         }
                     }
                     long subElapsed = System.nanoTime() - subStartNs;
                     iterSubSolveNs += subElapsed;
                     totalSubSolveNs += subElapsed;
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                        );
+                    }
 
                     for (int t = 1; t <= ins.l; t++) {
                         if (subCacheKeysByPeriod[t] != null && subResults[t] != null
@@ -609,9 +682,21 @@ public final class LbbdReformulationSolver {
                     }
                     feasibilityCuts++;
                     forceStrictMasterGap = false;
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                        );
+                    }
                     continue;
                 }
                 if (unresolvedPeriod >= 0) {
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                        );
+                    }
                     return buildSubproblemUnresolvedResult(
                             startNs,
                             iteration,
@@ -636,6 +721,12 @@ public final class LbbdReformulationSolver {
                 int freshRmpCutsAddedThisIter = 0;
 
                 if (violatedOptimality) {
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                        );
+                    }
                     periodCoveredByFreshRmpCut = new boolean[ins.l + 1];
                     int periodsToProcess = Math.min(MAX_RMP_PERIODS_PER_ITER, ins.l);
                     int[] selectedPeriods = selectBestRmpPeriods(point, phiByPeriod, rmpCacheKeysByPeriod, addedRmpCutKeys, periodsToProcess);
@@ -664,6 +755,7 @@ public final class LbbdReformulationSolver {
                         if (rmpExecutor != null) {
                             final int period = bestT;
                             final int[] prevVisitForPeriod = prevVisitArgPeriods[bestT];
+                            final double rmpTimeLimitSec = remainingSeconds(deadlineNs);
                             rmpFutures[bestT] = rmpExecutor.submit(new Callable<PeriodRouteMasterLpSolver.Result>() {
                                 @Override
                                 public PeriodRouteMasterLpSolver.Result call() {
@@ -672,7 +764,8 @@ public final class LbbdReformulationSolver {
                                             period,
                                             finalPoint.qBar[period],
                                             finalPoint.zBar[period],
-                                            prevVisitForPeriod
+                                            prevVisitForPeriod,
+                                            rmpTimeLimitSec
                                     );
                                 }
                             });
@@ -682,7 +775,8 @@ public final class LbbdReformulationSolver {
                                     bestT,
                                     point.qBar[bestT],
                                     point.zBar[bestT],
-                                    prevVisitArgPeriods[bestT]
+                                    prevVisitArgPeriods[bestT],
+                                    remainingSeconds(deadlineNs)
                             );
                             if (solvedCut.feasible && solvedCut.optimal && solvedCut.pricingProvedOptimal) {
                                 rmpCutCache.put(key, solvedCut);
@@ -708,6 +802,12 @@ public final class LbbdReformulationSolver {
                     long rmpElapsed = System.nanoTime() - rmpStartNs;
                     iterRmpSolveNs += rmpElapsed;
                     totalRmpSolveNs += rmpElapsed;
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                        );
+                    }
 
                     for (int idx = 0; idx < selectedPeriods.length; idx++) {
                         int bestT = selectedPeriods[idx];
@@ -912,6 +1012,12 @@ public final class LbbdReformulationSolver {
                                 incumbentPruneCuts++;
                             }
                         }
+                        if (isPastDeadline(deadlineNs)) {
+                            return buildGlobalTimeLimitResult(
+                                    startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                    incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                            );
+                        }
                         continue;
                     }
                 }
@@ -920,16 +1026,34 @@ public final class LbbdReformulationSolver {
                     master.addNoGoodCut(point);
                     targetPruneCuts++;
                     forceStrictMasterGap = false;
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                        );
+                    }
                     continue;
                 }
 
                 if (violatedOptimality) {
                     forceStrictMasterGap = false;
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                        );
+                    }
                     continue;
                 }
 
                 if (masterMipGapThisIter > CplexConfig.MIP_GAP + 1e-12) {
                     forceStrictMasterGap = true;
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                        );
+                    }
                     continue;
                 }
 
@@ -1019,7 +1143,8 @@ public final class LbbdReformulationSolver {
             double targetObjective,
             double targetTol,
             int[][] prevVisitHint,
-            long startNs
+            long startNs,
+            long deadlineNs
     ) {
         if (prevVisitHint.length < ins.n + 1) {
             return null;
@@ -1027,6 +1152,11 @@ public final class LbbdReformulationSolver {
         try (PeriodCvrpSubproblemSolver subproblemSolver = new PeriodCvrpSubproblemSolver()) {
             double phi = 0.0;
             for (int t = 1; t <= ins.l; t++) {
+                if (isPastDeadline(deadlineNs)) {
+                    return buildGlobalTimeLimitResult(
+                            startNs, 0, 0, 0, 0, 0, 0, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY
+                    );
+                }
                 double[] qBar = new double[ins.n + 1];
                 int[] zBar = new int[ins.n + 1];
                 for (int i = 1; i <= ins.n; i++) {
@@ -1043,8 +1173,15 @@ public final class LbbdReformulationSolver {
                     zBar[i] = 1;
                     qBar[i] = ins.g(i, v, t);
                 }
-                PeriodCvrpSubproblemSolver.Result sub = subproblemSolver.solve(ins, t, qBar, zBar);
+                PeriodCvrpSubproblemSolver.Result sub = subproblemSolver.solve(
+                        ins, t, qBar, zBar, remainingSeconds(deadlineNs)
+                );
                 if (!sub.feasible || !sub.optimal) {
+                    if (isPastDeadline(deadlineNs)) {
+                        return buildGlobalTimeLimitResult(
+                                startNs, 0, 0, 0, 0, 0, 0, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY
+                        );
+                    }
                     return null;
                 }
                 phi += sub.objective;
@@ -1345,8 +1482,74 @@ public final class LbbdReformulationSolver {
         );
     }
 
+    private static SolveResult buildGlobalTimeLimitResult(
+            long startNs,
+            int iteration,
+            int feasibilityCuts,
+            int optimalityCuts,
+            int lpDualCuts,
+            int incumbentPruneCuts,
+            int targetPruneCuts,
+            double bestUpperBound,
+            double bestLowerBound
+    ) {
+        double sec = elapsedSec(startNs);
+        double finalBestBound = isFinite(bestLowerBound) ? bestLowerBound : Double.NaN;
+        if (isFinite(bestUpperBound)) {
+            double gap = isFinite(finalBestBound) ? relativeGap(bestUpperBound, finalBestBound) : Double.NaN;
+            String status = "LBBD_GlobalTimeLimit(iter=" + iteration
+                    + ",feasCuts=" + feasibilityCuts
+                    + ",optCuts=" + optimalityCuts
+                    + ",lpDualCuts=" + lpDualCuts
+                    + ",incPruneCuts=" + incumbentPruneCuts
+                    + ",targetPruneCuts=" + targetPruneCuts + ")";
+            return new SolveResult(
+                    "LBBDReformulation",
+                    true,
+                    false,
+                    status,
+                    bestUpperBound,
+                    finalBestBound,
+                    gap,
+                    sec
+            );
+        }
+        String status = "LBBD_GlobalTimeLimit_NoIncumbent(iter=" + iteration
+                + ",feasCuts=" + feasibilityCuts
+                + ",optCuts=" + optimalityCuts
+                + ",lpDualCuts=" + lpDualCuts
+                + ",incPruneCuts=" + incumbentPruneCuts
+                + ",targetPruneCuts=" + targetPruneCuts + ")";
+        return new SolveResult(
+                "LBBDReformulation",
+                false,
+                false,
+                status,
+                Double.NaN,
+                finalBestBound,
+                Double.NaN,
+                sec
+        );
+    }
+
+    private static boolean isPastDeadline(long deadlineNs) {
+        return System.nanoTime() >= deadlineNs;
+    }
+
+    private static double remainingSeconds(long deadlineNs) {
+        long remainingNs = deadlineNs - System.nanoTime();
+        if (remainingNs <= 0L) {
+            return 0.0;
+        }
+        return remainingNs / (double) NANOS_PER_SECOND;
+    }
+
+    private static double normalizedTimeLimitSec(double timeLimitSec) {
+        return Math.max(1e-3, timeLimitSec);
+    }
+
     private static double elapsedSec(long startNs) {
-        return (System.nanoTime() - startNs) / 1_000_000_000.0;
+        return (System.nanoTime() - startNs) / (double) NANOS_PER_SECOND;
     }
 
     private static String fmt(double v) {

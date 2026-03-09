@@ -20,6 +20,7 @@ public final class RoutingLowerBoundSolver {
     private static final double EPS = 1e-9;
     private static final double ART_EPS = 1e-7;
     private static final int MAX_COLUMNS_PER_PRICING = 16;
+    private static final long NANOS_PER_SECOND = 1_000_000_000L;
 
     public static final class Result {
         public final boolean feasible;
@@ -53,6 +54,14 @@ public final class RoutingLowerBoundSolver {
     }
 
     public Result solve() {
+        return solve(CplexConfig.TIME_LIMIT_SEC);
+    }
+
+    public Result solve(double timeLimitSec) {
+        if (timeLimitSec <= 0.0) {
+            return new Result(false, false, "RF_TimeLimit", Double.NaN, 0, 0);
+        }
+        long deadlineNs = System.nanoTime() + Math.max(1L, Math.round(timeLimitSec * NANOS_PER_SECOND));
         int n = ins.n;
         double[] qMin = new double[n + 1];
         double[] serviceTimes = new double[n + 1];
@@ -102,7 +111,7 @@ public final class RoutingLowerBoundSolver {
 
         PricingEspprcSolver pricingSolver = new PricingEspprcSolver();
         try (IloCplex cplex = new IloCplex()) {
-            configureLp(cplex);
+            configureLp(cplex, timeLimitSec);
             IloObjective obj = cplex.addMinimize();
             double artPenalty = computeArtificialPenalty(ins, n);
 
@@ -139,6 +148,10 @@ public final class RoutingLowerBoundSolver {
             boolean optimal = false;
 
             while (true) {
+                if (isPastDeadline(deadlineNs)) {
+                    return new Result(false, false, "RF_TimeLimit", Double.NaN, iteration, generatedColumns);
+                }
+                cplex.setParam(IloCplex.Param.TimeLimit, normalizedTimeLimitSec(remainingSeconds(deadlineNs)));
                 iteration++;
                 boolean solved = cplex.solve();
                 status = cplex.getStatus().toString();
@@ -230,8 +243,24 @@ public final class RoutingLowerBoundSolver {
         cplex.numVar(col, 0.0, Double.MAX_VALUE, "zeta_" + name);
     }
 
-    private static void configureLp(IloCplex cplex) throws IloException {
-        cplex.setParam(IloCplex.Param.TimeLimit, CplexConfig.TIME_LIMIT_SEC);
+    private static boolean isPastDeadline(long deadlineNs) {
+        return System.nanoTime() >= deadlineNs;
+    }
+
+    private static double remainingSeconds(long deadlineNs) {
+        long remainingNs = deadlineNs - System.nanoTime();
+        if (remainingNs <= 0L) {
+            return 0.0;
+        }
+        return remainingNs / (double) NANOS_PER_SECOND;
+    }
+
+    private static double normalizedTimeLimitSec(double timeLimitSec) {
+        return Math.max(1e-3, timeLimitSec);
+    }
+
+    private static void configureLp(IloCplex cplex, double timeLimitSec) throws IloException {
+        cplex.setParam(IloCplex.Param.TimeLimit, normalizedTimeLimitSec(timeLimitSec));
         cplex.setParam(IloCplex.Param.RootAlgorithm, IloCplex.Algorithm.Dual);
         cplex.setParam(IloCplex.Param.Threads, 1);
         if (!LOG_TO_CONSOLE) {
