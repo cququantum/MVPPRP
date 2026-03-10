@@ -23,6 +23,7 @@ import java.util.Set;
 
 public final class Batch16CsvExporter {
     private static final double RESULT_TOL = CplexConfig.MIP_GAP;
+    private static final int METHODS_PER_INSTANCE = 4;
     private static final String CSV_HEADER =
             "instance,method,status,feasible,optimal,objective,best_bound,gap,time_sec";
     private static final OutputStream DEV_NULL = new OutputStream() {
@@ -71,7 +72,7 @@ public final class Batch16CsvExporter {
                 StandardCharsets.UTF_8,
                 StandardOpenOption.APPEND
         )) {
-            int totalRows = INSTANCE_PATHS.length * 3;
+            int totalRows = INSTANCE_PATHS.length * METHODS_PER_INSTANCE;
             int progress = completedKeys.size();
 
             for (int idx = 0; idx < INSTANCE_PATHS.length; idx++) {
@@ -107,6 +108,22 @@ public final class Batch16CsvExporter {
                             @Override
                             public SolveResult get() {
                                 return new ReformulationModelSolver().solve(ins);
+                            }
+                        }
+                );
+
+                progress = runAndWriteIfNeeded(
+                        writer,
+                        ins,
+                        instanceName,
+                        "lbbd_no_init",
+                        completedKeys,
+                        progress,
+                        totalRows,
+                        new SolveSupplier() {
+                            @Override
+                            public SolveResult get() {
+                                return new LbbdReformulationSolver(ins, false).solve(Double.NaN, RESULT_TOL);
                             }
                         }
                 );

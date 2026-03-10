@@ -68,9 +68,15 @@ public final class LbbdReformulationSolver {
     private double incumbentPruneMinExcess;
 
     private final Instance ins;
+    private final boolean enableInitialCuts;
 
     public LbbdReformulationSolver(Instance ins) {
+        this(ins, true);
+    }
+
+    public LbbdReformulationSolver(Instance ins, boolean enableInitialCuts) {
         this.ins = ins;
+        this.enableInitialCuts = enableInitialCuts;
 
         // Adaptive parameter configuration based on instance size
         if (ins.n <= 12) {
@@ -365,108 +371,112 @@ public final class LbbdReformulationSolver {
                     + " iters=" + lbRResult.iterations
                     + " cols=" + lbRResult.generatedColumns);
 
-            // === T1 Initial Cuts (speed.tex Section B.2, eq 4-9), parallel across periods ===
-            int t1CutsAdded = 0;
-            T1InitialCutSolver.T1Result[] t1Results = new T1InitialCutSolver.T1Result[ins.l + 1];
-            int t1Threads = Math.min(ins.l, Math.min(Runtime.getRuntime().availableProcessors(), 4));
-            ExecutorService t1Executor = t1Threads > 1 ? Executors.newFixedThreadPool(t1Threads) : null;
-            @SuppressWarnings("unchecked")
-            Future<T1InitialCutSolver.T1Result>[] t1Futures =
-                    (t1Executor != null) ? new Future[ins.l + 1] : null;
-            if (isPastDeadline(deadlineNs)) {
-                return buildGlobalTimeLimitResult(
-                        startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
-                        incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
-                );
-            }
-            if (t1Executor != null) {
-                try {
-                    final double t1TimeLimitSec = remainingSeconds(deadlineNs);
-                    for (int t = 1; t <= ins.l; t++) {
-                        final int period = t;
-                        t1Futures[t] = t1Executor.submit(new Callable<T1InitialCutSolver.T1Result>() {
-                            @Override
-                            public T1InitialCutSolver.T1Result call() {
-                                return new T1InitialCutSolver(ins).solve(period, t1TimeLimitSec);
-                            }
-                        });
-                    }
-                    for (int t = 1; t <= ins.l; t++) {
-                        try {
-                            t1Results[t] = t1Futures[t].get();
-                        } catch (Exception e) {
-                            System.err.println("[LBBD] T1 parallel solve failed for t=" + t + ": " + e.getMessage());
-                        }
-                    }
-                } finally {
-                    t1Executor.shutdownNow();
-                }
+            if (enableInitialCuts) {
+                // === T1 Initial Cuts (speed.tex Section B.2, eq 4-9), parallel across periods ===
+                int t1CutsAdded = 0;
+                T1InitialCutSolver.T1Result[] t1Results = new T1InitialCutSolver.T1Result[ins.l + 1];
+                int t1Threads = Math.min(ins.l, Math.min(Runtime.getRuntime().availableProcessors(), 4));
+                ExecutorService t1Executor = t1Threads > 1 ? Executors.newFixedThreadPool(t1Threads) : null;
+                @SuppressWarnings("unchecked")
+                Future<T1InitialCutSolver.T1Result>[] t1Futures =
+                        (t1Executor != null) ? new Future[ins.l + 1] : null;
                 if (isPastDeadline(deadlineNs)) {
                     return buildGlobalTimeLimitResult(
                             startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
                             incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
                     );
                 }
-                T1InitialCutSolver fallbackSolver = new T1InitialCutSolver(ins);
-                for (int t = 1; t <= ins.l; t++) {
-                    if (t1Results[t] == null) {
-                        t1Results[t] = fallbackSolver.solve(t, remainingSeconds(deadlineNs));
+                if (t1Executor != null) {
+                    try {
+                        final double t1TimeLimitSec = remainingSeconds(deadlineNs);
+                        for (int t = 1; t <= ins.l; t++) {
+                            final int period = t;
+                            t1Futures[t] = t1Executor.submit(new Callable<T1InitialCutSolver.T1Result>() {
+                                @Override
+                                public T1InitialCutSolver.T1Result call() {
+                                    return new T1InitialCutSolver(ins).solve(period, t1TimeLimitSec);
+                                }
+                            });
+                        }
+                        for (int t = 1; t <= ins.l; t++) {
+                            try {
+                                t1Results[t] = t1Futures[t].get();
+                            } catch (Exception e) {
+                                System.err.println("[LBBD] T1 parallel solve failed for t=" + t + ": " + e.getMessage());
+                            }
+                        }
+                    } finally {
+                        t1Executor.shutdownNow();
                     }
-                }
-            } else {
-                T1InitialCutSolver t1Solver = new T1InitialCutSolver(ins);
-                for (int t = 1; t <= ins.l; t++) {
                     if (isPastDeadline(deadlineNs)) {
                         return buildGlobalTimeLimitResult(
                                 startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
                                 incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
                         );
                     }
-                    t1Results[t] = t1Solver.solve(t, remainingSeconds(deadlineNs));
-                }
-            }
-            for (int t = 1; t <= ins.l; t++) {
-                T1InitialCutSolver.T1Result t1 = t1Results[t];
-                if (t1 != null
-                        && t1.feasible
-                        && t1.optimal
-                        && t1.pricingProvedOptimal
-                        && t1.artificialClean
-                        && t1.dualU0 <= 1e-7
-                        && hasMeaningfulDualCoeffs(t, t1.dualW, t1.dualU0)) {
-                    master.addDualInitialCut(t, t1.dualW, t1.dualU0, "T1_InitCut_t" + t);
-                    t1CutsAdded++;
-                }
-            }
-            System.out.println("[LBBD] T1 initial cuts added: " + t1CutsAdded + "/" + ins.l);
-
-            // === T2 Initial Cuts (speed.tex Section B.3, eq 4-12 in per-period form) ===
-            if (isPastDeadline(deadlineNs)) {
-                return buildGlobalTimeLimitResult(
-                        startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
-                        incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
-                );
-            }
-            T2InitialCutSolver t2Solver = new T2InitialCutSolver(ins);
-            T2InitialCutSolver.T2Result t2 = t2Solver.solve(remainingSeconds(deadlineNs));
-            if (isPastDeadline(deadlineNs)) {
-                return buildGlobalTimeLimitResult(
-                        startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
-                        incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
-                );
-            }
-            int t2CutsAdded = 0;
-            if (t2.feasible && t2.optimal && t2.pricingProvedOptimal && t2.artificialClean
-                    && t2.dualWByPeriod != null && t2.dualU0ByPeriod != null) {
-                for (int t = 1; t <= ins.l; t++) {
-                    if (t2.dualU0ByPeriod[t] <= 1e-7
-                            && hasMeaningfulDualCoeffs(t, t2.dualWByPeriod[t], t2.dualU0ByPeriod[t])) {
-                        master.addDualInitialCut(t, t2.dualWByPeriod[t], t2.dualU0ByPeriod[t], "T2_InitCut_t" + t);
-                        t2CutsAdded++;
+                    T1InitialCutSolver fallbackSolver = new T1InitialCutSolver(ins);
+                    for (int t = 1; t <= ins.l; t++) {
+                        if (t1Results[t] == null) {
+                            t1Results[t] = fallbackSolver.solve(t, remainingSeconds(deadlineNs));
+                        }
+                    }
+                } else {
+                    T1InitialCutSolver t1Solver = new T1InitialCutSolver(ins);
+                    for (int t = 1; t <= ins.l; t++) {
+                        if (isPastDeadline(deadlineNs)) {
+                            return buildGlobalTimeLimitResult(
+                                    startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                                    incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                            );
+                        }
+                        t1Results[t] = t1Solver.solve(t, remainingSeconds(deadlineNs));
                     }
                 }
+                for (int t = 1; t <= ins.l; t++) {
+                    T1InitialCutSolver.T1Result t1 = t1Results[t];
+                    if (t1 != null
+                            && t1.feasible
+                            && t1.optimal
+                            && t1.pricingProvedOptimal
+                            && t1.artificialClean
+                            && t1.dualU0 <= 1e-7
+                            && hasMeaningfulDualCoeffs(t, t1.dualW, t1.dualU0)) {
+                        master.addDualInitialCut(t, t1.dualW, t1.dualU0, "T1_InitCut_t" + t);
+                        t1CutsAdded++;
+                    }
+                }
+                System.out.println("[LBBD] T1 initial cuts added: " + t1CutsAdded + "/" + ins.l);
+
+                // === T2 Initial Cuts (speed.tex Section B.3, eq 4-12 in per-period form) ===
+                if (isPastDeadline(deadlineNs)) {
+                    return buildGlobalTimeLimitResult(
+                            startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                            incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                    );
+                }
+                T2InitialCutSolver t2Solver = new T2InitialCutSolver(ins);
+                T2InitialCutSolver.T2Result t2 = t2Solver.solve(remainingSeconds(deadlineNs));
+                if (isPastDeadline(deadlineNs)) {
+                    return buildGlobalTimeLimitResult(
+                            startNs, iteration, feasibilityCuts, optimalityCuts, lpDualCuts,
+                            incumbentPruneCuts, targetPruneCuts, bestUpperBound, bestLowerBound
+                    );
+                }
+                int t2CutsAdded = 0;
+                if (t2.feasible && t2.optimal && t2.pricingProvedOptimal && t2.artificialClean
+                        && t2.dualWByPeriod != null && t2.dualU0ByPeriod != null) {
+                    for (int t = 1; t <= ins.l; t++) {
+                        if (t2.dualU0ByPeriod[t] <= 1e-7
+                                && hasMeaningfulDualCoeffs(t, t2.dualWByPeriod[t], t2.dualU0ByPeriod[t])) {
+                            master.addDualInitialCut(t, t2.dualWByPeriod[t], t2.dualU0ByPeriod[t], "T2_InitCut_t" + t);
+                            t2CutsAdded++;
+                        }
+                    }
+                }
+                System.out.println("[LBBD] T2 initial cuts added: " + t2CutsAdded + "/" + ins.l);
+            } else {
+                System.out.println("[LBBD] initial cuts disabled: skip T1/T2 initial cuts");
             }
-            System.out.println("[LBBD] T2 initial cuts added: " + t2CutsAdded + "/" + ins.l);
 
             long totalMasterSolveNs = 0L;
             long totalSubSolveNs = 0L;
