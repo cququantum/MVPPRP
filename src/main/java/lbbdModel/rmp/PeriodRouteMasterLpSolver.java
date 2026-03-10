@@ -96,11 +96,11 @@ public final class PeriodRouteMasterLpSolver implements AutoCloseable {
         }
     }
 
-    public Result solve(Instance ins, int t, double[] qBar, int[] zBar, int[] prevVisitBySupplier) {
-        return solve(ins, t, qBar, zBar, prevVisitBySupplier, CplexConfig.TIME_LIMIT_SEC);
+    public Result solve(Instance ins, int t, int[] prevVisitBySupplier) {
+        return solve(ins, t, prevVisitBySupplier, CplexConfig.TIME_LIMIT_SEC);
     }
 
-    public Result solve(Instance ins, int t, double[] qBar, int[] zBar, int[] prevVisitBySupplier, double timeLimitSec) {
+    public Result solve(Instance ins, int t, int[] prevVisitBySupplier, double timeLimitSec) {
         if (t < 1 || t > ins.l) {
             throw new IllegalArgumentException("t must be in 1..l");
         }

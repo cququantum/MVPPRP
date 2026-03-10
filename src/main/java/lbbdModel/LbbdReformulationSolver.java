@@ -772,8 +772,6 @@ public final class LbbdReformulationSolver {
                                     return finalRmpLpSolver.solve(
                                             ins,
                                             period,
-                                            finalPoint.qBar[period],
-                                            finalPoint.zBar[period],
                                             prevVisitForPeriod,
                                             rmpTimeLimitSec
                                     );
@@ -783,8 +781,6 @@ public final class LbbdReformulationSolver {
                             PeriodRouteMasterLpSolver.Result solvedCut = rmpLpSolver.solve(
                                     ins,
                                     bestT,
-                                    point.qBar[bestT],
-                                    point.zBar[bestT],
                                     prevVisitArgPeriods[bestT],
                                     remainingSeconds(deadlineNs)
                             );
