@@ -1,5 +1,6 @@
 import instance.Instance;
 import lbbdModel.LbbdReformulationSolver;
+import model.CplexConfig;
 import model.SolveResult;
 import originalModel.OriginalModelSolver;
 import reformulationModel.ReformulationModelSolver;
@@ -21,7 +22,7 @@ import java.util.Locale;
 import java.util.Set;
 
 public final class Batch16CsvExporter {
-    private static final double RESULT_TOL = 1e-4;
+    private static final double RESULT_TOL = CplexConfig.MIP_GAP;
     private static final String CSV_HEADER =
             "instance,method,status,feasible,optimal,objective,best_bound,gap,time_sec";
     private static final OutputStream DEV_NULL = new OutputStream() {

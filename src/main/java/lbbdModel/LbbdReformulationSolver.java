@@ -25,8 +25,8 @@ import java.util.concurrent.Future;
 public final class LbbdReformulationSolver {
 
     private static final double CUT_EPS = 1e-6;
-    private static final double RESULT_TOL = 1e-4;
-    private static final double INCUMBENT_PRUNE_TOL = 1e-4;
+    private static final double RESULT_TOL = CplexConfig.MIP_GAP;
+    private static final double INCUMBENT_PRUNE_TOL = CplexConfig.MIP_GAP;
     private static final int MAX_ITERATIONS = 5000;
     private static final int MAX_RMP_PERIODS_PER_ITER = 3;
     private static final boolean ENABLE_INCUMBENT_PRUNE_NOGOOD = false;

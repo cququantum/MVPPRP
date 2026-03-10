@@ -1,5 +1,6 @@
 import instance.Instance;
 import lbbdModel.LbbdReformulationSolver;
+import model.CplexConfig;
 import model.SolveResult;
 import originalModel.OriginalModelSolver;
 import reformulationModel.ReformulationModelSolver;
@@ -9,7 +10,7 @@ import java.util.Locale;
 
 public class Main {
     private enum SolverMode { ALL, ORIGINAL, REFORM, LBBD }
-    private static final double RESULT_TOL = 1e-4;
+    private static final double RESULT_TOL = CplexConfig.MIP_GAP;
 
     public static void main(String[] args) {
         SolverMode solverMode = SolverMode.ALL;
@@ -75,7 +76,7 @@ public class Main {
                 printComparison(originalResult, reformulationResult);
             }
             if (reformulationResult != null && lbbdResult != null) {
-                printValidation("reform-vs-lbbd", reformulationResult, lbbdResult, 1e-4);
+                printValidation("reform-vs-lbbd", reformulationResult, lbbdResult, CplexConfig.MIP_GAP);
             }
         } catch (IOException e) {
             throw new RuntimeException("Failed to load instance file: " + instancePath, e);
