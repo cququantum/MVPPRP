@@ -49,12 +49,24 @@ P_{0t} &\leq L_p, && \forall t \in T && \text{(成品库存容量)}
 \vspace{-1.5ex}
 \begin{align}
 I_{i,t-1} + s_{it} &= q_{it} + I_{it}, && \forall i \in V_S, t \in T && \text{(库存平衡，$t=1$时$I_{i,0}=I_{i0}$)} \\
-q_{it} &\geq I_{i,t-1} + s_{it} - M(1 - z_{it}), && \forall i \in V_S, t \in T && \text{(访问时取全量)} \\
-q_{it} &\leq M z_{it}, && \forall i \in V_S, t \in T && \text{(不访问则不取货)} \\
-I_{it} &\leq M(1 - z_{it}), && \forall i \in V_S, t \in T && \text{(访问后库存为0)} \\
-I_{it} &\geq I_{i,t-1} + s_{it} - M z_{it}, && \forall i \in V_S, t \in T && \text{(不访问时库存累积)} \\
+q_{it} &\geq I_{i,t-1} + s_{it} - L_i(1 - z_{it}), && \forall i \in V_S, t \in T && \text{(访问时取全量)} \\
+q_{it} &\leq Q z_{it}, && \forall i \in V_S, t \in T && \text{(不访问则不取货)} \\
+I_{it} &\leq L_i(1 - z_{it}), && \forall i \in V_S, t \in T && \text{(访问后库存为0)} \\
+I_{it} &\geq I_{i,t-1} + s_{it} - L_i z_{it}, && \forall i \in V_S, t \in T && \text{(不访问时库存累积)} \\
 I_{i,t-1} + s_{it} &\leq L_i, && \forall i \in V_S, t \in T && \text{(库存容量限制)}
 \end{align}
+% 修正说明：
+% 1. 不再使用统一 big-M，而是按变量自然上界拆分：
+%    q 相关约束使用车辆容量 Q，库存相关约束使用节点容量 L_i。
+% 2. 这样与原模型语义一致，但比统一 M 更紧、更稳定。
+
+\begin{remark}[实现中的等价强化]
+代码实现保留库存平衡与容量约束，并使用
+\[
+q_{it} \le Q z_{it}, \qquad I_{it} \le L_i(1-z_{it})
+\]
+这两条更紧的联动约束；结合变量非负性，与上面的分离常数 big-M 写法等价，但数值稳定性更好。
+\end{remark}
 
 \subsubsection{工厂原料库存约束}
 \vspace{-1.5ex}
@@ -232,4 +244,3 @@ u_{it} &\geq 0, && \forall i \in V, t \in T
 
 
 \end{document}
-
