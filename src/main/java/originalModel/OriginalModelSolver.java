@@ -129,36 +129,14 @@ public final class OriginalModelSolver {
                     }
                     cplex.addLe(prePickupCap, rhsPrePickupCap, "SupplierPrePickupCap_" + i + "_" + t);
 
-                    IloLinearNumExpr pickupAll = cplex.linearNumExpr();
-                    double rhsPickupAll = ins.s[i][t] - ins.bigM;
-                    pickupAll.addTerm(1.0, q[i][t]);
-                    if (t == 1) {
-                        rhsPickupAll += ins.Ii0[i];
-                    } else {
-                        pickupAll.addTerm(-1.0, inventory[i][t - 1]);
-                    }
-                    pickupAll.addTerm(-ins.bigM, z[i][t]);
-                    cplex.addGe(pickupAll, rhsPickupAll, "PickupAllLB_" + i + "_" + t);
-
                     IloLinearNumExpr rhsNoVisitNoPickup = cplex.linearNumExpr();
-                    rhsNoVisitNoPickup.addTerm(ins.bigM, z[i][t]);
+                    rhsNoVisitNoPickup.addTerm(ins.Q, z[i][t]);
                     cplex.addLe(q[i][t], rhsNoVisitNoPickup, "NoVisitNoPickup_" + i + "_" + t);
 
                     IloLinearNumExpr visitZeroInventory = cplex.linearNumExpr();
                     visitZeroInventory.addTerm(1.0, inventory[i][t]);
-                    visitZeroInventory.addTerm(ins.bigM, z[i][t]);
-                    cplex.addLe(visitZeroInventory, ins.bigM, "VisitInventoryZero_" + i + "_" + t);
-
-                    IloLinearNumExpr noVisitCarry = cplex.linearNumExpr();
-                    double rhsNoVisitCarry = ins.s[i][t];
-                    noVisitCarry.addTerm(1.0, inventory[i][t]);
-                    if (t == 1) {
-                        rhsNoVisitCarry += ins.Ii0[i];
-                    } else {
-                        noVisitCarry.addTerm(-1.0, inventory[i][t - 1]);
-                    }
-                    noVisitCarry.addTerm(ins.bigM, z[i][t]);
-                    cplex.addGe(noVisitCarry, rhsNoVisitCarry, "NoVisitCarry_" + i + "_" + t);
+                    visitZeroInventory.addTerm(ins.Li[i], z[i][t]);
+                    cplex.addLe(visitZeroInventory, ins.Li[i], "VisitInventoryZero_" + i + "_" + t);
 
                     cplex.addLe(inventory[i][t], ins.Li[i], "SupplierCap_" + i + "_" + t);
                 }
