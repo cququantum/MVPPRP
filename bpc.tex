@@ -1,0 +1,485 @@
+% bpc.tex — Branch-Price-and-Cut 求解 CVRP 子问题
+% 符号体系与 lbbd.tex / reformulationModel.tex / speed.tex 保持一致
+
+\documentclass{article}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{mathrsfs}
+\geometry{a4paper, margin=1in}
+\usepackage{ctex}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage[linesnumbered,ruled,vlined]{algorithm2e}
+
+\newtheorem{remark}{注}
+\newtheorem{definition}{定义}
+\newtheorem{proposition}{命题}
+
+\begin{document}
+
+\section{Branch-Price-and-Cut 精确求解 CVRP 子问题}
+
+在 LBBD 框架（见 \texttt{lbbd.tex}）中，给定主问题的整数解 $(\bar z,\bar\lambda)$ 后，
+需要对每个时期 $t\in T$ 精确求解一个 CVRP 子问题 $\text{CVRP}(t)$ 以获得最优路径成本 $\omega_t^*$。
+本章介绍采用 Branch-Price-and-Cut（BPC）方法精确求解 $\text{CVRP}(t)$ 的原理。
+
+% ============================================================
+\subsection{符号回顾与子问题输入}
+% ============================================================
+
+沿用 \texttt{lbbd.tex} 中的符号。对时期 $t$，BMP 传递给 BSP 的信息为：
+\begin{itemize}[leftmargin=2em]
+  \item 当期被访问的收集点集合 $N_c^t = \{i \in V_S : \bar z_{it} = 1\}$；
+  \item 每个收集点 $i \in N_c^t$ 的取货量 $q_{it} = g_{i\bar v_i t}$，其中 $\bar v_i$ 满足 $\bar\lambda_{i\bar v_i t} = 1$；
+  \item 可用车辆上限 $K$，单车容量 $Q$。
+\end{itemize}
+
+$\text{CVRP}(t)$ 需要为这些收集点安排从工厂（节点 $0$）出发、最终返回工厂（节点 $n+1$）的多条路径，
+使得每条路径载重不超过 $Q$、路径数不超过 $K$，且总行驶成本最小。
+
+% ============================================================
+\subsection{集合划分主问题}
+\label{sec:bpc_master}
+% ============================================================
+
+令 $\mathcal{R}_t$ 为时期 $t$ 所有满足车辆容量约束的可行路线集合。
+对路线 $r \in \mathcal{R}_t$，定义：
+\begin{itemize}[leftmargin=2em]
+  \item $b_r = \sum_{(i,j) \in r} c_{ij}$：路线 $r$ 的行驶成本；
+  \item $a_{ir} \in \{0,1\}$：收集点 $i$ 是否被路线 $r$ 服务。
+\end{itemize}
+令 $\xi_r \in \{0,1\}$ 为是否选用路线 $r$ 的决策变量。
+$\text{CVRP}(t)$ 的集合划分（Set Partitioning）形式为：
+
+\begin{align}
+\omega_t^* = \min\ & \sum_{r \in \mathcal{R}_t} b_r\,\xi_r \notag \\
+\text{s.t.}\quad
+& \sum_{r \in \mathcal{R}_t} a_{ir}\,\xi_r = 1, && \forall\, i \in N_c^t, \label{eq:bpc_cover} \\
+& \sum_{r \in \mathcal{R}_t} \xi_r \le K, \label{eq:bpc_vehicle} \\
+& \xi_r \in \{0,1\}, && \forall\, r \in \mathcal{R}_t. \label{eq:bpc_integrality}
+\end{align}
+
+约束 \eqref{eq:bpc_cover} 要求每个收集点恰好被一条路线服务（集合划分），
+约束 \eqref{eq:bpc_vehicle} 限制使用的路线数不超过可用车辆数。
+
+\begin{remark}[与 \texttt{lbbd.tex} 中子问题的对应关系]
+在 \texttt{lbbd.tex} 的公式 \eqref{eq:cvrp_sp_t} 中，覆盖约束以"客户--需求情景"$(i,v)$ 为索引，
+即 $\sum_r a_{ivr}\xi_r = \lambda_{ivt}$。
+由于 BPC 求解时 $\bar\lambda$ 已经固定，对每个被访问的收集点 $i$，
+恰好只有一个 $\bar v_i$ 使得 $\bar\lambda_{i\bar v_i t} = 1$，
+故覆盖约束退化为式 \eqref{eq:bpc_cover} 的标准集合划分形式，
+取货量则确定为 $q_{it} = g_{i\bar v_i t}$。
+\end{remark}
+
+由于可行路线集合 $\mathcal{R}_t$ 的规模随客户数呈指数增长，
+无法直接枚举。BPC 方法的核心思想是将求解过程分为三个层次：
+列生成（动态生成路线）、割平面（收紧 LP 松弛）和分支（保证整数最优性）。
+
+% ============================================================
+\subsection{列生成：受限主问题与定价子问题}
+\label{sec:column_generation}
+% ============================================================
+
+\subsubsection{受限主问题（RMP）}
+
+列生成从一个仅包含少量初始路线的\textbf{受限主问题}（Restricted Master Problem, RMP）出发，
+求解其 LP 松弛（将 $\xi_r \in \{0,1\}$ 放宽为 $\xi_r \ge 0$）。
+初始路线可取每个收集点的"单客户路线"（从工厂出发、仅服务一个收集点后返回），
+保证 RMP 初始可行。
+
+设 RMP 的 LP 松弛最优解对应的对偶变量为：
+\begin{itemize}[leftmargin=2em]
+  \item $w_i \in \mathbb{R}$：覆盖约束 \eqref{eq:bpc_cover} 的对偶变量，$\forall\, i \in N_c^t$；
+  \item $u_0 \le 0$：车辆数约束 \eqref{eq:bpc_vehicle} 的对偶变量。
+\end{itemize}
+
+\subsubsection{定价子问题：最短路径问题}
+
+为判断是否存在能改善当前 LP 最优值的新路线，需要求解\textbf{定价子问题}。
+路线 $r$ 的 reduced cost 定义为：
+\begin{equation}
+\bar{c}_r = b_r - \sum_{i \in N_c^t} a_{ir}\,w_i - u_0.
+\label{eq:reduced_cost}
+\end{equation}
+
+若不存在 $\bar{c}_r < 0$ 的路线，则当前 RMP 的 LP 最优解即为完整主问题 LP 松弛的最优解，
+列生成收敛。否则，将具有负 reduced cost 的路线加入 RMP 并重新求解。
+
+定价子问题等价于在以工厂为起终点的图上，寻找一条满足车辆容量约束的最小 reduced cost 路径，
+且每个客户至多访问一次。这正是\textbf{基本最短路问题（ESPPRC）}：
+
+\begin{definition}[基本最短路问题（ESPPRC）]
+给定带权有向图 $G = (V', A')$，其中 $V' = \{0\} \cup N_c^t \cup \{n+1\}$，
+每个客户节点 $i$ 有需求 $q_{it}$ 和收益 $w_i$（对偶值），
+每条弧 $(i,j)$ 有成本 $c_{ij}$。ESPPRC 要求找到一条从节点 $0$ 到节点 $n+1$ 的路径，
+使得路径上客户需求之和不超过 $Q$、每个客户至多出现一次，且 reduced cost \eqref{eq:reduced_cost} 最小。
+\end{definition}
+
+ESPPRC 是 NP-hard 问题，但在 CVRP 的实际规模下可通过标号算法高效求解。
+
+% ============================================================
+\subsection{标号算法求解 ESPPRC}
+\label{sec:labeling}
+% ============================================================
+
+\subsubsection{单向标号设定算法}
+
+标号算法（Label-Setting Algorithm）是求解 ESPPRC 的经典方法。
+算法为图中每条部分路径维护一个\textbf{标号} $L$，记录以下资源状态：
+\begin{itemize}[leftmargin=2em]
+  \item $L.\text{last}$：当前路径的末端节点；
+  \item $L.\text{load}$：已使用的车辆容量；
+  \item $L.\text{cost}$：从工厂到当前节点的行驶成本；
+  \item $L.\text{gain}$：已收集的对偶收益 $\sum_{i \in \text{visited}} w_i$；
+  \item $L.S$：已访问的客户集合（保证基本性，即无重复访问）。
+\end{itemize}
+
+标号的 partial reduced cost 定义为：
+\begin{equation}
+\bar{c}(L) = L.\text{cost} - L.\text{gain}.
+\label{eq:partial_rc}
+\end{equation}
+
+算法从工厂出发，逐步沿弧扩展标号。当标号从节点 $i$ 沿弧 $(i,j)$ 扩展时，
+生成新标号 $L'$：
+\begin{align}
+L'.\text{last} &= j, \notag \\
+L'.\text{load} &= L.\text{load} + q_{jt}, \notag \\
+L'.\text{cost} &= L.\text{cost} + c_{ij}, \notag \\
+L'.\text{gain} &= L.\text{gain} + w_j, \notag \\
+L'.S &= L.S \cup \{j\}. \notag
+\end{align}
+扩展需满足基本性约束 $j \notin L.S$ 和容量约束 $L'.\text{load} \le Q$。
+
+当标号扩展到返回工厂弧 $(i, n+1)$ 时，对应完整路线的 reduced cost 为
+\begin{equation}
+\bar{c}_r = L.\text{cost} + c_{i,n+1} - L.\text{gain} - u_0.
+\end{equation}
+
+\subsubsection{支配规则}
+
+为避免标号数量的指数爆炸，标号算法的关键是利用\textbf{支配规则}（Dominance Rule）
+剪除不可能产生最优路线的标号。
+
+\begin{definition}[标号支配]
+标号 $L^1$ \textbf{支配}标号 $L^2$（记作 $L^1 \preceq L^2$），
+若以下条件同时成立：
+\begin{enumerate}[label=(\roman*)]
+  \item $L^1.\text{last} = L^2.\text{last}$（末端节点相同）；
+  \item $L^1.\text{load} \le L^2.\text{load}$（已用容量不多于）；
+  \item $\bar{c}(L^1) \le \bar{c}(L^2)$（partial reduced cost 不大于）；
+  \item $L^1.S \subseteq L^2.S$（已访问集合为子集）。
+\end{enumerate}
+\end{definition}
+
+条件 (iv) 保证 $L^1$ 能访问的剩余客户是 $L^2$ 能访问的超集，
+因此 $L^1$ 的任何可行延伸也是 $L^2$ 的可行延伸，
+且延伸后的 reduced cost 不会更差。被支配的标号可安全删除。
+
+\begin{remark}[子集支配的枚举]
+条件 (iv) 要求检查已访问集合的子集关系。
+当客户数 $|N_c^t|$ 较小时（如不超过 62），可用位掩码（bitmask）表示访问集合 $S$，
+并在同一末端节点的标号之间高效枚举子集进行支配检查。
+具体而言，对标号 $L$ 在末端节点处的标号表中，
+仅需遍历 $L.S$ 的所有真子集对应的标号即可完成支配判定。
+\end{remark}
+
+\subsubsection{双向标号算法}
+\label{sec:bidirectional}
+
+单向标号算法从工厂向外扩展，标号数量随路径长度指数增长。
+\textbf{双向标号算法}通过同时从两端搜索来降低计算量。
+
+\paragraph{前向标号}从工厂（节点 $0$）出发，沿弧正向扩展，
+记录路径 $0 \to i_1 \to \cdots \to i_k$（末端为 $i_k$）。
+
+\paragraph{后向标号}从返回工厂节点（节点 $n+1$）出发，
+沿弧反向扩展，记录路径 $j_1 \to \cdots \to j_m \to n+1$（首端为 $j_1$）。
+
+\paragraph{拼接}当两个方向的标号扩展到足够覆盖整个容量范围后，
+尝试将前向标号与后向标号拼接。前向标号 $L^F$（末端为 $i$）与后向标号 $L^B$（首端为 $j$）可拼接，
+需满足：
+\begin{enumerate}[label=(\roman*)]
+  \item 两者已访问的客户集合不相交：$L^F.S \cap L^B.S = \emptyset$；
+  \item 合并后容量可行：$L^F.\text{load} + L^B.\text{load} \le Q$；
+  \item 连接弧 $(i,j)$ 存在。
+\end{enumerate}
+拼接后完整路线的 reduced cost 为
+\begin{equation}
+\bar{c}_r = L^F.\text{cost} + c_{ij} + L^B.\text{cost} - L^F.\text{gain} - L^B.\text{gain} - u_0.
+\end{equation}
+
+双向算法通过\textbf{渐进式容量扩展}控制搜索空间：
+设步长 $\Delta$，前向标号先扩展到 $\text{load} \le \Delta$，后向标号同样扩展到 $\text{load} \le \Delta$，
+然后执行拼接；之后逐步增大容量限制直到覆盖 $Q$。
+在每一轮中，只有新产生的标号需要与对方向的已有标号进行拼接，避免重复计算。
+
+\subsubsection{ng-route 松弛加速}
+\label{sec:ng_relaxation}
+
+当客户数较多时，精确 ESPPRC 的计算量仍然很大。
+\textbf{ng-route 松弛}通过放松基本性约束来加速定价。
+
+\begin{definition}[ng 邻域集]
+对每个客户 $i \in N_c^t$，定义其 \textbf{ng 邻域集} $N_G(i) \subseteq N_c^t$，
+通常取 $i$ 的 $\Delta_{\text{ng}}$ 个最近邻客户（加上 $i$ 自身）。
+\end{definition}
+
+在 ng-route 松弛中，标号不再记录完整的已访问集合 $S$，
+而是记录一个\textbf{记忆集} $M \subseteq N_c^t$。
+当标号从节点 $i$ 扩展到节点 $j$ 时，新的记忆集更新为：
+\begin{equation}
+M' = (M \cap N_G(j)) \cup \{j\}.
+\end{equation}
+扩展的基本性检查放松为：仅当 $j \in M$ 时才禁止扩展。
+这意味着只有在当前记忆集中的客户不允许被重复访问，
+不在记忆集中的客户即使之前已经访问过也可以再次扩展。
+
+ng-route 松弛的优势在于：
+\begin{itemize}[leftmargin=2em]
+  \item 记忆集的状态空间远小于完整的已访问集合，显著减少标号数量；
+  \item 得到的 LP 下界仍然是精确 LP 松弛下界的下界，保证列生成整体框架的正确性；
+  \item 如果 ng 松弛找到的负 reduced cost 路线恰好是基本的（无重复访问），
+        则该路线也是精确定价的合法列。
+\end{itemize}
+
+在实际求解中，采用\textbf{松弛优先、精确兜底}的策略：
+先用 ng-route 松弛的双向标号快速寻找负 reduced cost 列；
+若 ng 松弛无法找到负 reduced cost 列，
+则回退到精确 ESPPRC（完整记录已访问集合）以确认列生成确实收敛。
+这一策略在多数迭代中用松弛加速，仅在最后收敛阶段使用精确定价，
+兼顾了效率与正确性。
+
+\subsubsection{完成界剪枝}
+\label{sec:completion_bound}
+
+为进一步减少标号扩展数量，可利用\textbf{完成界}（Completion Bound）进行标号剪枝。
+
+对前向标号 $L^F$（末端为客户 $i$，已用容量为 $q$），
+定义\textbf{后缀下界} $\text{CB}^+(i, q)$ 为从客户 $i$ 出发、
+在剩余容量 $Q - q$ 内返回工厂所能获得的最小 partial reduced cost。
+若标号的 partial reduced cost 加上后缀下界已经不能优于当前最优，
+即
+\begin{equation}
+\bar{c}(L^F) + \text{CB}^+(i, q) - u_0 \ge \bar{c}^*,
+\end{equation}
+其中 $\bar{c}^*$ 为当前已知的最优 reduced cost，则该标号可安全剪除。
+
+对称地，对后向标号可定义\textbf{前缀下界} $\text{CB}^-(j, q)$。
+
+后缀下界可通过在状态空间 $(\text{当前节点}, \text{已用容量})$ 上
+逆向动态规划预计算得到（忽略基本性约束，仅考虑容量和弧禁止约束）。
+当客户需求为整数时，容量状态可离散化，使得预计算的时间和空间开销可控。
+
+% ============================================================
+\subsection{容量割}
+\label{sec:capacity_cuts}
+% ============================================================
+
+列生成求解 LP 松弛后，所得下界可能与整数最优值存在较大间隙。
+在分支之前，通过向主问题中添加\textbf{有效不等式}（割平面）来收紧 LP 松弛，
+是提升 BPC 效率的重要手段。
+
+本文采用的割平面类型为\textbf{舍入容量不等式}（Rounded Capacity Inequalities, RCI），
+这是 CVRP 文献中最基本也最有效的割类之一。
+
+\begin{definition}[舍入容量不等式]
+对客户子集 $S \subseteq N_c^t$，$S \ne \emptyset$，定义
+\begin{equation}
+\sum_{r \in \mathcal{R}_t} \delta_r(S)\,\xi_r \ge \left\lceil \frac{\sum_{i \in S} q_{it}}{Q} \right\rceil,
+\label{eq:rci}
+\end{equation}
+其中 $\delta_r(S)$ 表示路线 $r$ 从集合 $S$ 内部出发到 $S$ 外部（含工厂）的弧的数量。
+\end{definition}
+
+不等式 \eqref{eq:rci} 的直观含义是：为服务集合 $S$ 中所有客户的总需求，
+至少需要 $\lceil \sum_{i \in S} q_{it} / Q \rceil$ 辆车进出该集合。
+
+\subsubsection{割的分离}
+
+给定 LP 松弛最优解 $\bar\xi$，需要找到被违反的 RCI，即满足
+\begin{equation}
+\sum_{r \in \mathcal{R}_t} \delta_r(S)\,\bar\xi_r < \left\lceil \frac{\sum_{i \in S} q_{it}}{Q} \right\rceil
+\end{equation}
+的客户子集 $S$。精确分离是 NP-hard 的，因此实际中采用启发式方法。
+
+本文使用两种启发式分离策略：
+
+\paragraph{收缩分离（Shrinking Separation）}
+构造弧流图，将每个客户视为初始簇。
+反复合并弧流值最大的两个簇，直到所有簇合并为一体或无法继续。
+在每次合并后检查所形成的客户子集是否产生被违反的 RCI。
+
+\paragraph{连通子图分离（Connected Separation）}
+从弧流图中枚举连通的客户子集。
+从每个客户出发，沿弧流值正的边进行深度优先搜索，
+逐步扩大子集并检查 RCI 的违反程度。搜索过程中设置子集大小上限以控制计算量。
+
+\subsubsection{割对定价子问题的影响}
+
+添加 RCI 后，覆盖约束之外多出了割的对偶变量。
+设割 \eqref{eq:rci} 对应对偶变量为 $\sigma_S \ge 0$。
+在定价子问题中，路线 $r$ 的 reduced cost 变为
+\begin{equation}
+\bar{c}_r = b_r - \sum_{i \in N_c^t} a_{ir}\,w_i - u_0 - \sum_{S} \delta_r(S)\,\sigma_S.
+\label{eq:reduced_cost_with_cuts}
+\end{equation}
+
+由于 $\delta_r(S)$ 依赖于路线 $r$ 中从 $S$ 内部指向 $S$ 外部的弧的数量，
+可以将割的对偶贡献分解到每条弧上：对弧 $(i,j)$（$i \in S, j \notin S$），
+该弧携带对偶收益 $\sigma_S$。这样，割的对偶值可以作为弧上的额外收益整合到 ESPPRC 的标号扩展中，
+不改变定价算法的整体框架，仅在弧的 reduced cost 计算中额外扣除割的对偶贡献。
+
+% ============================================================
+\subsection{分支策略}
+\label{sec:branching}
+% ============================================================
+
+当列生成（含割平面）收敛后，若 LP 松弛最优解 $\bar\xi$ 不是整数解，
+则需要通过分支排除当前分数解。BPC 中的分支决策不能直接对路线变量 $\xi_r$ 分支
+（因为这会破坏列生成的结构），而是对更自然的聚合量进行分支。
+
+\subsubsection{车辆数分支（优先级最高）}
+
+定义 LP 解中使用的车辆数为
+\begin{equation}
+\bar{m} = \sum_{r \in \mathcal{R}_t} \bar\xi_r.
+\end{equation}
+若 $\bar{m}$ 非整数，则生成两个子节点：
+\begin{itemize}[leftmargin=2em]
+  \item 左子节点：添加约束 $\sum_r \xi_r \le \lfloor \bar{m} \rfloor$；
+  \item 右子节点：添加约束 $\sum_r \xi_r \ge \lceil \bar{m} \rceil$。
+\end{itemize}
+车辆数约束可直接修改主问题中的车辆上下界，
+不影响定价子问题的结构。
+
+\subsubsection{弧分支}
+
+若车辆数已为整数但路线方案仍为分数解，则对\textbf{弧流量}进行分支。
+从 LP 解中计算每条弧 $(i,j)$ 的聚合流量：
+\begin{equation}
+\bar{f}_{ij} = \sum_{r \in \mathcal{R}_t : (i,j) \in r} \bar\xi_r.
+\end{equation}
+
+选择最接近 $0.5$ 的分数弧流量 $\bar{f}_{ij}$ 进行分支，生成两个子节点：
+\begin{itemize}[leftmargin=2em]
+  \item 禁止弧子节点：弧 $(i,j)$ 被禁止使用（在定价子问题中删除该弧）；
+  \item 强制弧子节点：弧 $(i,j)$ 必须被使用
+    （在定价子问题中，禁止节点 $i$ 的所有其他出弧和节点 $j$ 的所有其他入弧）。
+\end{itemize}
+
+弧禁止/强制约束直接反映在定价子问题的图结构中，
+标号扩展时检查弧是否被禁止即可，不需要修改主问题的约束矩阵。
+
+\subsubsection{强分支}
+\label{sec:strong_branching}
+
+为选择分支效果最好的弧，可采用\textbf{强分支}（Strong Branching）策略。
+对若干候选分支弧，分别试探性地求解两个子节点的 LP 松弛（通过执行若干轮列生成迭代），
+估计分支后两侧的 LP 下界，然后选择使两侧下界提升之和最大的弧作为实际分支弧。
+
+候选弧按弧流量与 $0.5$ 的接近程度排序，取前若干个进行评估。
+强分支在增加单步计算量的同时，通常能显著减小搜索树的规模。
+
+% ============================================================
+\subsection{搜索树管理}
+\label{sec:tree}
+% ============================================================
+
+BPC 以\textbf{最优先搜索}（Best-First Search）策略管理搜索树：
+优先探索 LP 下界最小的节点。维护全局上界（incumbent），
+若某节点的 LP 下界不低于当前上界则剪枝。
+
+每个搜索树节点继承父节点的车辆数界、弧禁止集合和容量割集合，
+并将父节点的列池作为初始列热启动子节点的列生成，避免从零开始。
+
+% ============================================================
+\subsection{BPC 求解 CVRP$(t)$ 的整体流程}
+\label{sec:bpc_overall}
+% ============================================================
+
+\begin{algorithm}[H]
+\caption{Branch-Price-and-Cut 求解 $\text{CVRP}(t)$}
+\DontPrintSemicolon
+\KwIn{客户集合 $N_c^t$，取货量 $q_{it}$，车辆容量 $Q$，车辆上限 $K$，距离矩阵 $c$}
+\KwOut{最优路径成本 $\omega_t^*$（或判定不可行）}
+\BlankLine
+\textbf{预检查：}若 $\sum_{i \in N_c^t} q_{it} > KQ$ 或存在 $q_{it} > Q$，返回不可行\;
+\BlankLine
+\textbf{初始化：}以单客户路线作为初始列，创建根节点\;
+$\text{incumbent} \leftarrow +\infty$，将根节点入优先队列\;
+\BlankLine
+\While{队列非空}{
+  取出 LP 下界最小的节点 $\nu$\;
+  \If{$\nu$ 的 LP 下界 $\ge$ incumbent}{
+    剪枝，\textbf{continue}\;
+  }
+  \BlankLine
+  \textbf{(a) 列生成：}
+  \Repeat{定价子问题无负 reduced cost 列}{
+    求解 RMP 的 LP 松弛\;
+    提取对偶变量 $(w, u_0)$\;
+    先用 ng-route 松弛双向标号寻找负 reduced cost 列\;
+    若松弛未找到，用精确 ESPPRC 确认\;
+    将找到的新列加入 RMP\;
+  }
+  \BlankLine
+  \textbf{(b) 割平面分离：}
+  从 LP 解中分离被违反的舍入容量不等式\;
+  若找到新割，加入 RMP 并返回步骤 (a)\;
+  \BlankLine
+  \textbf{(c) 可行性检查：}
+  \If{LP 不可行（人工变量为正）}{
+    剪枝（不可行），\textbf{continue}\;
+  }
+  \BlankLine
+  \textbf{(d) 整数性检查：}
+  \If{LP 解为整数}{
+    更新 $\text{incumbent} \leftarrow \min\{\text{incumbent},\, \text{LP最优值}\}$\;
+    \textbf{continue}\;
+  }
+  \BlankLine
+  \textbf{(e) 分支：}
+  \If{车辆数 $\bar{m}$ 为分数}{
+    按车辆数分支，生成两个子节点入队\;
+  }
+  \Else{
+    选择分支弧（可用强分支），生成两个子节点入队\;
+  }
+}
+\Return $\text{incumbent}$（若为 $+\infty$ 则不可行）\;
+\end{algorithm}
+
+% ============================================================
+\subsection{与 LBBD 框架的接口}
+\label{sec:bpc_lbbd_interface}
+% ============================================================
+
+BPC 作为 LBBD 的子问题求解器，需要向主问题提供以下信息：
+
+\paragraph{(1) 最优路径成本 $\omega_t^*$。}
+若 $\text{CVRP}(t)$ 可行，$\omega_t^*$ 即为 BPC 返回的最优值；
+若不可行，$\omega_t^* = +\infty$。
+
+\paragraph{(2) 可行性判定。}
+当 $\text{CVRP}(t)$ 不可行时，LBBD 主问题需要添加可行性割
+（\texttt{lbbd.tex} 中的式 (3-14)/(3-15)/(3-16)），
+以排除当前不可行的 $(\bar z, \bar\lambda)$ 配置。
+
+\paragraph{(3) 对偶信息。}
+\texttt{lbbd.tex} 中的对偶最优性割（式 (3-18)）和初始割（\texttt{speed.tex} 中的 $T1$/$T2$ 割）
+需要 CVRP$(t)$ LP 松弛的对偶最优解 $(w^*, u_0^*)$。
+BPC 的列生成在收敛时（定价确认无负 reduced cost 列），
+RMP 的对偶变量即为完整主问题 LP 松弛的对偶最优解，
+满足 \texttt{lbbd.tex} 中式 \eqref{eq:dual_cvrp_t} 的所有对偶约束，
+可直接用于生成有效的对偶割。
+
+\begin{remark}[列生成收敛与对偶可行性]
+如 \texttt{lbbd.tex} 中所强调的，对偶解必须在列生成\textbf{完全收敛}后提取。
+若在列生成未收敛时提前提取对偶解，该解仅对已生成的受限列满足对偶约束，
+可能对未生成的路线违反约束，从而导致生成的割不安全（可能切掉最优解）。
+本文的实现中，列生成采用"松弛优先、精确兜底"的策略保证收敛时的对偶解全局可行。
+\end{remark}
+
+\end{document}
