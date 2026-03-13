@@ -9,7 +9,7 @@ import java.io.IOException;
 import java.util.Locale;
 
 public class Main {
-    private enum SolverMode { ALL, ORIGINAL, REFORM, LBBD }
+    private enum SolverMode { ALL, ORIGINAL, REFORM, LBBD_NO_INIT, LBBD }
     private static final double RESULT_TOL = CplexConfig.MIP_GAP;
 
     public static void main(String[] args) {
@@ -47,6 +47,7 @@ public class Main {
 
             SolveResult originalResult = null;
             SolveResult reformulationResult = null;
+            SolveResult lbbdNoInitResult = null;
             SolveResult lbbdResult = null;
 
             if (solverMode == SolverMode.ALL || solverMode == SolverMode.ORIGINAL) {
@@ -55,6 +56,10 @@ public class Main {
             if (solverMode == SolverMode.ALL || solverMode == SolverMode.REFORM) {
                 ReformulationModelSolver reformulationSolver = new ReformulationModelSolver();
                 reformulationResult = reformulationSolver.solve(ins);
+            }
+            if (solverMode == SolverMode.ALL || solverMode == SolverMode.LBBD_NO_INIT) {
+                LbbdReformulationSolver lbbdNoInitSolver = new LbbdReformulationSolver(ins, false);
+                lbbdNoInitResult = lbbdNoInitSolver.solve(Double.NaN, RESULT_TOL);
             }
             if (solverMode == SolverMode.ALL || solverMode == SolverMode.LBBD) {
                 LbbdReformulationSolver lbbdSolver = new LbbdReformulationSolver(ins);
@@ -69,11 +74,17 @@ public class Main {
             if (reformulationResult != null) {
                 System.out.println(reformulationResult.toSummaryLine());
             }
+            if (lbbdNoInitResult != null) {
+                System.out.println(lbbdNoInitResult.toSummaryLine());
+            }
             if (lbbdResult != null) {
                 System.out.println(lbbdResult.toSummaryLine());
             }
             if (originalResult != null && reformulationResult != null) {
                 printComparison(originalResult, reformulationResult);
+            }
+            if (reformulationResult != null && lbbdNoInitResult != null) {
+                printValidation("reform-vs-lbbd_no_init", reformulationResult, lbbdNoInitResult, CplexConfig.MIP_GAP);
             }
             if (reformulationResult != null && lbbdResult != null) {
                 printValidation("reform-vs-lbbd", reformulationResult, lbbdResult, CplexConfig.MIP_GAP);
@@ -96,6 +107,9 @@ public class Main {
         }
         if ("reform".equals(x) || "reformulation".equals(x)) {
             return SolverMode.REFORM;
+        }
+        if ("lbbd_no_init".equals(x) || "lbbd-no-init".equals(x) || "lbbd_noinit".equals(x)) {
+            return SolverMode.LBBD_NO_INIT;
         }
         if ("lbbd".equals(x)) {
             return SolverMode.LBBD;
