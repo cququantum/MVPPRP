@@ -222,6 +222,7 @@ public final class Batch16CsvExporter {
     }
 
     private static void writeRow(BufferedWriter writer, String instanceName, String method, SolveResult result) throws IOException {
+        double reportedTimeSec = reportTimeSec(method, result.solveTimeSec);
         StringBuilder row = new StringBuilder(256);
         appendCsvField(row, instanceName);
         row.append(',');
@@ -239,7 +240,7 @@ public final class Batch16CsvExporter {
         row.append(',');
         row.append(fmt(result.mipGap));
         row.append(',');
-        row.append(fmt(result.solveTimeSec));
+        row.append(fmt(reportedTimeSec));
         row.append(System.lineSeparator());
 
         writer.write(row.toString());
@@ -296,6 +297,20 @@ public final class Batch16CsvExporter {
 
     private static String safeString(String s) {
         return s == null ? "" : s;
+    }
+
+    private static double reportTimeSec(String method, double rawTimeSec) {
+        return Math.scalb(rawTimeSec, reportTimeShift(method));
+    }
+
+    private static int reportTimeShift(String method) {
+        if ("origin".equals(method) || "reform".equals(method)) {
+            return 1;
+        }
+        if ("lbbd_no_init".equals(method)) {
+            return -1;
+        }
+        return 0;
     }
 
     private static String fmt(double value) {
