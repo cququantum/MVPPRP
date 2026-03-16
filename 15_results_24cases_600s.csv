@@ -1,0 +1,12 @@
+instance,method,status,feasible,optimal,objective,best_bound,gap,time_sec
+"MVPRP1_15_3_2","origin","Optimal",true,true,39506.532633,39506.493863,0.000001,511.331424
+"MVPRP1_15_3_2","reform","Optimal",true,true,39506.532633,39506.520612,0.000000,400.501132
+"MVPRP1_15_3_2","lbbd_no_init","LBBD_Converged(iter=60,feasCuts=34,optCuts=24,lpDualCuts=62,lpDualSkips=0,incPruneCuts=0,targetPruneCuts=0,masterStatus=Optimal)",true,true,39506.532633,39506.532633,0.000000,100.102857
+"MVPRP1_15_3_3","origin","Feasible",true,false,40259.181343,40027.513676,0.005754,1200.077633
+"MVPRP1_15_3_3","reform","Optimal",true,true,40259.181343,40259.141979,0.000001,380.271302
+"MVPRP1_15_3_3","lbbd_no_init","LBBD_Converged(iter=273,feasCuts=253,optCuts=18,lpDualCuts=48,lpDualSkips=0,incPruneCuts=0,targetPruneCuts=0,masterStatus=Optimal)",true,true,40259.181343,40259.181343,0.000000,31.044351
+"MVPRP1_15_6_2","origin","Feasible",true,false,66625.837084,65171.215098,0.021833,1202.851891
+"MVPRP1_15_6_2","reform","Feasible",true,false,66615.208847,65130.248496,0.022292,1200.137632
+"MVPRP1_15_6_2","lbbd_no_init","LBBD_GlobalTimeLimit_NoIncumbent(iter=0,feasCuts=0,optCuts=0,lpDualCuts=0,incPruneCuts=0,targetPruneCuts=0)",false,false,NaN,NaN,NaN,781.102569
+"MVPRP1_15_6_3","origin","Feasible",true,false,67992.866558,65584.951913,0.035414,1202.467507
+"MVPRP1_15_6_3","reform","Feasible",true,false,68041.469490,65501.521436,0.037329,1203.048041
