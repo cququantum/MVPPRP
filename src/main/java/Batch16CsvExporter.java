@@ -33,32 +33,32 @@ public final class Batch16CsvExporter {
         }
     };
     private static final String[] INSTANCE_PATHS = new String[]{
-            "data/MVPRP/MVPRP1_20_3_2.txt",
-            "data/MVPRP/MVPRP1_20_3_3.txt",
-            "data/MVPRP/MVPRP1_20_6_2.txt",
-            "data/MVPRP/MVPRP1_20_6_3.txt",
-            "data/MVPRP/MVPRP1_20_9_2.txt",
-            "data/MVPRP/MVPRP1_20_9_3.txt",
-            "data/MVPRP/MVPRP2_20_3_2.txt",
-            "data/MVPRP/MVPRP2_20_3_3.txt",
-            "data/MVPRP/MVPRP2_20_6_2.txt",
-            "data/MVPRP/MVPRP2_20_6_3.txt",
-            "data/MVPRP/MVPRP2_20_9_2.txt",
-            "data/MVPRP/MVPRP2_20_9_3.txt",
-            "data/MVPRP/MVPRP3_20_3_2.txt",
-            "data/MVPRP/MVPRP3_20_3_3.txt",
-            "data/MVPRP/MVPRP3_20_6_2.txt",
-            "data/MVPRP/MVPRP3_20_6_3.txt",
-            "data/MVPRP/MVPRP3_20_9_2.txt",
-            "data/MVPRP/MVPRP3_20_9_3.txt",
-            "data/MVPRP/MVPRP4_20_3_2.txt",
-            "data/MVPRP/MVPRP4_20_3_3.txt",
-            "data/MVPRP/MVPRP4_20_6_2.txt",
-            "data/MVPRP/MVPRP4_20_6_3.txt",
-            "data/MVPRP/MVPRP4_20_9_2.txt",
-            "data/MVPRP/MVPRP4_20_9_3.txt"
+            "data/MVPRP/MVPRP1_15_3_2.txt",
+            "data/MVPRP/MVPRP1_15_3_3.txt",
+            "data/MVPRP/MVPRP1_15_6_2.txt",
+            "data/MVPRP/MVPRP1_15_6_3.txt",
+            "data/MVPRP/MVPRP1_15_9_2.txt",
+            "data/MVPRP/MVPRP1_15_9_3.txt",
+            "data/MVPRP/MVPRP2_15_3_2.txt",
+            "data/MVPRP/MVPRP2_15_3_3.txt",
+            "data/MVPRP/MVPRP2_15_6_2.txt",
+            "data/MVPRP/MVPRP2_15_6_3.txt",
+            "data/MVPRP/MVPRP2_15_9_2.txt",
+            "data/MVPRP/MVPRP2_15_9_3.txt",
+            "data/MVPRP/MVPRP3_15_3_2.txt",
+            "data/MVPRP/MVPRP3_15_3_3.txt",
+            "data/MVPRP/MVPRP3_15_6_2.txt",
+            "data/MVPRP/MVPRP3_15_6_3.txt",
+            "data/MVPRP/MVPRP3_15_9_2.txt",
+            "data/MVPRP/MVPRP3_15_9_3.txt",
+            "data/MVPRP/MVPRP4_15_3_2.txt",
+            "data/MVPRP/MVPRP4_15_3_3.txt",
+            "data/MVPRP/MVPRP4_15_6_2.txt",
+            "data/MVPRP/MVPRP4_15_6_3.txt",
+            "data/MVPRP/MVPRP4_15_9_2.txt",
+            "data/MVPRP/MVPRP4_15_9_3.txt"
     };
-    private static final Path OUTPUT_CSV = Paths.get("20_results_24cases_600s.csv");
+    private static final Path OUTPUT_CSV = Paths.get("15_results_24cases_600s.csv");
 
     private Batch16CsvExporter() {
     }
