@@ -48,7 +48,7 @@ public final class Batch16CsvExporter {
             "data/MVPRP/MVPRP2_15_6_3.txt",
             "data/MVPRP/MVPRP2_15_9_3.txt",
     };
-    private static final Path OUTPUT_CSV = Paths.get("large_results_cases_7200s.csv");
+    private static final Path OUTPUT_CSV = Paths.get("lbbd_results_cases_7200s.csv");
 
     private Batch16CsvExporter() {
     }
