@@ -2,8 +2,6 @@ import instance.Instance;
 import lbbdModel.LbbdReformulationSolver;
 import model.CplexConfig;
 import model.SolveResult;
-import originalModel.OriginalModelSolver;
-import reformulationModel.ReformulationModelSolver;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -23,7 +21,7 @@ import java.util.Set;
 
 public final class Batch16CsvExporter {
     private static final double RESULT_TOL = CplexConfig.MIP_GAP;
-    private static final int METHODS_PER_INSTANCE = 3;
+    private static final int METHODS_PER_INSTANCE = 1;
     private static final String CSV_HEADER =
             "instance,method,status,feasible,optimal,objective,best_bound,gap,time_sec";
     private static final OutputStream DEV_NULL = new OutputStream() {
@@ -34,21 +32,21 @@ public final class Batch16CsvExporter {
     };
     private static final String[] INSTANCE_PATHS = new String[]{
             "data/MVPRP/MVPRP1_15_6_2.txt",
-            "data/MVPRP/MVPRP1_15_6_3.txt",
-            "data/MVPRP/MVPRP1_15_9_2.txt",
-            "data/MVPRP/MVPRP1_15_9_3.txt",
             "data/MVPRP/MVPRP2_15_6_2.txt",
-            "data/MVPRP/MVPRP2_15_6_3.txt",
-            "data/MVPRP/MVPRP2_15_9_2.txt",
-            "data/MVPRP/MVPRP2_15_9_3.txt",
             "data/MVPRP/MVPRP3_15_6_2.txt",
-            "data/MVPRP/MVPRP3_15_6_3.txt",
-            "data/MVPRP/MVPRP3_15_9_2.txt",
-            "data/MVPRP/MVPRP3_15_9_3.txt",
             "data/MVPRP/MVPRP4_15_6_2.txt",
+            "data/MVPRP/MVPRP3_15_9_3.txt",
+            "data/MVPRP/MVPRP3_15_9_2.txt",
+            "data/MVPRP/MVPRP3_15_6_3.txt",
             "data/MVPRP/MVPRP4_15_6_3.txt",
-            "data/MVPRP/MVPRP4_15_9_2.txt",
+            "data/MVPRP/MVPRP1_15_9_2.txt",
             "data/MVPRP/MVPRP4_15_9_3.txt",
+            "data/MVPRP/MVPRP4_15_9_2.txt",
+            "data/MVPRP/MVPRP1_15_6_3.txt",
+            "data/MVPRP/MVPRP1_15_9_3.txt",
+            "data/MVPRP/MVPRP2_15_9_2.txt",
+            "data/MVPRP/MVPRP2_15_6_3.txt",
+            "data/MVPRP/MVPRP2_15_9_3.txt",
     };
     private static final Path OUTPUT_CSV = Paths.get("large_results_cases_7200s.csv");
 
@@ -58,6 +56,7 @@ public final class Batch16CsvExporter {
     public static void main(String[] args) throws Exception {
         Set<String> completedKeys = new HashSet<String>();
         ensureOutputFile(completedKeys);
+        Set<String> targetKeys = buildTargetKeys();
 
         try (BufferedWriter writer = Files.newBufferedWriter(
                 OUTPUT_CSV,
@@ -65,44 +64,12 @@ public final class Batch16CsvExporter {
                 StandardOpenOption.APPEND
         )) {
             int totalRows = INSTANCE_PATHS.length * METHODS_PER_INSTANCE;
-            int progress = completedKeys.size();
+            int progress = countCompletedTargets(completedKeys, targetKeys);
 
             for (int idx = 0; idx < INSTANCE_PATHS.length; idx++) {
                 String instancePath = INSTANCE_PATHS[idx];
                 String instanceName = instanceName(instancePath);
                 final Instance ins = loadInstance(instancePath);
-
-                progress = runAndWriteIfNeeded(
-                        writer,
-                        ins,
-                        instanceName,
-                        "origin",
-                        completedKeys,
-                        progress,
-                        totalRows,
-                        new SolveSupplier() {
-                            @Override
-                            public SolveResult get() {
-                                return new OriginalModelSolver().solve(ins);
-                            }
-                        }
-                );
-
-                progress = runAndWriteIfNeeded(
-                        writer,
-                        ins,
-                        instanceName,
-                        "reform",
-                        completedKeys,
-                        progress,
-                        totalRows,
-                        new SolveSupplier() {
-                            @Override
-                            public SolveResult get() {
-                                return new ReformulationModelSolver().solve(ins);
-                            }
-                        }
-                );
 
                 progress = runAndWriteIfNeeded(
                         writer,
@@ -122,6 +89,24 @@ public final class Batch16CsvExporter {
 
             }
         }
+    }
+
+    private static Set<String> buildTargetKeys() {
+        HashSet<String> targetKeys = new HashSet<String>();
+        for (int idx = 0; idx < INSTANCE_PATHS.length; idx++) {
+            targetKeys.add(buildKey(instanceName(INSTANCE_PATHS[idx]), "lbbd_no_init"));
+        }
+        return targetKeys;
+    }
+
+    private static int countCompletedTargets(Set<String> completedKeys, Set<String> targetKeys) {
+        int count = 0;
+        for (String key : targetKeys) {
+            if (completedKeys.contains(key)) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private static Instance loadInstance(String instancePath) throws IOException {
