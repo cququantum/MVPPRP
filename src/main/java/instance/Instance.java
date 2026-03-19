@@ -79,6 +79,19 @@ public final class Instance {
         public static Options defaults() { return new Options(); }
     }
 
+    public static final class Overrides {
+        public Integer K;
+        public Double Q;
+        public Double f;
+        public Double h0;
+        public Double hp;
+        public double[] hi;
+
+        public static Overrides defaults() {
+            return new Overrides();
+        }
+    }
+
     // -----------------------
     // Basic instance fields
     // -----------------------
@@ -114,6 +127,8 @@ public final class Instance {
     public final double hp;      // finished holding cost
     public final double Lp;      // finished capacity
     public final double bigM;    // Big-M
+    private final Options.DistanceMode distanceMode;
+    private final boolean autoSetDt;
 
     // s_{it}: pickup generation. index: i=1..n, t=1..l+1
     public final double[][] s;        // [n+1][l+2], ignore index 0
@@ -184,6 +199,8 @@ public final class Instance {
         this.hp = opt.hp;
         this.Lp = (opt.Lp > 0) ? opt.Lp : this.L0;
         this.bigM = (opt.bigM > 0) ? opt.bigM : this.Q;
+        this.distanceMode = opt.distanceMode;
+        this.autoSetDt = opt.autoSetDt;
 
         // Build s_{it} from demand, and s_{i,l+1}=0
         this.s = new double[n + 1][l + 2];
@@ -302,6 +319,49 @@ public final class Instance {
         return new Instance(p, opt);
     }
 
+    public Instance copyWithOverrides(Overrides overrides) {
+        if (overrides == null) {
+            return this;
+        }
+
+        Parsed parsed = new Parsed();
+        parsed.n = this.n;
+        parsed.l = this.l;
+        parsed.K = (overrides.K != null) ? overrides.K.intValue() : this.K;
+        parsed.Q = (overrides.Q != null) ? overrides.Q.doubleValue() : this.Q;
+        parsed.supplierX = this.x[0];
+        parsed.supplierY = this.y[0];
+        parsed.supplierInit = this.I00;
+        parsed.supplierMax = this.L0;
+        parsed.prodCap = this.C;
+        parsed.supplierHold = (overrides.h0 != null) ? overrides.h0.doubleValue() : this.h0;
+        parsed.varCost = this.u;
+        parsed.fixCost = (overrides.f != null) ? overrides.f.doubleValue() : this.f;
+
+        for (int i = 1; i <= this.n; i++) {
+            double deliveryInit = this.Li[i] - this.Ii0[i] - this.demand[i];
+            double holdCost = resolveHoldCostOverride(overrides.hi, i, this.hi[i]);
+            parsed.retailers.put(i, new Node(
+                    this.x[i],
+                    this.y[i],
+                    deliveryInit,
+                    this.Li[i],
+                    this.demand[i],
+                    holdCost
+            ));
+        }
+
+        Options opt = Options.defaults();
+        opt.k = this.k;
+        opt.P00 = this.P00;
+        opt.hp = (overrides.hp != null) ? overrides.hp.doubleValue() : this.hp;
+        opt.Lp = this.Lp;
+        opt.bigM = this.bigM;
+        opt.distanceMode = this.distanceMode;
+        opt.autoSetDt = this.autoSetDt;
+        return new Instance(parsed, opt);
+    }
+
     // -----------------------
     // Core model helper functions
     // -----------------------
@@ -369,6 +429,17 @@ public final class Instance {
     private static double mapDeliveryInitToPickupInit(double deliveryInit, double capacity, double periodDemand) {
         double mapped = capacity - deliveryInit - periodDemand;
         return Math.max(0.0, mapped);
+    }
+
+    private static double resolveHoldCostOverride(double[] hiOverride, int index, double fallback) {
+        if (hiOverride == null || index < 0 || index >= hiOverride.length) {
+            return fallback;
+        }
+        double value = hiOverride[index];
+        if (Double.isNaN(value)) {
+            return fallback;
+        }
+        return value;
     }
 
     // -----------------------
