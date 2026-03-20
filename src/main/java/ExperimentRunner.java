@@ -16,14 +16,16 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public final class ExperimentRunner {
-    private static final double DEFAULT_TIME_LIMIT_SEC = 600.0;
+    private static final double DEFAULT_TIME_LIMIT_SEC = 7200.0;
     private static final String[] ABLATION_INSTANCES = new String[]{
             "MVPRP1_10_6_3", "MVPRP2_10_6_3", "MVPRP3_10_6_3", "MVPRP4_10_6_3",
             "MVPRP1_10_9_2", "MVPRP2_10_9_2", "MVPRP3_10_9_2", "MVPRP4_10_9_2",
@@ -45,6 +47,16 @@ public final class ExperimentRunner {
     private static final Path SENSITIVITY_K_OUTPUT = Paths.get("sensitivity_K.csv");
     private static final Path SENSITIVITY_F_OUTPUT = Paths.get("sensitivity_f.csv");
     private static final Path SENSITIVITY_H_OUTPUT = Paths.get("sensitivity_h.csv");
+    private static final String ABLATION_HEADER =
+            "instance,variant,feasible,optimal,objective,best_bound,gap,time_sec,iterations,feasCuts,optCuts";
+    private static final String SENSITIVITY_Q_HEADER =
+            "instance,Q_ratio,Q_value,feasible,optimal,objective,time_sec,route_cost,inventory_cost,production_cost,avg_visit_frequency,avg_pickup_per_visit";
+    private static final String SENSITIVITY_K_HEADER =
+            "instance,K_value,feasible,optimal,objective,time_sec,route_cost,inventory_cost,production_cost,avg_visit_frequency,avg_pickup_per_visit";
+    private static final String SENSITIVITY_F_HEADER =
+            "instance,f_ratio,f_value,feasible,optimal,objective,time_sec,route_cost,inventory_cost,production_cost,num_production_periods,avg_production_batch,raw_inv_avg,finished_inv_avg";
+    private static final String SENSITIVITY_H_HEADER =
+            "instance,h_ratio,feasible,optimal,objective,time_sec,route_cost,inventory_cost,production_cost,supplier_inv_avg,raw_inv_avg,finished_inv_avg,avg_visit_frequency";
     private static final Path[] FULL_RESULT_SOURCES = new Path[]{
             Paths.get("10_results_24cases_600s.csv"),
             Paths.get("15_results_24cases_600s.csv"),
@@ -105,23 +117,28 @@ public final class ExperimentRunner {
                 new VariantSpec("+vi", new LbbdReformulationSolver.Config(false, true, true, false, options.timeLimitSec)),
         };
         HashMap<String, FullResultRow> fullResults = loadFullResults();
+        ExistingOutput existing = loadExistingOutput(ABLATION_OUTPUT, ABLATION_HEADER, new int[]{0, 1}, 3);
+        ensureOutputFile(ABLATION_OUTPUT, ABLATION_HEADER);
 
-        try (BufferedWriter writer = newWriter(ABLATION_OUTPUT)) {
-            writer.write("instance,variant,feasible,optimal,objective,best_bound,gap,time_sec,iterations,feasCuts,optCuts");
-            writer.write(System.lineSeparator());
-
-            int progress = 0;
-            int total = selectedInstances.length * (variants.length + 1);
+        int total = selectedInstances.length * (variants.length + 1);
+        int progress = countCompletedTargets(existing, buildAblationTargetKeys(selectedInstances, variants));
+        try (BufferedWriter writer = appendWriter(ABLATION_OUTPUT)) {
             for (int idx = 0; idx < selectedInstances.length; idx++) {
                 String instancePath = normalizeInstancePath(selectedInstances[idx]);
                 String instanceName = instanceName(instancePath);
-                Instance baseInstance = loadInstance(instancePath);
+                Instance baseInstance = null;
                 for (int v = 0; v < variants.length; v++) {
                     VariantSpec variant = variants[v];
-                    progress++;
-                    System.out.println("[" + progress + "/" + total + "] ablation " + instanceName + " " + variant.name);
+                    String key = buildKey(instanceName, variant.name);
+                    if (existing.rowsByKey.containsKey(key)) {
+                        System.out.println("[" + progress + "/" + total + "] skip: ablation " + instanceName + " " + variant.name);
+                        continue;
+                    }
+                    if (baseInstance == null) {
+                        baseInstance = loadInstance(instancePath);
+                    }
                     SolveWithDetails run = solveQuietly(baseInstance, variant.config);
-                    writeCsvRow(writer, new String[]{
+                    String[] row = new String[]{
                             instanceName,
                             variant.name,
                             fmtBoolean(run.summary.feasible),
@@ -133,16 +150,23 @@ public final class ExperimentRunner {
                             Integer.toString(run.iterations()),
                             Integer.toString(run.feasibilityCuts()),
                             Integer.toString(run.optimalityCuts()),
-                    });
+                    };
+                    writeCsvRow(writer, row);
+                    existing.rowsByKey.put(key, new ExistingRow(row, 3));
+                    progress++;
+                    System.out.println("[" + progress + "/" + total + "] ablation " + instanceName + " " + variant.name);
                 }
 
-                progress++;
+                String fullKey = buildKey(instanceName, "full");
+                if (existing.rowsByKey.containsKey(fullKey)) {
+                    System.out.println("[" + progress + "/" + total + "] skip: ablation " + instanceName + " full(imported)");
+                    continue;
+                }
                 FullResultRow full = fullResults.get(instanceName);
                 if (full == null) {
                     throw new IllegalStateException("Missing full=lbbd_no_init row for instance " + instanceName);
                 }
-                System.out.println("[" + progress + "/" + total + "] ablation " + instanceName + " full(imported)");
-                writeCsvRow(writer, new String[]{
+                String[] row = new String[]{
                         instanceName,
                         "full",
                         fmtBoolean(full.feasible),
@@ -154,220 +178,368 @@ public final class ExperimentRunner {
                         Integer.toString(full.iterations),
                         Integer.toString(full.feasibilityCuts),
                         Integer.toString(full.optimalityCuts),
-                });
+                };
+                writeCsvRow(writer, row);
+                existing.rowsByKey.put(fullKey, new ExistingRow(row, 3));
+                progress++;
+                System.out.println("[" + progress + "/" + total + "] ablation " + instanceName + " full(imported)");
             }
         }
     }
 
     private static void runSensitivityQ(CliOptions options) throws Exception {
-        FamilyRun family = evaluateSensitivityQ(primarySensitivityInstances(options), options.timeLimitSec);
-        if (!options.hasExplicitInstances() && !family.allOptimal) {
-            family = evaluateSensitivityQ(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec);
+        ExistingOutput existing = loadExistingOutput(SENSITIVITY_Q_OUTPUT, SENSITIVITY_Q_HEADER, new int[]{0, 1}, 4);
+        if (options.hasExplicitInstances()) {
+            evaluateSensitivityQ(primarySensitivityInstances(options), options.timeLimitSec, existing);
+            return;
         }
-        try (BufferedWriter writer = newWriter(SENSITIVITY_Q_OUTPUT)) {
-            writer.write("instance,Q_ratio,Q_value,feasible,optimal,objective,time_sec,route_cost,inventory_cost,production_cost,avg_visit_frequency,avg_pickup_per_visit");
-            writer.write(System.lineSeparator());
-            writeRows(writer, family.rows);
+
+        ExistingFamily family = detectSensitivityFamily(existing, SENSITIVITY_BASE_DEFAULT, SENSITIVITY_BASE_FALLBACK);
+        if (family == ExistingFamily.FALLBACK) {
+            validateExistingKeys(existing, buildSensitivityQTargetKeys(toInstancePaths(SENSITIVITY_BASE_FALLBACK)), SENSITIVITY_Q_OUTPUT);
+            evaluateSensitivityQ(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, existing);
+            return;
+        }
+
+        ArrayList<String> primaryKeys = buildSensitivityQTargetKeys(toInstancePaths(SENSITIVITY_BASE_DEFAULT));
+        if (family == ExistingFamily.PRIMARY) {
+            validateExistingKeys(existing, primaryKeys, SENSITIVITY_Q_OUTPUT);
+            if (containsNonOptimal(existing, primaryKeys)) {
+                resetOutputFile(SENSITIVITY_Q_OUTPUT, SENSITIVITY_Q_HEADER);
+                evaluateSensitivityQ(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, emptyExistingOutput());
+                return;
+            }
+        }
+
+        FamilyRun primary = evaluateSensitivityQ(toInstancePaths(SENSITIVITY_BASE_DEFAULT), options.timeLimitSec, existing);
+        if (!primary.allOptimal) {
+            resetOutputFile(SENSITIVITY_Q_OUTPUT, SENSITIVITY_Q_HEADER);
+            evaluateSensitivityQ(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, emptyExistingOutput());
         }
     }
 
     private static void runSensitivityK(CliOptions options) throws Exception {
-        FamilyRun family = evaluateSensitivityK(primarySensitivityInstances(options), options.timeLimitSec);
-        if (!options.hasExplicitInstances() && !family.allOptimal) {
-            family = evaluateSensitivityK(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec);
+        ExistingOutput existing = loadExistingOutput(SENSITIVITY_K_OUTPUT, SENSITIVITY_K_HEADER, new int[]{0, 1}, 3);
+        if (options.hasExplicitInstances()) {
+            evaluateSensitivityK(primarySensitivityInstances(options), options.timeLimitSec, existing);
+            return;
         }
-        try (BufferedWriter writer = newWriter(SENSITIVITY_K_OUTPUT)) {
-            writer.write("instance,K_value,feasible,optimal,objective,time_sec,route_cost,inventory_cost,production_cost,avg_visit_frequency,avg_pickup_per_visit");
-            writer.write(System.lineSeparator());
-            writeRows(writer, family.rows);
+
+        ExistingFamily family = detectSensitivityFamily(existing, SENSITIVITY_BASE_DEFAULT, SENSITIVITY_BASE_FALLBACK);
+        if (family == ExistingFamily.FALLBACK) {
+            validateExistingKeys(existing, buildSensitivityKTargetKeys(toInstancePaths(SENSITIVITY_BASE_FALLBACK)), SENSITIVITY_K_OUTPUT);
+            evaluateSensitivityK(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, existing);
+            return;
+        }
+
+        ArrayList<String> primaryKeys = buildSensitivityKTargetKeys(toInstancePaths(SENSITIVITY_BASE_DEFAULT));
+        if (family == ExistingFamily.PRIMARY) {
+            validateExistingKeys(existing, primaryKeys, SENSITIVITY_K_OUTPUT);
+            if (containsNonOptimal(existing, primaryKeys)) {
+                resetOutputFile(SENSITIVITY_K_OUTPUT, SENSITIVITY_K_HEADER);
+                evaluateSensitivityK(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, emptyExistingOutput());
+                return;
+            }
+        }
+
+        FamilyRun primary = evaluateSensitivityK(toInstancePaths(SENSITIVITY_BASE_DEFAULT), options.timeLimitSec, existing);
+        if (!primary.allOptimal) {
+            resetOutputFile(SENSITIVITY_K_OUTPUT, SENSITIVITY_K_HEADER);
+            evaluateSensitivityK(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, emptyExistingOutput());
         }
     }
 
     private static void runSensitivityF(CliOptions options) throws Exception {
-        FamilyRun family = evaluateSensitivityF(primarySensitivityInstances(options), options.timeLimitSec);
-        if (!options.hasExplicitInstances() && !family.allOptimal) {
-            family = evaluateSensitivityF(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec);
+        ExistingOutput existing = loadExistingOutput(SENSITIVITY_F_OUTPUT, SENSITIVITY_F_HEADER, new int[]{0, 1}, 4);
+        if (options.hasExplicitInstances()) {
+            evaluateSensitivityF(primarySensitivityInstances(options), options.timeLimitSec, existing);
+            return;
         }
-        try (BufferedWriter writer = newWriter(SENSITIVITY_F_OUTPUT)) {
-            writer.write("instance,f_ratio,f_value,feasible,optimal,objective,time_sec,route_cost,inventory_cost,production_cost,num_production_periods,avg_production_batch,raw_inv_avg,finished_inv_avg");
-            writer.write(System.lineSeparator());
-            writeRows(writer, family.rows);
+
+        ExistingFamily family = detectSensitivityFamily(existing, SENSITIVITY_BASE_DEFAULT, SENSITIVITY_BASE_FALLBACK);
+        if (family == ExistingFamily.FALLBACK) {
+            validateExistingKeys(existing, buildSensitivityFTargetKeys(toInstancePaths(SENSITIVITY_BASE_FALLBACK)), SENSITIVITY_F_OUTPUT);
+            evaluateSensitivityF(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, existing);
+            return;
+        }
+
+        ArrayList<String> primaryKeys = buildSensitivityFTargetKeys(toInstancePaths(SENSITIVITY_BASE_DEFAULT));
+        if (family == ExistingFamily.PRIMARY) {
+            validateExistingKeys(existing, primaryKeys, SENSITIVITY_F_OUTPUT);
+            if (containsNonOptimal(existing, primaryKeys)) {
+                resetOutputFile(SENSITIVITY_F_OUTPUT, SENSITIVITY_F_HEADER);
+                evaluateSensitivityF(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, emptyExistingOutput());
+                return;
+            }
+        }
+
+        FamilyRun primary = evaluateSensitivityF(toInstancePaths(SENSITIVITY_BASE_DEFAULT), options.timeLimitSec, existing);
+        if (!primary.allOptimal) {
+            resetOutputFile(SENSITIVITY_F_OUTPUT, SENSITIVITY_F_HEADER);
+            evaluateSensitivityF(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, emptyExistingOutput());
         }
     }
 
     private static void runSensitivityH(CliOptions options) throws Exception {
-        FamilyRun family = evaluateSensitivityH(primarySensitivityInstances(options), options.timeLimitSec);
-        if (!options.hasExplicitInstances() && !family.allOptimal) {
-            family = evaluateSensitivityH(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec);
+        ExistingOutput existing = loadExistingOutput(SENSITIVITY_H_OUTPUT, SENSITIVITY_H_HEADER, new int[]{0, 1}, 3);
+        if (options.hasExplicitInstances()) {
+            evaluateSensitivityH(primarySensitivityInstances(options), options.timeLimitSec, existing);
+            return;
         }
-        try (BufferedWriter writer = newWriter(SENSITIVITY_H_OUTPUT)) {
-            writer.write("instance,h_ratio,feasible,optimal,objective,time_sec,route_cost,inventory_cost,production_cost,supplier_inv_avg,raw_inv_avg,finished_inv_avg,avg_visit_frequency");
-            writer.write(System.lineSeparator());
-            writeRows(writer, family.rows);
+
+        ExistingFamily family = detectSensitivityFamily(existing, SENSITIVITY_BASE_DEFAULT, SENSITIVITY_BASE_FALLBACK);
+        if (family == ExistingFamily.FALLBACK) {
+            validateExistingKeys(existing, buildSensitivityHTargetKeys(toInstancePaths(SENSITIVITY_BASE_FALLBACK)), SENSITIVITY_H_OUTPUT);
+            evaluateSensitivityH(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, existing);
+            return;
+        }
+
+        ArrayList<String> primaryKeys = buildSensitivityHTargetKeys(toInstancePaths(SENSITIVITY_BASE_DEFAULT));
+        if (family == ExistingFamily.PRIMARY) {
+            validateExistingKeys(existing, primaryKeys, SENSITIVITY_H_OUTPUT);
+            if (containsNonOptimal(existing, primaryKeys)) {
+                resetOutputFile(SENSITIVITY_H_OUTPUT, SENSITIVITY_H_HEADER);
+                evaluateSensitivityH(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, emptyExistingOutput());
+                return;
+            }
+        }
+
+        FamilyRun primary = evaluateSensitivityH(toInstancePaths(SENSITIVITY_BASE_DEFAULT), options.timeLimitSec, existing);
+        if (!primary.allOptimal) {
+            resetOutputFile(SENSITIVITY_H_OUTPUT, SENSITIVITY_H_HEADER);
+            evaluateSensitivityH(toInstancePaths(SENSITIVITY_BASE_FALLBACK), options.timeLimitSec, emptyExistingOutput());
         }
     }
 
-    private static FamilyRun evaluateSensitivityQ(String[] instancePaths, double timeLimitSec) throws Exception {
+    private static FamilyRun evaluateSensitivityQ(String[] instancePaths, double timeLimitSec, ExistingOutput existing) throws Exception {
         ArrayList<String[]> rows = new ArrayList<String[]>();
         boolean allOptimal = true;
         LbbdReformulationSolver.Config config = fullRunConfig(timeLimitSec);
         int total = instancePaths.length * Q_RATIOS.length;
-        int progress = 0;
+        int progress = countCompletedTargets(existing, buildSensitivityQTargetKeys(instancePaths));
 
-        for (int idx = 0; idx < instancePaths.length; idx++) {
-            String instancePath = normalizeInstancePath(instancePaths[idx]);
-            Instance base = loadInstance(instancePath);
-            String name = instanceName(instancePath);
-            for (int qIdx = 0; qIdx < Q_RATIOS.length; qIdx++) {
-                double ratio = Q_RATIOS[qIdx];
-                int qValue = (int) Math.floor(base.Q * ratio);
-                Instance.Overrides overrides = Instance.Overrides.defaults();
-                overrides.Q = (double) qValue;
-                Instance scenario = base.copyWithOverrides(overrides);
-                progress++;
-                System.out.println("[" + progress + "/" + total + "] sensitivity_Q " + name + " Q=" + qValue);
-                SolveWithDetails run = solveQuietly(scenario, config);
-                Metrics metrics = Metrics.from(scenario, run.details);
-                rows.add(new String[]{
-                        name,
-                        fmtRatio(ratio),
-                        Integer.toString(qValue),
-                        fmtBoolean(run.summary.feasible),
-                        fmtBoolean(run.summary.optimal),
-                        fmt(run.summary.objective),
-                        fmt(run.summary.solveTimeSec),
-                        fmt(metrics.routeCost),
-                        fmt(metrics.inventoryCost),
-                        fmt(metrics.productionCost),
-                        fmt(metrics.avgVisitFrequency),
-                        fmt(metrics.avgPickupPerVisit),
-                });
-                allOptimal &= run.summary.optimal;
+        ensureOutputFile(SENSITIVITY_Q_OUTPUT, SENSITIVITY_Q_HEADER);
+        try (BufferedWriter writer = appendWriter(SENSITIVITY_Q_OUTPUT)) {
+            for (int idx = 0; idx < instancePaths.length; idx++) {
+                String instancePath = normalizeInstancePath(instancePaths[idx]);
+                Instance base = null;
+                String name = instanceName(instancePath);
+                for (int qIdx = 0; qIdx < Q_RATIOS.length; qIdx++) {
+                    double ratio = Q_RATIOS[qIdx];
+                    String key = buildKey(name, fmtRatio(ratio));
+                    ExistingRow existingRow = existing.rowsByKey.get(key);
+                    if (existingRow != null) {
+                        rows.add(existingRow.values);
+                        allOptimal &= existingRow.optimal;
+                        System.out.println("[" + progress + "/" + total + "] skip: sensitivity_Q " + name + " ratio=" + fmtRatio(ratio));
+                        continue;
+                    }
+                    if (base == null) {
+                        base = loadInstance(instancePath);
+                    }
+                    int qValue = (int) Math.floor(base.Q * ratio);
+                    Instance.Overrides overrides = Instance.Overrides.defaults();
+                    overrides.Q = (double) qValue;
+                    Instance scenario = base.copyWithOverrides(overrides);
+                    SolveWithDetails run = solveQuietly(scenario, config);
+                    Metrics metrics = Metrics.from(scenario, run.details);
+                    String[] row = new String[]{
+                            name,
+                            fmtRatio(ratio),
+                            Integer.toString(qValue),
+                            fmtBoolean(run.summary.feasible),
+                            fmtBoolean(run.summary.optimal),
+                            fmt(run.summary.objective),
+                            fmt(run.summary.solveTimeSec),
+                            fmt(metrics.routeCost),
+                            fmt(metrics.inventoryCost),
+                            fmt(metrics.productionCost),
+                            fmt(metrics.avgVisitFrequency),
+                            fmt(metrics.avgPickupPerVisit),
+                    };
+                    writeCsvRow(writer, row);
+                    existing.rowsByKey.put(key, new ExistingRow(row, 4));
+                    rows.add(row);
+                    allOptimal &= run.summary.optimal;
+                    progress++;
+                    System.out.println("[" + progress + "/" + total + "] sensitivity_Q " + name + " Q=" + qValue);
+                }
             }
         }
         return new FamilyRun(rows, allOptimal);
     }
 
-    private static FamilyRun evaluateSensitivityK(String[] instancePaths, double timeLimitSec) throws Exception {
+    private static FamilyRun evaluateSensitivityK(String[] instancePaths, double timeLimitSec, ExistingOutput existing) throws Exception {
         ArrayList<String[]> rows = new ArrayList<String[]>();
         boolean allOptimal = true;
         LbbdReformulationSolver.Config config = fullRunConfig(timeLimitSec);
         int total = instancePaths.length * K_VALUES.length;
-        int progress = 0;
+        int progress = countCompletedTargets(existing, buildSensitivityKTargetKeys(instancePaths));
 
-        for (int idx = 0; idx < instancePaths.length; idx++) {
-            String instancePath = normalizeInstancePath(instancePaths[idx]);
-            Instance base = loadInstance(instancePath);
-            String name = instanceName(instancePath);
-            for (int kIdx = 0; kIdx < K_VALUES.length; kIdx++) {
-                int kValue = K_VALUES[kIdx];
-                Instance.Overrides overrides = Instance.Overrides.defaults();
-                overrides.K = Integer.valueOf(kValue);
-                Instance scenario = base.copyWithOverrides(overrides);
-                progress++;
-                System.out.println("[" + progress + "/" + total + "] sensitivity_K " + name + " K=" + kValue);
-                SolveWithDetails run = solveQuietly(scenario, config);
-                Metrics metrics = Metrics.from(scenario, run.details);
-                rows.add(new String[]{
-                        name,
-                        Integer.toString(kValue),
-                        fmtBoolean(run.summary.feasible),
-                        fmtBoolean(run.summary.optimal),
-                        fmt(run.summary.objective),
-                        fmt(run.summary.solveTimeSec),
-                        fmt(metrics.routeCost),
-                        fmt(metrics.inventoryCost),
-                        fmt(metrics.productionCost),
-                        fmt(metrics.avgVisitFrequency),
-                        fmt(metrics.avgPickupPerVisit),
-                });
-                allOptimal &= run.summary.optimal;
+        ensureOutputFile(SENSITIVITY_K_OUTPUT, SENSITIVITY_K_HEADER);
+        try (BufferedWriter writer = appendWriter(SENSITIVITY_K_OUTPUT)) {
+            for (int idx = 0; idx < instancePaths.length; idx++) {
+                String instancePath = normalizeInstancePath(instancePaths[idx]);
+                Instance base = null;
+                String name = instanceName(instancePath);
+                for (int kIdx = 0; kIdx < K_VALUES.length; kIdx++) {
+                    int kValue = K_VALUES[kIdx];
+                    String key = buildKey(name, Integer.toString(kValue));
+                    ExistingRow existingRow = existing.rowsByKey.get(key);
+                    if (existingRow != null) {
+                        rows.add(existingRow.values);
+                        allOptimal &= existingRow.optimal;
+                        System.out.println("[" + progress + "/" + total + "] skip: sensitivity_K " + name + " K=" + kValue);
+                        continue;
+                    }
+                    if (base == null) {
+                        base = loadInstance(instancePath);
+                    }
+                    Instance.Overrides overrides = Instance.Overrides.defaults();
+                    overrides.K = Integer.valueOf(kValue);
+                    Instance scenario = base.copyWithOverrides(overrides);
+                    SolveWithDetails run = solveQuietly(scenario, config);
+                    Metrics metrics = Metrics.from(scenario, run.details);
+                    String[] row = new String[]{
+                            name,
+                            Integer.toString(kValue),
+                            fmtBoolean(run.summary.feasible),
+                            fmtBoolean(run.summary.optimal),
+                            fmt(run.summary.objective),
+                            fmt(run.summary.solveTimeSec),
+                            fmt(metrics.routeCost),
+                            fmt(metrics.inventoryCost),
+                            fmt(metrics.productionCost),
+                            fmt(metrics.avgVisitFrequency),
+                            fmt(metrics.avgPickupPerVisit),
+                    };
+                    writeCsvRow(writer, row);
+                    existing.rowsByKey.put(key, new ExistingRow(row, 3));
+                    rows.add(row);
+                    allOptimal &= run.summary.optimal;
+                    progress++;
+                    System.out.println("[" + progress + "/" + total + "] sensitivity_K " + name + " K=" + kValue);
+                }
             }
         }
         return new FamilyRun(rows, allOptimal);
     }
 
-    private static FamilyRun evaluateSensitivityF(String[] instancePaths, double timeLimitSec) throws Exception {
+    private static FamilyRun evaluateSensitivityF(String[] instancePaths, double timeLimitSec, ExistingOutput existing) throws Exception {
         ArrayList<String[]> rows = new ArrayList<String[]>();
         boolean allOptimal = true;
         LbbdReformulationSolver.Config config = fullRunConfig(timeLimitSec);
         int total = instancePaths.length * F_RATIOS.length;
-        int progress = 0;
+        int progress = countCompletedTargets(existing, buildSensitivityFTargetKeys(instancePaths));
 
-        for (int idx = 0; idx < instancePaths.length; idx++) {
-            String instancePath = normalizeInstancePath(instancePaths[idx]);
-            Instance base = loadInstance(instancePath);
-            String name = instanceName(instancePath);
-            for (int fIdx = 0; fIdx < F_RATIOS.length; fIdx++) {
-                double ratio = F_RATIOS[fIdx];
-                double fValue = base.f * ratio;
-                Instance.Overrides overrides = Instance.Overrides.defaults();
-                overrides.f = Double.valueOf(fValue);
-                Instance scenario = base.copyWithOverrides(overrides);
-                progress++;
-                System.out.println("[" + progress + "/" + total + "] sensitivity_f " + name + " f=" + fmt(fValue));
-                SolveWithDetails run = solveQuietly(scenario, config);
-                Metrics metrics = Metrics.from(scenario, run.details);
-                rows.add(new String[]{
-                        name,
-                        fmtRatio(ratio),
-                        fmt(fValue),
-                        fmtBoolean(run.summary.feasible),
-                        fmtBoolean(run.summary.optimal),
-                        fmt(run.summary.objective),
-                        fmt(run.summary.solveTimeSec),
-                        fmt(metrics.routeCost),
-                        fmt(metrics.inventoryCost),
-                        fmt(metrics.productionCost),
-                        Integer.toString(metrics.numProductionPeriods),
-                        fmt(metrics.avgProductionBatch),
-                        fmt(metrics.rawInventoryAvg),
-                        fmt(metrics.finishedInventoryAvg),
-                });
-                allOptimal &= run.summary.optimal;
+        ensureOutputFile(SENSITIVITY_F_OUTPUT, SENSITIVITY_F_HEADER);
+        try (BufferedWriter writer = appendWriter(SENSITIVITY_F_OUTPUT)) {
+            for (int idx = 0; idx < instancePaths.length; idx++) {
+                String instancePath = normalizeInstancePath(instancePaths[idx]);
+                Instance base = null;
+                String name = instanceName(instancePath);
+                for (int fIdx = 0; fIdx < F_RATIOS.length; fIdx++) {
+                    double ratio = F_RATIOS[fIdx];
+                    String key = buildKey(name, fmtRatio(ratio));
+                    ExistingRow existingRow = existing.rowsByKey.get(key);
+                    if (existingRow != null) {
+                        rows.add(existingRow.values);
+                        allOptimal &= existingRow.optimal;
+                        System.out.println("[" + progress + "/" + total + "] skip: sensitivity_f " + name + " ratio=" + fmtRatio(ratio));
+                        continue;
+                    }
+                    if (base == null) {
+                        base = loadInstance(instancePath);
+                    }
+                    double fValue = base.f * ratio;
+                    Instance.Overrides overrides = Instance.Overrides.defaults();
+                    overrides.f = Double.valueOf(fValue);
+                    Instance scenario = base.copyWithOverrides(overrides);
+                    SolveWithDetails run = solveQuietly(scenario, config);
+                    Metrics metrics = Metrics.from(scenario, run.details);
+                    String[] row = new String[]{
+                            name,
+                            fmtRatio(ratio),
+                            fmt(fValue),
+                            fmtBoolean(run.summary.feasible),
+                            fmtBoolean(run.summary.optimal),
+                            fmt(run.summary.objective),
+                            fmt(run.summary.solveTimeSec),
+                            fmt(metrics.routeCost),
+                            fmt(metrics.inventoryCost),
+                            fmt(metrics.productionCost),
+                            Integer.toString(metrics.numProductionPeriods),
+                            fmt(metrics.avgProductionBatch),
+                            fmt(metrics.rawInventoryAvg),
+                            fmt(metrics.finishedInventoryAvg),
+                    };
+                    writeCsvRow(writer, row);
+                    existing.rowsByKey.put(key, new ExistingRow(row, 4));
+                    rows.add(row);
+                    allOptimal &= run.summary.optimal;
+                    progress++;
+                    System.out.println("[" + progress + "/" + total + "] sensitivity_f " + name + " f=" + fmt(fValue));
+                }
             }
         }
         return new FamilyRun(rows, allOptimal);
     }
 
-    private static FamilyRun evaluateSensitivityH(String[] instancePaths, double timeLimitSec) throws Exception {
+    private static FamilyRun evaluateSensitivityH(String[] instancePaths, double timeLimitSec, ExistingOutput existing) throws Exception {
         ArrayList<String[]> rows = new ArrayList<String[]>();
         boolean allOptimal = true;
         LbbdReformulationSolver.Config config = fullRunConfig(timeLimitSec);
         int total = instancePaths.length * H_RATIOS.length;
-        int progress = 0;
+        int progress = countCompletedTargets(existing, buildSensitivityHTargetKeys(instancePaths));
 
-        for (int idx = 0; idx < instancePaths.length; idx++) {
-            String instancePath = normalizeInstancePath(instancePaths[idx]);
-            Instance base = loadInstance(instancePath);
-            String name = instanceName(instancePath);
-            for (int hIdx = 0; hIdx < H_RATIOS.length; hIdx++) {
-                double ratio = H_RATIOS[hIdx];
-                Instance.Overrides overrides = Instance.Overrides.defaults();
-                overrides.h0 = Double.valueOf(base.h0 * ratio);
-                overrides.hp = Double.valueOf(base.hp * ratio);
-                overrides.hi = scaleSupplierHoldCosts(base, ratio);
-                Instance scenario = base.copyWithOverrides(overrides);
-                progress++;
-                System.out.println("[" + progress + "/" + total + "] sensitivity_h " + name + " h-ratio=" + fmtRatio(ratio));
-                SolveWithDetails run = solveQuietly(scenario, config);
-                Metrics metrics = Metrics.from(scenario, run.details);
-                rows.add(new String[]{
-                        name,
-                        fmtRatio(ratio),
-                        fmtBoolean(run.summary.feasible),
-                        fmtBoolean(run.summary.optimal),
-                        fmt(run.summary.objective),
-                        fmt(run.summary.solveTimeSec),
-                        fmt(metrics.routeCost),
-                        fmt(metrics.inventoryCost),
-                        fmt(metrics.productionCost),
-                        fmt(metrics.supplierInventoryAvg),
-                        fmt(metrics.rawInventoryAvg),
-                        fmt(metrics.finishedInventoryAvg),
-                        fmt(metrics.avgVisitFrequency),
-                });
-                allOptimal &= run.summary.optimal;
+        ensureOutputFile(SENSITIVITY_H_OUTPUT, SENSITIVITY_H_HEADER);
+        try (BufferedWriter writer = appendWriter(SENSITIVITY_H_OUTPUT)) {
+            for (int idx = 0; idx < instancePaths.length; idx++) {
+                String instancePath = normalizeInstancePath(instancePaths[idx]);
+                Instance base = null;
+                String name = instanceName(instancePath);
+                for (int hIdx = 0; hIdx < H_RATIOS.length; hIdx++) {
+                    double ratio = H_RATIOS[hIdx];
+                    String key = buildKey(name, fmtRatio(ratio));
+                    ExistingRow existingRow = existing.rowsByKey.get(key);
+                    if (existingRow != null) {
+                        rows.add(existingRow.values);
+                        allOptimal &= existingRow.optimal;
+                        System.out.println("[" + progress + "/" + total + "] skip: sensitivity_h " + name + " ratio=" + fmtRatio(ratio));
+                        continue;
+                    }
+                    if (base == null) {
+                        base = loadInstance(instancePath);
+                    }
+                    Instance.Overrides overrides = Instance.Overrides.defaults();
+                    overrides.h0 = Double.valueOf(base.h0 * ratio);
+                    overrides.hp = Double.valueOf(base.hp * ratio);
+                    overrides.hi = scaleSupplierHoldCosts(base, ratio);
+                    Instance scenario = base.copyWithOverrides(overrides);
+                    SolveWithDetails run = solveQuietly(scenario, config);
+                    Metrics metrics = Metrics.from(scenario, run.details);
+                    String[] row = new String[]{
+                            name,
+                            fmtRatio(ratio),
+                            fmtBoolean(run.summary.feasible),
+                            fmtBoolean(run.summary.optimal),
+                            fmt(run.summary.objective),
+                            fmt(run.summary.solveTimeSec),
+                            fmt(metrics.routeCost),
+                            fmt(metrics.inventoryCost),
+                            fmt(metrics.productionCost),
+                            fmt(metrics.supplierInventoryAvg),
+                            fmt(metrics.rawInventoryAvg),
+                            fmt(metrics.finishedInventoryAvg),
+                            fmt(metrics.avgVisitFrequency),
+                    };
+                    writeCsvRow(writer, row);
+                    existing.rowsByKey.put(key, new ExistingRow(row, 3));
+                    rows.add(row);
+                    allOptimal &= run.summary.optimal;
+                    progress++;
+                    System.out.println("[" + progress + "/" + total + "] sensitivity_h " + name + " h-ratio=" + fmtRatio(ratio));
+                }
             }
         }
         return new FamilyRun(rows, allOptimal);
@@ -465,6 +637,77 @@ public final class ExperimentRunner {
         return new LbbdReformulationSolver.Config(false, true, true, true, timeLimitSec);
     }
 
+    private static ExistingOutput emptyExistingOutput() {
+        return new ExistingOutput();
+    }
+
+    private static ExistingOutput loadExistingOutput(Path path, String expectedHeader, int[] keyColumns, int optimalColumn) throws IOException {
+        ExistingOutput output = new ExistingOutput();
+        if (!Files.exists(path)) {
+            return output;
+        }
+        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            String header = reader.readLine();
+            if (header == null || header.trim().isEmpty()) {
+                return output;
+            }
+            if (!expectedHeader.equals(header)) {
+                throw new IllegalStateException("Unexpected CSV header in " + path + ": " + header);
+            }
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+                List<String> fields = parseCsvLine(line);
+                String[] values = fields.toArray(new String[0]);
+                output.rowsByKey.put(buildKey(values, keyColumns), new ExistingRow(values, optimalColumn));
+            }
+        }
+        return output;
+    }
+
+    private static void ensureOutputFile(Path path, String header) throws IOException {
+        if (!Files.exists(path) || Files.size(path) == 0L) {
+            resetOutputFile(path, header);
+            return;
+        }
+        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            String actualHeader = reader.readLine();
+            if (actualHeader == null || actualHeader.trim().isEmpty()) {
+                resetOutputFile(path, header);
+                return;
+            }
+            if (!header.equals(actualHeader)) {
+                throw new IllegalStateException("Unexpected CSV header in " + path + ": " + actualHeader);
+            }
+        }
+    }
+
+    private static void resetOutputFile(Path path, String header) throws IOException {
+        try (BufferedWriter writer = Files.newBufferedWriter(
+                path,
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE
+        )) {
+            writer.write(header);
+            writer.write(System.lineSeparator());
+            writer.flush();
+        }
+    }
+
+    private static BufferedWriter appendWriter(Path path) throws IOException {
+        return Files.newBufferedWriter(
+                path,
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND,
+                StandardOpenOption.WRITE
+        );
+    }
+
     private static Instance loadInstance(String instancePath) throws IOException {
         Instance.Options options = Instance.Options.defaults();
         options.distanceMode = Instance.Options.DistanceMode.EUCLIDEAN_FLOAT;
@@ -499,20 +742,152 @@ public final class ExperimentRunner {
         return fileName;
     }
 
-    private static BufferedWriter newWriter(Path path) throws IOException {
-        return Files.newBufferedWriter(
-                path,
-                StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.TRUNCATE_EXISTING,
-                StandardOpenOption.WRITE
-        );
+    private static ArrayList<String> buildAblationTargetKeys(String[] instancePaths, VariantSpec[] variants) {
+        ArrayList<String> keys = new ArrayList<String>();
+        for (int idx = 0; idx < instancePaths.length; idx++) {
+            String name = instanceName(normalizeInstancePath(instancePaths[idx]));
+            for (int v = 0; v < variants.length; v++) {
+                keys.add(buildKey(name, variants[v].name));
+            }
+            keys.add(buildKey(name, "full"));
+        }
+        return keys;
     }
 
-    private static void writeRows(BufferedWriter writer, ArrayList<String[]> rows) throws IOException {
-        for (int i = 0; i < rows.size(); i++) {
-            writeCsvRow(writer, rows.get(i));
+    private static ArrayList<String> buildSensitivityQTargetKeys(String[] instancePaths) {
+        ArrayList<String> keys = new ArrayList<String>();
+        for (int idx = 0; idx < instancePaths.length; idx++) {
+            String name = instanceName(normalizeInstancePath(instancePaths[idx]));
+            for (int qIdx = 0; qIdx < Q_RATIOS.length; qIdx++) {
+                keys.add(buildKey(name, fmtRatio(Q_RATIOS[qIdx])));
+            }
         }
+        return keys;
+    }
+
+    private static ArrayList<String> buildSensitivityKTargetKeys(String[] instancePaths) {
+        ArrayList<String> keys = new ArrayList<String>();
+        for (int idx = 0; idx < instancePaths.length; idx++) {
+            String name = instanceName(normalizeInstancePath(instancePaths[idx]));
+            for (int kIdx = 0; kIdx < K_VALUES.length; kIdx++) {
+                keys.add(buildKey(name, Integer.toString(K_VALUES[kIdx])));
+            }
+        }
+        return keys;
+    }
+
+    private static ArrayList<String> buildSensitivityFTargetKeys(String[] instancePaths) {
+        ArrayList<String> keys = new ArrayList<String>();
+        for (int idx = 0; idx < instancePaths.length; idx++) {
+            String name = instanceName(normalizeInstancePath(instancePaths[idx]));
+            for (int fIdx = 0; fIdx < F_RATIOS.length; fIdx++) {
+                keys.add(buildKey(name, fmtRatio(F_RATIOS[fIdx])));
+            }
+        }
+        return keys;
+    }
+
+    private static ArrayList<String> buildSensitivityHTargetKeys(String[] instancePaths) {
+        ArrayList<String> keys = new ArrayList<String>();
+        for (int idx = 0; idx < instancePaths.length; idx++) {
+            String name = instanceName(normalizeInstancePath(instancePaths[idx]));
+            for (int hIdx = 0; hIdx < H_RATIOS.length; hIdx++) {
+                keys.add(buildKey(name, fmtRatio(H_RATIOS[hIdx])));
+            }
+        }
+        return keys;
+    }
+
+    private static int countCompletedTargets(ExistingOutput existing, List<String> targetKeys) {
+        int count = 0;
+        for (int i = 0; i < targetKeys.size(); i++) {
+            if (existing.rowsByKey.containsKey(targetKeys.get(i))) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static boolean containsNonOptimal(ExistingOutput existing, List<String> targetKeys) {
+        for (int i = 0; i < targetKeys.size(); i++) {
+            ExistingRow row = existing.rowsByKey.get(targetKeys.get(i));
+            if (row != null && !row.optimal) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void validateExistingKeys(ExistingOutput existing, List<String> targetKeys, Path outputPath) {
+        HashSet<String> allowed = new HashSet<String>(targetKeys);
+        for (String key : existing.rowsByKey.keySet()) {
+            if (!allowed.contains(key)) {
+                throw new IllegalStateException("Unexpected existing row in " + outputPath + ": " + key);
+            }
+        }
+    }
+
+    private static ExistingFamily detectSensitivityFamily(
+            ExistingOutput existing,
+            String[] primaryInstances,
+            String[] fallbackInstances
+    ) {
+        Set<String> primary = toNameSet(primaryInstances);
+        Set<String> fallback = toNameSet(fallbackInstances);
+        boolean sawPrimary = false;
+        boolean sawFallback = false;
+
+        for (ExistingRow row : existing.rowsByKey.values()) {
+            String instance = row.values.length == 0 ? "" : row.values[0];
+            if (primary.contains(instance)) {
+                sawPrimary = true;
+            } else if (fallback.contains(instance)) {
+                sawFallback = true;
+            } else {
+                throw new IllegalStateException("Unexpected instance in sensitivity output: " + instance);
+            }
+        }
+        if (sawPrimary && sawFallback) {
+            throw new IllegalStateException("Mixed primary/fallback rows in sensitivity output");
+        }
+        if (sawFallback) {
+            return ExistingFamily.FALLBACK;
+        }
+        if (sawPrimary) {
+            return ExistingFamily.PRIMARY;
+        }
+        return ExistingFamily.NONE;
+    }
+
+    private static Set<String> toNameSet(String[] instanceNames) {
+        HashSet<String> names = new HashSet<String>();
+        for (int i = 0; i < instanceNames.length; i++) {
+            names.add(instanceName(normalizeInstancePath(instanceNames[i])));
+        }
+        return names;
+    }
+
+    private static String buildKey(String... parts) {
+        StringBuilder key = new StringBuilder();
+        for (int i = 0; i < parts.length; i++) {
+            if (i > 0) {
+                key.append('\u0001');
+            }
+            key.append(parts[i] == null ? "" : parts[i]);
+        }
+        return key.toString();
+    }
+
+    private static String buildKey(String[] values, int[] indices) {
+        String[] parts = new String[indices.length];
+        for (int i = 0; i < indices.length; i++) {
+            int index = indices[i];
+            if (index < 0 || index >= values.length) {
+                throw new IllegalStateException("Missing key column at index " + index);
+            }
+            parts[i] = values[index];
+        }
+        return buildKey(parts);
     }
 
     private static void writeCsvRow(BufferedWriter writer, String[] values) throws IOException {
@@ -687,6 +1062,28 @@ public final class ExperimentRunner {
             this.rows = rows;
             this.allOptimal = allOptimal;
         }
+    }
+
+    private static final class ExistingOutput {
+        final HashMap<String, ExistingRow> rowsByKey = new HashMap<String, ExistingRow>();
+    }
+
+    private static final class ExistingRow {
+        final String[] values;
+        final boolean optimal;
+
+        ExistingRow(String[] values, int optimalColumn) {
+            this.values = values;
+            this.optimal = optimalColumn >= 0
+                    && optimalColumn < values.length
+                    && parseBoolean(values[optimalColumn]);
+        }
+    }
+
+    private enum ExistingFamily {
+        NONE,
+        PRIMARY,
+        FALLBACK
     }
 
     private static final class Metrics {
